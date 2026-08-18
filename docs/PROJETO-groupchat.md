@@ -167,11 +167,80 @@ interfaces em sincronia.
 
 ---
 
-## 8. O que ainda não sei
+---
+
+## 8. A tela — existe, e dá para abrir: `docs/desenho/groupchat.html`
+
+Desenho self-contained (527 linhas, sem fonte/script/imagem externa). Abra no navegador.
+Mostra as três IAs falando, os quatro casos da barra, a ação dobrada, a falha, o vazio, o
+erro e a microssessão. Diz de si mesmo **"amostra estática"** — não finge telemetria viva.
+
+### O contrato mínimo por atualização de sessão
+
+```json
+{
+  "ia_id": "codex", "session_id": "cx_7f2a", "model_id": "gpt-5.6-sol",
+  "context": {
+    "state": "exact",                       // exact · estimated · unknown
+    "last_prompt_tokens": 168000,
+    "estimated_prompt_tokens": null,
+    "context_window_tokens": 250000,
+    "source": "provider.usage.prompt_tokens",
+    "sampled_at": "2026-08-18T15:42:08-03:00",
+    "reason": null                          // ex.: compacted_waiting_measurement
+  },
+  "liveness": { "last_signal_at": "...", "session_state": "running" }
+}
+```
+
+`session_id` é **por IA**, nunca da sala. Trocou de modelo, o denominador chega de novo
+antes do desenho. `last_prompt_tokens: -1` vira `state: unknown` + texto **"medindo"** —
+nunca 0%.
+
+### Como os três estados aparecem sem depender de cor
+
+Barra sólida = `exato` · hachurada com `≈` = `estimado` · trilho tracejado que respira =
+`desconhecido`. **A cor da IA diz quem fala; a cor semântica diz como vai.** As duas nunca
+no mesmo elemento — é a lei do `DESIGN.md` aplicada.
+
+### Auditoria visual — o que eu medi, não o que o laudo disse
+
+O laudo declarou honestamente que **não** houve render nem prova de layout (o contrato
+proibiu navegador por RAM). Então medi eu, e achei um defeito real:
+
+| viewport | estouro horizontal **antes** | **depois** |
+|---|---|---|
+| 360px | 185px (129 elementos) | **0** |
+| 390px | 155px (125 elementos) | **0** |
+| 430px | 115px (121 elementos) | **0** |
+
+⭐ **Causa-raiz, e ela se repete:** `grid-template-columns:1fr` nos dois breakpoints.
+`1fr` é `minmax(auto,1fr)`, e o `auto` **não encolhe abaixo do min-content** — um bloco
+largo travava a coluna em 545px e os cinco filhos herdavam; no cabeçalho, o
+`white-space:nowrap` do subtítulo virava o piso da coluna e o `text-overflow:ellipsis`
+nunca chegava a agir. Conserto: `minmax(0,1fr)` nos dois lugares. **Levar isto para o
+`sala.js` quando o modo nascer** — o app tem a mesma grade de três colunas.
+
+Mobile é o uso principal dele: sem esse conserto, a tela cortava no celular.
+
+**O que NÃO se sustentou:** achei que o compositor cobria a última fala (321px). Medi de
+novo separando clip-de-rolagem de cobertura — sobreposição **0px**, conteúdo inalcançável
+**0px**. A primeira medição mentiu porque `scroll-behavior:smooth` não avança em tempo
+virtual no headless. Não havia defeito.
+
+---
+
+## 9. O que ainda não sei
 
 - se o `token_count` das mensagens (nulo no hermes) tem equivalente utilizável em **cada
   CLI da frota** — o codex imprime tokens no fim, o kimi mostra `context: 24% (236k/1M)` no
-  rodapé. **Parser por braço quebra quando o braço muda de formato**; o contrato do §6.2
+  rodapé. **Parser por braço quebra quando o braço muda de formato**; o contrato acima
   existe para isso, mas precisa ser provado braço a braço.
-- o laudo do desenho (kimi, 4 KB) e o de omniroute/obsidian (11 KB) ainda não foram
-  integrados aqui.
+- **quem mantém o catálogo `model_id → context_window_tokens`.** Sem essa autoridade no
+  backend, a regra de recalcular o denominador ao trocar de modelo não é verificável.
+- o algoritmo de estimativa não foi escolhido. A tela define como **receber e rotular** uma
+  estimativa sem fingir exatidão — não como produzi-la.
+- não foram provados em runtime: contraste no pixel, navegação por teclado e prova em
+  iPhone real. O HTML traz `progressbar`, rótulos, foco e movimento reduzido — mas isso é
+  promessa de marcação, não medida.
+- o laudo de omniroute/obsidian (11 KB) ainda não foi integrado aqui.

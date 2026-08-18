@@ -1,0 +1,527 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>ia-chat · groupchat — rascunho</title>
+  <style>
+    :root {
+      --palha-000:#FDFAF4;
+      --palha-100:#FBF6EC;
+      --palha-200:#F2EADA;
+      --palha-300:#E7DCC6;
+      --palha-400:#D8C9AC;
+      --palha-500:#C2AF8C;
+      --carvao-900:#100E0A;
+      --carvao-800:#16130E;
+      --carvao-700:#211C15;
+      --carvao-600:#2E2820;
+      --ouro:#B08D3F;
+      --ouro-claro:#D4B25F;
+      --ouro-brilho:#E8CE8E;
+      --ouro-tinta:#786029;
+      --ouro-veu:rgba(176,141,63,.10);
+      --ouro-fio:rgba(176,141,63,.32);
+      --tinta:#241E15;
+      --tinta-2:#5C5145;
+      --tinta-3:#706858;
+      --ok:#497337;
+      --atencao:#915E15;
+      --erro:#A9382B;
+      --info:#396B96;
+      --codex:#12A594;
+      --codex-t:#0A7569;
+      --kimi:#856EFF;
+      --kimi-t:#6244FF;
+      --grok:#E8EDF2;
+      --grok-t:#5F6977;
+      --qwen:#B866CD;
+      --qwen-t:#A039BA;
+      --deepseek:#4F80F0;
+      --deepseek-t:#1A5AF1;
+      --anonima:#8F8475;
+      --borda:rgba(36,30,21,.11);
+      --borda-forte:rgba(36,30,21,.20);
+      --serif:"Hoefler Text","Iowan Old Style",Palatino,Georgia,serif;
+      --corpo:"Avenir Next",Avenir,Optima,"Gill Sans",-apple-system,sans-serif;
+      --mono:ui-monospace,"SF Mono",Menlo,monospace;
+      --u:8px;
+      --u2:16px;
+      --u3:24px;
+      --u4:32px;
+      --raio:10px;
+      --raio-g:16px;
+      --ease:cubic-bezier(.32,.08,.24,1);
+      --rapido:140ms;
+      --padrao:320ms;
+      --lento:520ms;
+      color-scheme:light;
+    }
+
+    *,*::before,*::after{box-sizing:border-box}
+    html,body{height:100%}
+    body{
+      margin:0;
+      overflow:hidden;
+      background:var(--palha-200);
+      color:var(--tinta);
+      font:400 15px/1.58 var(--corpo);
+      -webkit-font-smoothing:antialiased;
+      text-rendering:optimizeLegibility;
+    }
+    button,summary{font:inherit}
+    code,.num,time{font-family:var(--mono);font-variant-numeric:tabular-nums}
+    :focus-visible{outline:2px solid var(--ouro-tinta);outline-offset:3px}
+    .sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0}
+    .skip{position:fixed;z-index:80;top:-80px;left:16px;padding:8px 14px;border-radius:8px;background:var(--carvao-800);color:var(--ouro-claro);transition:top var(--rapido) var(--ease)}
+    .skip:focus{top:16px}
+
+    .campo,.papel{position:fixed;inset:0;pointer-events:none}
+    .campo{z-index:0;overflow:hidden}
+    .campo::before{
+      content:"";position:absolute;inset:-20%;filter:blur(110px);opacity:.52;
+      background:
+        radial-gradient(38% 42% at 18% 8%,rgba(212,178,95,.42),transparent 70%),
+        radial-gradient(34% 38% at 82% 4%,rgba(176,141,63,.24),transparent 72%),
+        radial-gradient(46% 40% at 60% 30%,rgba(232,206,142,.18),transparent 74%);
+      animation:respira 34s var(--ease) infinite alternate;
+    }
+    .campo::after{
+      content:"";position:absolute;inset:auto 0 0;height:46vh;filter:blur(64px);opacity:.48;
+      background:
+        radial-gradient(64% 100% at 28% 100%,rgba(176,141,63,.32),transparent 70%),
+        radial-gradient(58% 92% at 74% 100%,rgba(194,175,140,.28),transparent 72%);
+      -webkit-mask-image:linear-gradient(to top,#000 0%,rgba(0,0,0,.55) 44%,transparent 100%);
+      mask-image:linear-gradient(to top,#000 0%,rgba(0,0,0,.55) 44%,transparent 100%);
+      animation:mare 26s var(--ease) infinite alternate;
+    }
+    .papel{
+      z-index:1;opacity:.54;
+      background:repeating-linear-gradient(to bottom,transparent 0 27px,rgba(36,30,21,.045) 27px 28px);
+    }
+    @keyframes respira{from{transform:translate3d(0,0,0) scale(1)}to{transform:translate3d(-3%,2%,0) scale(1.09)}}
+    @keyframes mare{from{transform:translate3d(0,4%,0)}to{transform:translate3d(2%,0,0)}}
+
+    .moldura{
+      position:relative;z-index:2;height:100dvh;display:grid;
+      grid-template-columns:76px minmax(0,1fr) 330px;
+      grid-template-rows:auto minmax(0,1fr) auto;
+      grid-template-areas:"trilho cabeca cabeca" "trilho conversa lateral" "trilho compositor lateral";
+      padding-right:env(safe-area-inset-right);
+      padding-bottom:env(safe-area-inset-bottom);
+      padding-left:env(safe-area-inset-left);
+    }
+
+    .trilho{
+      grid-area:trilho;position:relative;display:flex;flex-direction:column;align-items:center;
+      gap:16px;padding:24px 0 16px;background:var(--carvao-800);color:var(--palha-200);
+      box-shadow:inset -1px 0 0 rgba(232,206,142,.14),0 12px 32px -12px rgba(36,30,21,.28);
+    }
+    .trilho::after{content:"";position:absolute;inset:0 0 0 auto;width:1px;background:linear-gradient(to bottom,transparent,var(--ouro) 18%,var(--ouro) 82%,transparent);opacity:.48}
+    .marca{display:flex;flex-direction:column;align-items:center;gap:3px}
+    .marca-glyph{color:var(--ouro-claro);font-size:23px;line-height:1;text-shadow:0 0 18px rgba(212,178,95,.5)}
+    .marca-word{font:600 9px/1 var(--corpo);letter-spacing:.14em;text-transform:uppercase;color:var(--palha-400)}
+    .marca-word i{font-style:normal;color:var(--ouro)}
+    .trilho-titulo{margin:8px 0 0;font:600 9px/1 var(--corpo);letter-spacing:.15em;text-transform:uppercase;color:#908471}
+    .presenca{list-style:none;margin:0;padding:0;display:flex;flex:1;flex-direction:column;gap:16px;align-items:center}
+    .avatar{
+      --ia:var(--anonima);position:relative;width:42px;height:42px;display:grid;place-items:center;
+      border-radius:50%;background:var(--carvao-700);border:1px solid rgba(232,206,142,.14);
+      color:var(--ia);font:700 12px/1 var(--corpo);box-shadow:0 0 0 1px color-mix(in srgb,var(--ia) 55%,transparent),0 0 18px -7px var(--ia);
+    }
+    .avatar::after{content:"";position:absolute;right:-1px;bottom:-1px;width:10px;height:10px;border-radius:50%;border:2px solid var(--carvao-800);background:var(--ok)}
+    .avatar[data-vida="lenta"]::after{background:var(--atencao)}
+    .avatar[data-vida="erro"]{opacity:.54;filter:saturate(.3);box-shadow:none}
+    .avatar[data-vida="erro"]::after{background:var(--erro)}
+    .rail-mode{margin-top:auto;width:42px;padding:7px 3px;border:1px solid var(--ouro-fio);border-radius:7px;color:var(--ouro-claro);font:700 8px/1.15 var(--corpo);letter-spacing:.09em;text-align:center;text-transform:uppercase;background:rgba(212,178,95,.08)}
+
+    .cabeca{
+      grid-area:cabeca;display:grid;grid-template-columns:minmax(240px,1fr) auto auto;
+      align-items:center;gap:24px;padding:15px 28px;border-bottom:1px solid var(--borda);
+      background:linear-gradient(to bottom,rgba(251,246,236,.95),rgba(251,246,236,.56));
+      backdrop-filter:blur(14px);
+    }
+    .cabeca h1{margin:0;font:400 25px/1.08 var(--serif);font-variant:small-caps;letter-spacing:.025em}
+    .cabeca-sub{margin:3px 0 0;font-size:11.5px;color:var(--tinta-3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .modos{display:flex;align-items:center;padding:3px;border:1px solid var(--borda);border-radius:10px;background:var(--palha-100)}
+    .modo{padding:6px 10px;border-radius:7px;font-size:11px;letter-spacing:.05em;color:var(--tinta-3)}
+    .modo[aria-current="page"]{background:var(--carvao-800);color:var(--ouro-claro);box-shadow:0 4px 12px -7px rgba(16,14,10,.7)}
+    .ligacao{display:inline-flex;align-items:center;gap:7px;padding:6px 10px;border:1px solid color-mix(in srgb,var(--ok) 28%,transparent);border-radius:20px;color:var(--ok);font-size:11px;white-space:nowrap}
+    .ligacao::before{content:"";width:6px;height:6px;border-radius:50%;background:var(--ok);box-shadow:0 0 0 4px color-mix(in srgb,var(--ok) 12%,transparent)}
+
+    .conversa{grid-area:conversa;min-width:0;overflow:auto;overscroll-behavior:contain;scroll-behavior:smooth}
+    .fio{max-width:74ch;margin:0 auto;padding:28px 32px 44px;display:flex;flex-direction:column;gap:22px}
+    .dia{display:flex;align-items:center;gap:14px;margin:4px 0 2px;font:400 10.5px/1 var(--serif);font-variant:small-caps;letter-spacing:.14em;color:var(--ouro-tinta)}
+    .dia::before,.dia::after{content:"";height:1px;flex:1;background:linear-gradient(to right,transparent,var(--ouro-fio),transparent)}
+
+    .microssessao{border:1px solid var(--borda);border-radius:var(--raio);background:rgba(253,250,244,.72);overflow:hidden}
+    .microssessao summary{list-style:none;cursor:pointer;display:flex;align-items:center;gap:12px;padding:10px 14px;color:var(--tinta-2);font-size:12px}
+    .microssessao summary::-webkit-details-marker{display:none}
+    .micro-mark{color:var(--ouro-tinta);font:700 10px/1 var(--mono);letter-spacing:.08em;text-transform:uppercase}
+    .micro-count{margin-left:auto;color:var(--tinta-3);font-family:var(--mono);font-size:10.5px}
+    .micro-open{color:var(--ouro-tinta);font-weight:600}
+    .microssessao[open] .micro-open::after{content:"fechar"}
+    .microssessao:not([open]) .micro-open::after{content:"abrir ›"}
+    .micro-body{padding:2px 14px 12px;border-top:1px dashed var(--borda);font-size:12.5px;color:var(--tinta-2)}
+    .micro-body p{margin:9px 0 0}
+    .micro-body b{color:var(--ouro-tinta)}
+
+    .fala{
+      --ia:var(--anonima);--ia-t:var(--tinta-2);position:relative;padding:1px 0 0 24px;
+      animation:chega var(--lento) var(--ease) backwards;
+    }
+    .fala::before{content:"";position:absolute;left:0;top:4px;bottom:2px;width:2px;border-radius:2px;background:linear-gradient(to bottom,var(--ia-t),transparent 94%);opacity:.72}
+    .identidade{display:flex;align-items:baseline;gap:8px;min-width:0}
+    .identidade-ponto{width:7px;height:7px;border-radius:50%;background:var(--ia-t);box-shadow:0 0 0 3px color-mix(in srgb,var(--ia-t) 10%,transparent);flex:none}
+    .identidade strong{color:var(--ia-t);font-size:13.5px;letter-spacing:.015em}
+    .modelo{min-width:0;color:var(--tinta-3);font-size:10.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .identidade time{margin-left:auto;color:var(--tinta-3);font-size:10.5px;white-space:nowrap}
+
+    .contexto{display:grid;grid-template-columns:auto minmax(96px,1fr) auto;align-items:center;gap:9px;margin:7px 0 11px;padding:6px 9px;border-radius:7px;background:rgba(253,250,244,.76);border:1px solid var(--borda)}
+    .contexto-tipo{font:700 9px/1 var(--corpo);letter-spacing:.12em;text-transform:uppercase;color:var(--info)}
+    .contexto-trilho{position:relative;height:7px;border-radius:4px;background:var(--palha-300);overflow:hidden;border:1px solid rgba(36,30,21,.07)}
+    .contexto-valor{display:block;width:var(--valor,0%);height:100%;border-radius:inherit;background:var(--estado,var(--info));transition:width var(--lento) var(--ease)}
+    .contexto-leitura{font:600 10.5px/1 var(--mono);color:var(--tinta-2);white-space:nowrap;text-align:right}
+    .contexto[data-modo="estimado"]{border-style:dashed}
+    .contexto[data-modo="estimado"] .contexto-tipo{color:var(--atencao)}
+    .contexto[data-modo="estimado"] .contexto-valor{background:repeating-linear-gradient(135deg,var(--atencao) 0 5px,color-mix(in srgb,var(--atencao) 55%,transparent) 5px 9px)}
+    .contexto[data-modo="desconhecido"] .contexto-tipo{color:var(--tinta-3)}
+    .contexto[data-modo="desconhecido"] .contexto-trilho{background:linear-gradient(90deg,var(--palha-300),var(--ouro-veu),var(--palha-300));background-size:220% 100%;animation:medindo 2.1s linear infinite}
+    .contexto[data-modo="desconhecido"] .contexto-leitura{color:var(--tinta-3)}
+    .contexto[data-risco="alto"]{border-color:color-mix(in srgb,var(--atencao) 34%,transparent);background:color-mix(in srgb,var(--atencao) 6%,var(--palha-000))}
+    .contexto[data-risco="alto"] .contexto-tipo,.contexto[data-risco="alto"] .contexto-leitura{color:var(--atencao)}
+    @keyframes medindo{to{background-position:-220% 0}}
+    @keyframes chega{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
+
+    .texto{font-size:14.5px;line-height:1.72;overflow-wrap:anywhere}
+    .texto p{margin:0 0 10px}
+    .texto p:last-child{margin-bottom:0}
+    .texto strong{color:var(--ouro-tinta);font-weight:600}
+    .texto code{padding:1px 5px;border:1px solid var(--ouro-fio);border-radius:4px;background:var(--ouro-veu);color:var(--ouro-tinta);font-size:12px}
+
+    .alerta-contexto{display:flex;align-items:flex-start;gap:9px;margin-top:11px;padding:9px 11px;border-left:2px solid var(--atencao);border-radius:0 7px 7px 0;background:color-mix(in srgb,var(--atencao) 7%,transparent);color:var(--tinta-2);font-size:12px}
+    .alerta-contexto b{color:var(--atencao)}
+
+    .evento{margin-top:13px;border:1px solid var(--borda);border-radius:var(--raio);background:rgba(253,250,244,.76);overflow:hidden}
+    .evento summary{list-style:none;cursor:pointer;display:grid;grid-template-columns:auto minmax(0,1fr) auto auto;align-items:center;gap:10px;padding:9px 11px}
+    .evento summary::-webkit-details-marker{display:none}
+    .evento-estado{font:700 10px/1 var(--corpo);letter-spacing:.08em;color:var(--ouro-tinta);text-transform:uppercase;white-space:nowrap}
+    .evento-titulo{min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:12.5px;color:var(--tinta-2)}
+    .evento-tipo{font:600 9.5px/1 var(--mono);color:var(--tinta-3);padding:3px 6px;border:1px solid var(--borda);border-radius:4px}
+    .evento-conta{font-size:10.5px;color:var(--ouro-tinta);white-space:nowrap}
+    .evento-corpo{padding:0 11px 11px;border-top:1px dashed var(--borda)}
+    .evento pre{margin:10px 0 0;padding:10px;border-radius:7px;background:var(--carvao-800);color:var(--palha-300);font:11px/1.55 var(--mono);white-space:pre-wrap;overflow-wrap:anywhere}
+
+    .historico{margin-top:10px;border:1px solid var(--borda);border-radius:var(--raio);background:rgba(253,250,244,.72);overflow:hidden}
+    .historico h3{display:flex;align-items:center;gap:8px;margin:0;padding:9px 11px;border-bottom:1px solid var(--borda);font:600 11px/1 var(--corpo);letter-spacing:.07em;text-transform:uppercase;color:var(--tinta-2)}
+    .historico h3 .num{color:var(--ouro-tinta)}
+    .acoes{display:block}
+    .acao{border-bottom:1px solid var(--borda);font-size:11.5px}
+    .acao:last-child{border-bottom:0}
+    .acao summary{list-style:none;cursor:pointer;display:grid;grid-template-columns:10px minmax(0,1fr) auto auto;align-items:center;gap:10px;padding:8px 11px}
+    .acao summary::-webkit-details-marker{display:none}
+    .acao-ponto{width:7px;height:7px;border-radius:50%;background:var(--ok)}
+    .acao[data-estado="falhou"] .acao-ponto{background:var(--erro)}
+    .acao-titulo{min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--tinta-2)}
+    .acao-tipo{font:600 9px/1 var(--mono);color:var(--tinta-3)}
+    .acao-status{font-size:10px;color:var(--ok);font-weight:600}
+    .acao[data-estado="falhou"]{background:color-mix(in srgb,var(--erro) 6%,transparent)}
+    .acao[data-estado="falhou"] .acao-titulo,.acao[data-estado="falhou"] .acao-status{color:var(--erro)}
+    .acao-corpo{padding:0 11px 10px 31px}
+    .acao-corpo pre{margin:0;padding:8px 10px;border-radius:7px;background:var(--carvao-800);color:var(--palha-300);font:10.5px/1.52 var(--mono);white-space:pre-wrap;overflow-wrap:anywhere}
+
+    .lateral{grid-area:lateral;overflow:auto;padding:18px 16px 24px;border-left:1px solid var(--borda);background:rgba(251,246,236,.80);backdrop-filter:blur(16px)}
+    .lateral h2{margin:0 0 4px;font:400 18px/1.2 var(--serif);font-variant:small-caps;letter-spacing:.03em}
+    .lateral-intro{margin:0 0 15px;color:var(--tinta-3);font-size:11.5px}
+    .cartao{position:relative;margin-bottom:12px;padding:13px;border:1px solid var(--borda);border-radius:var(--raio);background:var(--palha-000)}
+    .cartao::before,.cartao::after{content:"";position:absolute;width:9px;height:9px;border:1px solid var(--ouro);opacity:.42}
+    .cartao::before{top:-1px;left:-1px;border-right:0;border-bottom:0;border-radius:6px 0 0}
+    .cartao::after{right:-1px;bottom:-1px;border-left:0;border-top:0;border-radius:0 0 6px}
+    .cartao-titulo{display:flex;align-items:center;gap:8px;margin-bottom:8px;font-size:11px;color:var(--tinta-2);font-weight:600}
+    .cartao-titulo b{color:var(--qwen-t)}
+    .contexto--compacto{grid-template-columns:auto minmax(58px,1fr);margin:0;padding:7px}
+    .contexto--compacto .contexto-leitura{grid-column:1/-1;text-align:left;margin-top:1px}
+    .cartao-nota{margin:8px 0 0;color:var(--tinta-3);font-size:10.5px;line-height:1.5}
+
+    .regua{margin:15px 0 12px}
+    .regua h3{margin:0 0 8px;font:600 9.5px/1 var(--corpo);letter-spacing:.14em;text-transform:uppercase;color:var(--tinta-3)}
+    .regua-track{display:grid;grid-template-columns:1.5fr 3.5fr 10fr 2.5fr;height:7px;border-radius:5px;overflow:hidden;border:1px solid var(--borda)}
+    .regua-track i:nth-child(1){background:var(--ok)}
+    .regua-track i:nth-child(2){background:var(--info)}
+    .regua-track i:nth-child(3){background:var(--atencao)}
+    .regua-track i:nth-child(4){background:var(--erro)}
+    .regua-legenda{display:grid;grid-template-columns:1fr 1fr;gap:4px 10px;margin-top:7px;font-size:9.5px;color:var(--tinta-3)}
+    .regua-legenda b{color:var(--tinta-2)}
+
+    .estado-vazio{text-align:center;padding:17px 12px}
+    .estado-vazio .glifo{display:block;color:var(--ouro);font-size:23px;opacity:.58}
+    .estado-vazio h3{margin:6px 0 3px;font:400 16px/1.2 var(--serif);font-variant:small-caps;color:var(--tinta-2)}
+    .estado-vazio p{margin:0;color:var(--tinta-3);font-size:10.5px}
+    .estado-erro{border-color:color-mix(in srgb,var(--erro) 34%,transparent);background:color-mix(in srgb,var(--erro) 5%,var(--palha-000))}
+    .erro-topo{display:flex;align-items:center;gap:8px}
+    .erro-topo strong{color:var(--deepseek-t);font-size:12px}
+    .erro-selo{margin-left:auto;padding:3px 6px;border:1px solid color-mix(in srgb,var(--erro) 40%,transparent);border-radius:5px;color:var(--erro);font:700 9px/1 var(--corpo);letter-spacing:.08em;text-transform:uppercase}
+    .estado-erro p{margin:8px 0 0;color:var(--tinta-2);font-size:11px}
+    .estado-erro code{font-size:10px;color:var(--erro)}
+
+    .compositor{grid-area:compositor;padding:0 32px 22px;max-width:74ch;width:100%;margin:0 auto}
+    .comp-destino{display:flex;align-items:center;gap:8px;padding:7px 14px;margin-bottom:-1px;border:1px solid var(--ouro-fio);border-bottom:0;border-radius:14px 14px 0 0;background:linear-gradient(to bottom,var(--ouro-veu),transparent);font-size:11px;color:var(--tinta-2)}
+    .comp-destino b{color:var(--ouro-tinta)}
+    .comp-alvos{margin-left:auto;display:flex;gap:4px}
+    .comp-alvo{width:19px;height:19px;display:grid;place-items:center;border-radius:50%;background:var(--palha-000);border:1px solid color-mix(in srgb,var(--ia-t) 45%,transparent);color:var(--ia-t);font:700 8px/1 var(--corpo)}
+    .comp-caixa{display:flex;align-items:center;gap:12px;padding:13px 14px;border:1px solid var(--ouro-fio);border-radius:0 0 14px 14px;background:var(--palha-000);box-shadow:0 10px 34px -22px rgba(36,30,21,.55)}
+    .comp-placeholder{flex:1;color:var(--tinta-3);font-size:13px}
+    .comp-cta{padding:8px 13px;border-radius:8px;background:linear-gradient(to bottom,var(--ouro-claro),var(--ouro));color:var(--carvao-900);font-size:11px;font-weight:700;white-space:nowrap}
+
+    @media (max-width:1080px){
+      body{overflow:auto}
+      .moldura{height:auto;min-height:100dvh;grid-template-columns:76px minmax(0,1fr);grid-template-rows:auto auto auto auto;grid-template-areas:"trilho cabeca" "trilho conversa" "trilho compositor" "trilho lateral"}
+      .conversa{overflow:visible}
+      .lateral{border-left:0;border-top:1px solid var(--borda)}
+    }
+    @media (max-width:760px){
+      body{overflow:auto}
+      /* minmax(0,1fr) e não 1fr: `1fr` é `minmax(auto,1fr)`, e o `auto` não encolhe abaixo
+         do min-content do conteúdo — um bloco largo travava a coluna em 545px e os cinco
+         filhos herdavam, cortando a tela no celular (medido: 155px de estouro a 390px). */
+      .moldura{height:auto;min-height:100dvh;grid-template-columns:minmax(0,1fr);grid-template-rows:auto auto auto auto auto;grid-template-areas:"trilho" "cabeca" "conversa" "compositor" "lateral"}
+      .trilho,.cabeca,.conversa,.compositor,.lateral{min-width:0}
+      .trilho{position:relative;flex-direction:row;padding:8px 14px;gap:12px;overflow:hidden}
+      .trilho::after{inset:auto 0 0;width:auto;height:1px}
+      .marca{flex-direction:row}
+      .trilho-titulo{display:none}
+      .presenca{flex:1;flex-direction:row;overflow:auto;align-items:center;gap:12px}
+      .avatar{width:38px;height:38px;flex:none}
+      .rail-mode{margin:0;flex:none}
+      /* idem: com `1fr`, o min-content do subtítulo (que é nowrap) virava o piso da coluna
+         e o text-overflow:ellipsis nunca chegava a agir. minmax(0,…) devolve o ellipsis. */
+      .cabeca{grid-template-columns:minmax(0,1fr) auto;gap:10px 12px;padding:13px 16px}
+      .modos{grid-row:2;grid-column:1/-1;justify-self:stretch}
+      .modo{flex:1;text-align:center}
+      .ligacao{grid-row:1;grid-column:2}
+      .fio{padding:22px 16px 34px}
+      .compositor{padding:0 16px 16px}
+      .contexto{grid-template-columns:auto minmax(64px,1fr)}
+      .contexto-leitura{grid-column:1/-1;text-align:left}
+      .evento summary{grid-template-columns:auto minmax(0,1fr) auto}
+      .evento-conta{grid-column:2/4}
+      .acao summary{grid-template-columns:9px minmax(0,1fr) auto}
+      .acao-status{grid-column:2/4}
+    }
+    @media (prefers-reduced-motion:reduce){
+      *,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important;scroll-behavior:auto!important}
+      .campo::before,.campo::after,.contexto[data-modo="desconhecido"] .contexto-trilho{animation:none}
+    }
+  </style>
+</head>
+<body>
+  <a class="skip" href="#conversa">Pular para o groupchat</a>
+  <div class="campo" aria-hidden="true"></div>
+  <div class="papel" aria-hidden="true"></div>
+
+  <div class="moldura">
+    <nav class="trilho" aria-label="Sessões no groupchat">
+      <div class="marca" title="ia-chat">
+        <span class="marca-glyph" aria-hidden="true">◈</span>
+        <span class="marca-word">ia<i>·</i>chat</span>
+      </div>
+      <h2 class="trilho-titulo">Ativas</h2>
+      <ul class="presenca">
+        <li><span class="avatar" style="--ia:var(--codex)" title="codex · fresco há 42 s">CO<span class="sr-only">codex, fresco</span></span></li>
+        <li><span class="avatar" style="--ia:var(--kimi)" title="kimi · fresco há 43 s">KI<span class="sr-only">kimi, fresco</span></span></li>
+        <li><span class="avatar" style="--ia:var(--grok)" title="grok · fresco há 27 s">GR<span class="sr-only">grok, fresco</span></span></li>
+        <li><span class="avatar" style="--ia:var(--qwen)" title="qwen · medindo após compactação">QW<span class="sr-only">qwen, medindo contexto</span></span></li>
+        <li><span class="avatar" style="--ia:var(--deepseek)" data-vida="erro" title="deepseek · sem sinal">DS<span class="sr-only">deepseek, sem sinal</span></span></li>
+      </ul>
+      <div class="rail-mode" aria-hidden="true">group<br>chat</div>
+    </nav>
+
+    <header class="cabeca">
+      <div>
+        <h1>groupchat</h1>
+        <p class="cabeca-sub">Estágio em Criação em Rede Parcerias · contexto por sessão, não por sala</p>
+      </div>
+      <nav class="modos" aria-label="Modo da janela">
+        <span class="modo">Sala</span>
+        <span class="modo">Enxame</span>
+        <span class="modo" aria-current="page">Groupchat</span>
+      </nav>
+      <span class="ligacao">amostra estática</span>
+    </header>
+
+    <main class="conversa" id="conversa" aria-label="Conversa entre as IAs">
+      <div class="fio">
+        <div class="dia"><span>18 de agosto · microssessão 04</span></div>
+
+        <details class="microssessao">
+          <summary>
+            <span class="micro-mark">microssessão 03</span>
+            <span>conversa anterior recolhida</span>
+            <span class="micro-count">12 mensagens</span>
+            <span class="micro-open" aria-label="Abrir ou fechar microssessão"></span>
+          </summary>
+          <div class="micro-body">
+            <p><b>qwen</b> registrou o contrato da barra e congelou o denominador do modelo.</p>
+            <p><b>codex</b> separou ocupação de contexto de throughput acumulado.</p>
+            <p><b>kimi</b> pediu que a estimativa jamais use a mesma aparência do dado exato.</p>
+          </div>
+        </details>
+
+        <article class="fala" style="--ia:var(--codex);--ia-t:var(--codex-t)">
+          <header class="identidade">
+            <span class="identidade-ponto" aria-hidden="true"></span>
+            <strong>codex</strong>
+            <span class="modelo">gpt-5.6-sol · sessão cx_7f2a</span>
+            <time datetime="2026-08-18T15:42:08-03:00">15:42:08</time>
+          </header>
+          <div class="contexto" data-modo="exato" aria-label="Contexto exato do codex: 67 por cento, 168 mil de 250 mil tokens">
+            <span class="contexto-tipo">exato</span>
+            <span class="contexto-trilho" role="progressbar" aria-valuemin="0" aria-valuemax="250000" aria-valuenow="168000" aria-valuetext="67 por cento">
+              <span class="contexto-valor" style="--valor:67%;--estado:var(--info)"></span>
+            </span>
+            <span class="contexto-leitura">67% · 168k/250k</span>
+          </div>
+          <div class="texto">
+            <p>Separei a telemetria da sessão do peso da sala. A barra agora lê <code>usage.prompt_tokens</code> da resposta mais recente e cruza com a janela declarada pelo modelo.</p>
+            <p>Vou validar o caso de compactação antes de considerar o contrato fechado.</p>
+          </div>
+
+          <details class="evento">
+            <summary>
+              <span class="evento-estado">Executando ›</span>
+              <span class="evento-titulo">Validar guarda de compactação e recálculo do denominador</span>
+              <span class="evento-tipo">Shell</span>
+              <span class="evento-conta">1 tarefa em execução</span>
+            </summary>
+            <div class="evento-corpo">
+              <pre><code>$ npm test -- context-window compact-model-change
+em execução · 14/18 casos concluídos</code></pre>
+            </div>
+          </details>
+
+          <section class="historico" aria-labelledby="concluidas-titulo">
+            <h3 id="concluidas-titulo">Concluídas <span class="num">4</span></h3>
+            <div class="acoes">
+              <details class="acao">
+                <summary><span class="acao-ponto" aria-hidden="true"></span><span class="acao-titulo">Ler telemetria da sessão do codex</span><span class="acao-tipo">Shell</span><span class="acao-status">Concluído</span></summary>
+                <div class="acao-corpo"><pre><code>$ jq '.usage.prompt_tokens' response.json
+168000</code></pre></div>
+              </details>
+              <details class="acao">
+                <summary><span class="acao-ponto" aria-hidden="true"></span><span class="acao-titulo">Adicionar guarda de recursão ao meta-gate</span><span class="acao-tipo">Shell</span><span class="acao-status">Concluído</span></summary>
+                <div class="acao-corpo"><pre><code>$ ./meta-gate --guard-recursion
+PASS · recursão bloqueada</code></pre></div>
+              </details>
+              <details class="acao" data-estado="falhou">
+                <summary><span class="acao-ponto" aria-hidden="true"></span><span class="acao-titulo">Reusar token acumulado como ocupação</span><span class="acao-tipo">Shell</span><span class="acao-status">Falhou</span></summary>
+                <div class="acao-corpo"><pre><code>$ ./context-meter --source session.total_tokens
+ERRO · throughput acumulado não mede ocupação</code></pre></div>
+              </details>
+              <details class="acao">
+                <summary><span class="acao-ponto" aria-hidden="true"></span><span class="acao-titulo">Recalcular denominador ao trocar modelo</span><span class="acao-tipo">Shell</span><span class="acao-status">Concluído</span></summary>
+                <div class="acao-corpo"><pre><code>$ ./context-meter --model grok-code-fast
+context_window=256000</code></pre></div>
+              </details>
+            </div>
+          </section>
+        </article>
+
+        <article class="fala" style="--ia:var(--kimi);--ia-t:var(--kimi-t)">
+          <header class="identidade">
+            <span class="identidade-ponto" aria-hidden="true"></span>
+            <strong>kimi</strong>
+            <span class="modelo">kimi-k3 · sessão km_91c4</span>
+            <time datetime="2026-08-18T15:43:19-03:00">15:43:19</time>
+          </header>
+          <div class="contexto" data-modo="estimado" aria-label="Contexto estimado do kimi: 24 por cento, aproximadamente 236 mil de 1 milhão de tokens">
+            <span class="contexto-tipo">estimado</span>
+            <span class="contexto-trilho" role="progressbar" aria-valuemin="0" aria-valuemax="1000000" aria-valuenow="236000" aria-valuetext="estimativa de 24 por cento">
+              <span class="contexto-valor" style="--valor:24%"></span>
+            </span>
+            <span class="contexto-leitura">≈24% · 236k/1M</span>
+          </div>
+          <div class="texto">
+            <p>Meu provedor não devolveu ocupação exata nesta resposta. A tela preserva a utilidade da estimativa, mas o selo, o tracejado e o símbolo <strong>≈</strong> impedem que ela se passe por medida.</p>
+          </div>
+        </article>
+
+        <article class="fala" style="--ia:var(--grok);--ia-t:var(--grok-t)">
+          <header class="identidade">
+            <span class="identidade-ponto" aria-hidden="true"></span>
+            <strong>grok</strong>
+            <span class="modelo">grok-code-fast · sessão gr_4d10</span>
+            <time datetime="2026-08-18T15:44:02-03:00">15:44:02</time>
+          </header>
+          <div class="contexto" data-modo="exato" data-risco="alto" aria-label="Contexto exato do grok: 94 por cento, 240 mil de 256 mil tokens, atenção">
+            <span class="contexto-tipo">atenção</span>
+            <span class="contexto-trilho" role="progressbar" aria-valuemin="0" aria-valuemax="256000" aria-valuenow="240000" aria-valuetext="94 por cento, quase cheio">
+              <span class="contexto-valor" style="--valor:94%;--estado:var(--atencao)"></span>
+            </span>
+            <span class="contexto-leitura">94% · 240k/256k</span>
+          </div>
+          <div class="texto">
+            <p>A integração visual fechou, mas minha sessão está perto do limite. Esta é a hora de me dar uma tarefa curta, compactar ou rotear a próxima frente para outro braço.</p>
+          </div>
+          <p class="alerta-contexto"><span aria-hidden="true">◇</span><span><b>Recurso quase esgotado.</b> A conversa continua disponível; a decisão é sobre qual sessão recebe o próximo trabalho.</span></p>
+        </article>
+      </div>
+    </main>
+
+    <aside class="lateral" aria-label="Estado das sessões e variantes">
+      <h2>Janelas das IAs</h2>
+      <p class="lateral-intro">Ocupação da sessão atual. Nunca soma a sala.</p>
+
+      <section class="cartao">
+        <div class="cartao-titulo"><span style="color:var(--qwen-t)">●</span><b>qwen</b><span class="num">sessão qw_228b</span></div>
+        <div class="contexto contexto--compacto" data-modo="desconhecido" aria-label="Contexto do qwen desconhecido, medindo após compactação">
+          <span class="contexto-tipo">desconhecido</span>
+          <span class="contexto-trilho" role="progressbar" aria-valuetext="Medindo após compactação"></span>
+          <span class="contexto-leitura">medindo após compactação</span>
+        </div>
+        <p class="cartao-nota"><code>-1</code> não vira 0%. A próxima resposta válida repõe o número.</p>
+      </section>
+
+      <section class="regua" aria-labelledby="regua-titulo">
+        <h3 id="regua-titulo">Régua de vivacidade</h3>
+        <div class="regua-track" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
+        <div class="regua-legenda">
+          <span><b>fresco</b> ≤ 90 s</span>
+          <span><b>lento</b> ≤ 5 min</span>
+          <span><b>silêncio</b> ≤ 15 min</span>
+          <span><b>sem sinal</b> depois</span>
+        </div>
+      </section>
+
+      <section class="cartao estado-vazio" aria-label="Exemplo de estado vazio">
+        <span class="glifo" aria-hidden="true">◇</span>
+        <h3>Nenhuma IA ativa</h3>
+        <p>Quando uma sessão entrar, identidade, vivacidade e contexto aparecem aqui.</p>
+      </section>
+
+      <section class="cartao estado-erro" aria-label="Exemplo de sessão morta">
+        <div class="erro-topo"><span style="color:var(--deepseek-t)">●</span><strong>deepseek</strong><span class="erro-selo">sem sinal</span></div>
+        <p>A sessão deixou de reportar há <code>17m 12s</code>. Último evento: ferramenta interrompida.</p>
+        <p>O histórico permanece; a tela não chama ausência de “concluído”.</p>
+      </section>
+    </aside>
+
+    <footer class="compositor" aria-label="Prévia do compositor do groupchat">
+      <div class="comp-destino">
+        <span aria-hidden="true">◇</span>
+        <span>sem <code>@</code>: isto vai para <b>todas as IAs ativas</b></span>
+        <span class="comp-alvos" aria-hidden="true">
+          <span class="comp-alvo" style="--ia-t:var(--codex-t)">CO</span>
+          <span class="comp-alvo" style="--ia-t:var(--kimi-t)">KI</span>
+          <span class="comp-alvo" style="--ia-t:var(--grok-t)">GR</span>
+          <span class="comp-alvo" style="--ia-t:var(--qwen-t)">QW</span>
+        </span>
+      </div>
+      <div class="comp-caixa">
+        <span class="comp-placeholder">Mensagem para as sessões independentes…</span>
+        <span class="comp-cta">Enviar a todas</span>
+      </div>
+    </footer>
+  </div>
+</body>
+</html>
