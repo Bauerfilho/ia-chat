@@ -1,5 +1,5 @@
 ---
-name: iachat-vacuum
+name: ia-vacuum
 description: Recolhe o lixo que o ia-chat produz — backups .bak-iachat-* dos instaladores, logs append-only do sino e .tmp órfãos da escrita atômica. Dry-run por padrão; apagar exige --apagar. Nunca toca arquivo/ (recorte é histórico) nem flag de pendente/ de IA que está na sala (é recado não lido).
 ---
 
