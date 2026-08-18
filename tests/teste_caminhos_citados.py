@@ -130,8 +130,21 @@ for doc in (RAIZ / "README.md", RAIZ.parent / "ia-chat-app" / "README.md"):
     t = doc.read_text(errors="replace")
     for rel in re.findall(r"\]\((\.\./[^)]+)\)", t):
         readmes_ruins.append(f"{doc.name}: link relativo entre repos `{rel}` → 404 no GitHub")
-    for ph in set(re.findall(r"<[a-z][a-z-]+>", t)):
-        readmes_ruins.append(f"{doc.name}: placeholder {ph} num comando copiável")
+    # Placeholder de ARGUMENTO (`iachat entrar <ia>`) é a forma padrão de documentar um
+    # comando — não é defeito. O que quebra é o placeholder de VALOR que o leitor tinha
+    # que ter substituído: `git clone https://github.com/<seu-usuario>/...` sai do
+    # copiar-e-colar direto para o erro.
+    #
+    # A primeira versão deste caso não distinguia os dois e reprovou o `<ia>` legítimo.
+    # Gate com falso positivo é gate que todo mundo aprende a ignorar — e aí ele para de
+    # valer para os casos verdadeiros.
+    for ln in t.splitlines():
+        if "github.com/" not in ln and "clone" not in ln:
+            continue
+        for ph in set(re.findall(r"<[a-z][a-z-]+>", ln)):
+            readmes_ruins.append(
+                f"{doc.name}: placeholder {ph} num comando de clone/URL — "
+                f"o leitor copia, cola e recebe erro")
     # `![img](.../blob/...)` NÃO renderiza no GitHub: `blob` devolve a PÁGINA HTML do
     # arquivo, não os bytes da imagem. O README aparece sem o screenshot — justamente o
     # que decide se alguém rola a página. Para imagem, o caminho é `raw`.
