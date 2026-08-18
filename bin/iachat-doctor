@@ -131,6 +131,9 @@ CASCAS = {
 }
 
 OK, FALHA, DUVIDA = "ok", "falhou", "?"
+# O dono participa da sala como qualquer um, mas não é uma casca de IA: não tem skills,
+# hooks nem processo para medir. Mesmo nome que o `iachat-comando` usa.
+DONO = "bauer"
 SIMBOLO = {OK: "✓", FALHA: "✗", DUVIDA: "⚠"}
 
 
@@ -800,6 +803,16 @@ def main() -> int:
         alvos = list(na_sala)
 
     for ia in alvos:
+        # O DONO não é casca: ele entrou em `na_sala` pelo app em 18/08, e o doctor
+        # passou a procurar skills e hooks de uma PESSOA — devolvendo um ⚠ que jamais
+        # vai virar ✓, porque não há nada para medir. Dúvida que não tem como se
+        # resolver não é medição honesta: é ruído que ensina a ignorar os ⚠, e o dia em
+        # que um ⚠ importar ele já terá aprendido a passar batido.
+        if ia == DONO:
+            L.add(f"casca:{ia}", "registro", OK,
+                  "é o dono, não uma casca de IA — sem skills ou hooks para medir",
+                  "comparação com o papel do dono")
+            continue
         if ia not in CASCAS:
             L.add(f"casca:{ia}", "registro", DUVIDA,
                   "casca fora do registro do iachat-doctor — não sei onde ela guarda "
