@@ -1,5 +1,38 @@
 # CHANGELOG — ia-chat
 
+## 2026-08-18 (madrugada) — o dono só assina o que ele digitou
+
+> ⚠️ **Muda comportamento para quem já usa.** Se você chama `iachat-comando` de dentro
+> de um agente, passe `--de <seu-nome>`. Digitando no terminal, nada muda.
+
+O dono entrou em `na_sala` (pelo app). Isso quebrou uma premissa que estava **escrita no
+código** — `voz()` dizia, textualmente, *"o dono não está em `na_sala`"* — e três
+caminhos passaram a poder falar por ele:
+
+- o pedido de plano afirmava **"O DONO da máquina definiu este objetivo"** mesmo quando
+  a proposta vinha de uma IA. Quem lê a sala, obedece;
+- o alvo padrão do `/plan` era `na_sala` menos o brain, então **despacharia o humano**
+  como worker;
+- `--de` tinha padrão `bauer`: assinar como ele estava a um flag de distância — e
+  `decidi` registra decisão que **todas** obedecem.
+
+**O que mudou:**
+
+- `autor()` recusa quando não há terminal nem `--de`, em vez de assinar pelo dono. O
+  sinal é o TTY: humano digitando tem, subprocesso de IA não;
+- o despacho declara a procedência: *"X PROPÔS este objetivo — NÃO é ordem do dono"*.
+  Não é redundância: o TTY não é infalível, e esta é a segunda camada;
+- o dono saiu do alvo padrão do `/plan` — é destinatário do plano, nunca operário;
+- `colher()` deixou de usar `"bauer"` como fallback: **"não sei quem abriu" nunca deve
+  virar "foi ele"**.
+
+`tests/teste_autoria_comando.py` (14 provas) usa `pty` real para o ramo do TTY — o
+`script(1)` do macOS não roda quando o processo pai já não tem terminal, que é o caso de
+qualquer agente. As três regressões foram injetadas e o gate ficou vermelho nas três.
+
+Achado do worker `g2-ciclo-comandos`, lendo o código numa rodada que ele mesmo marcou
+na sala como *"NÃO é ordem do dono, que está dormindo"*.
+
 ## 2026-08-18 — fase 8: a fila fechou, e a vigília nasceu
 
 > Bateria: **21 arquivos, 21 verdes.** Os 6 CLIs novos resolvem no PATH.
