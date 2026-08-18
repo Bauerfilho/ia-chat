@@ -1,5 +1,59 @@
 # CHANGELOG — ia-chat
 
+## 2026-08-18 (tarde) — a auditoria cruzada derrubou uma garantia que este arquivo dava
+
+> Cada frente da manhã foi auditada por quem **não a escreveu**. Três laudos, dois
+> bloqueantes — e um deles desmente o que está escrito na entrada de hoje de manhã.
+
+### ⚠️ Correção: o "mostrar-antes" NÃO vivia no servidor
+
+A entrada de manhã afirma, logo abaixo, que `plan`, `parar` e `refaz` *"sem `confirmado:
+true` devolvem 400"* e que *"um JS adulterado pularia a confirmação; o servidor não"*.
+
+**A primeira metade era verdade e a segunda não.** O servidor checava se o cliente havia
+dito `confirmado`, e nada mais. Um `POST /api/parar` com `{"confirmado":true}` e nada
+antes voltou **200**, mandou SIGTERM e deixou a missão parada — sem que previsão alguma
+tivesse sido pedida. A confirmação existia na tela; no servidor existia só um booleano
+que o próprio cliente escrevia.
+
+Fechado agora: a previsão (`seco`) devolve um **recibo** que nasce no servidor —
+aleatório, só em memória, 180 s, amarrado ao comando E aos argumentos canônicos daquela
+previsão, queimado no primeiro uso, no máximo 256 vivos. Sem recibo: 400 pedindo a
+previsão. Nem `confirmado` nem `recibo` atravessam para o CLI.
+
+Verificado por quem não consertou: o ataque nas três rotas → 400 · previsão e confirmação
+com o recibo → 200, executa · repetir o recibo → 400 · recibo do `/plan` usado no
+`/parar` → 400.
+
+### A skill de compactação apontava para o trabalho errado
+
+Sem `IASWARM_RUN`, ela elegia o run de *mtime* mais recente entre **todos**. Rodando de
+dentro de um run, o mapa apontava para outro. A skill existe para devolver uma IA ao
+próprio trabalho depois que o contexto morre — e mentia exatamente ali, onde quem lê não
+tem como desconfiar.
+
+A ordem virou: `IASWARM_RUN` válido → o run que contém o cwd → `PWD` coerente → e só
+então o *mtime*. Quando cai no último, o mapa **escreve que adivinhou**, com o critério.
+
+### O sino ligava com uma string
+
+`bool(valor)` aceitava `"false"` e `"0"` como verdadeiros — em Python, string não vazia é
+verdadeira. Um `config.json` malformado tirava o sono dele por defeito de tipo. Agora só
+o booleano `true` liga.
+
+### A skill parou de prometer um gatilho que o instalador não arma
+
+`ia-compactacao` declarava "passiva, no SessionStart" como se acontecesse sozinha. O
+`install.sh` copia binário e skill, e **não arma hook nenhum** — deliberadamente: editar
+o `settings.json` de quem instala é invasivo, e no Codex invalida o `trusted_hash`, que
+faz o hook ser pulado em silêncio. Num clone novo, a skill prometia e nada acontecia.
+
+Agora o instalador mostra que o mapa funciona na mão (`--mapa`, `--inicio`) e imprime o
+bloco pronto para colar; a skill declara que armar é gesto de quem instala. Um gate novo
+cobra que promessa e entrega digam a mesma coisa — vale para qualquer skill futura que
+cite um evento de hook.
+
+
 ## 2026-08-18 (manhã) — publicado, e os comandos do dono atravessam o app
 
 > Os dois repositórios foram ao ar: `github.com/Bauerfilho/ia-chat` e `ia-chat-app`.
