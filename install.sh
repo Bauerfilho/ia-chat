@@ -114,3 +114,34 @@ Codex:       as skills entram por diretório (aceita symlink):
              Codex passa a PULAR o hook em silêncio — ele precisa re-aprovar na próxima
              abertura. Este instalador nunca fabrica hash nem edita hooks.json.
 AVISO
+
+# O gatilho da compactação NÃO é armado aqui, e isso é deliberado: editar sozinho o
+# settings.json de quem instala é invasivo, e no Codex quebra o `trusted_hash`. Mas a
+# skill declarava "passiva, no SessionStart" como se acontecesse sozinho — e uma promessa
+# que o instalador não cumpre é pior que uma instrução a mais. Achado por auditoria
+# cruzada em 18/08: skill promete, install.sh não arma, clone novo não ganha o gatilho.
+ARMADOS=""
+if [ -f "$HOME/.claude/settings.json" ]; then
+  for ev in PreCompact PostCompact SessionStart; do
+    grep -q "ia-compactacao" "$HOME/.claude/settings.json" 2>/dev/null && ARMADOS="1" && break
+  done
+fi
+echo
+if [ -n "$ARMADOS" ]; then
+  echo "compactação: algum hook de ia-compactacao já está no seu settings.json."
+  echo "             confira quais com:  iachat doctor"
+else
+  echo "compactação: o mapa de retomada funciona AGORA na mão —"
+  echo "               ia-compactacao --mapa     (escreve o mapa)"
+  echo "               ia-compactacao --inicio   (imprime o ponteiro)"
+  echo "             para virar passivo, cole em ~/.claude/settings.json (hooks):"
+  cat <<HOOKS
+               "PreCompact":   [{"hooks":[{"type":"command",
+                  "command":"$DEST_BIN/ia-compactacao --pre"}]}],
+               "PostCompact":  [{"hooks":[{"type":"command",
+                  "command":"$DEST_BIN/ia-compactacao --pos"}]}],
+               "SessionStart": [{"hooks":[{"type":"command",
+                  "command":"$DEST_BIN/ia-compactacao --inicio"}]}]
+HOOKS
+  echo "             (armar é gesto seu — este instalador não edita hooks de ninguém.)"
+fi

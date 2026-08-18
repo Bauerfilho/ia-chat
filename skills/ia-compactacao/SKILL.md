@@ -42,16 +42,26 @@ Aquilo é buffer. Não comece por lá.
 2. Abra o primeiro path de **Onde parou**. Retome dali.
 3. Só então olhe a sala (`iachat read --de <você>`) se o mapa apontar uma mensagem.
 
-## O gatilho é passivo. Você não precisa lembrar.
+## O gatilho é passivo — depois de armado UMA vez
 
 | caminho | quando | o que acontece |
 |---|---|---|
 | **PreCompact** | a casca vai compactar | o script grava o mapa **antes** do contexto morrer |
 | **PostCompact** | a compactação acabou | atualiza o mapa; injeta o ponteiro no contexto |
-| **SessionStart** (`source=compact` ou qualquer start) | você abriu / voltou / entrou na sala | se `caminho.md` existe, o hook imprime o ponteiro |
+| **SessionStart** | você abriu / voltou / entrou na sala | se `caminho.md` existe, o hook imprime o ponteiro |
 
-Não depende de a IA lembrar da skill. O hook escreve e entrega. A skill
-existe para você **saber o que fazer** quando o aviso chegar.
+Não depende de a IA lembrar da skill. O hook escreve e entrega. A skill existe
+para você **saber o que fazer** quando o aviso chegar.
+
+> ⚠️ **O `install.sh` NÃO arma esses hooks, e isso é de propósito.** Um instalador
+> que edita sozinho o `settings.json` de quem instala é invasivo — e em algumas
+> cascas (Codex) mexer no arquivo de hooks invalida o `trusted_hash` e quebra o
+> que já funcionava. O instalador **mostra** o bloco pronto para colar; armar é
+> um gesto seu.
+>
+> Enquanto não for armado, a skill funciona **na mão**: `ia-compactacao --mapa`
+> escreve o mapa, `--inicio` imprime o ponteiro. O que não acontece sozinho é o
+> gatilho. Rode `iachat doctor` para ver se ele está armado nesta máquina.
 
 ## O sino
 
