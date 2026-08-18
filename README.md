@@ -81,7 +81,7 @@ iachat read --de codex --todas                  # + conversa entre terceiros
 iachat read --de codex --tudo                   # a sala inteira (caro, explícito)
 iachat entregar --de codex                      # usado pelo hook: injeta o que é dele
 iachat read --de codex --sem-avancar            # ler sem mexer no cursor
-iachat page recorte-01 4
+iachat page recorte-01 4     # existe depois que a sala rotaciona
 iachat rotate                                   # arquiva o excedente (idempotente)
 iachat sino off                                 # muda a notificação do operador
 ```

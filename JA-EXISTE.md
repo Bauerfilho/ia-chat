@@ -9,7 +9,7 @@
 > A régua: **ressuscitar ideia descartada exige número novo** — medição nova, não
 > convicção nova.
 
-## As 25 peças que existem hoje
+## As 26 peças que existem hoje
 
 Medido em 18/08 com `ls -d skills/*/`. Cada uma resolve **um** problema; se a sua ideia
 resolve o mesmo, é melhoria de peça, não peça nova.
@@ -44,6 +44,7 @@ resolve o mesmo, é melhoria de peça, não peça nova.
 | `ia-plan` | acionar outra IA em modo plano (seco por padrão) |
 | `ia-roster` | quem está na sala e o que o disco prova |
 | `ia-decide` | o que já foi decidido, antes de rediscutir |
+| `ia-retratar` | desdizer sem apagar: a mensagem errada continua no histórico, mas a busca avisa |
 | `ia-comandos` | os comandos do dono: `/goal` `/plan` `/concluir` `/parar` `/quem` `/decidi` `/refaz` |
 
 ### Higiene e diagnóstico
@@ -74,8 +75,9 @@ Estas foram medidas contra o produto rodando. São trabalho legítimo, não idei
 3. ~~entrar na sala é editar JSON à mão~~ — **fechada em 18/08**: `iachat entrar <ia>`
    inscreve E confere a infra. O código de saída carrega a diferença que importa:
    **0 = entrou e recebe · 1 = entrou mas não recebe sozinha**, com o comando que falta.
-4. **não existe retratação** — mensagem errada fica achável para sempre, e a correção não
-   invalida o que ela corrigiu.
+4. ~~não existe retratação~~ — **fechada em 18/08**: `ia-retratar`. Só o autor retrata o
+   próprio; decisão do dono não se retrata; e o `iachat search` NATIVO marca
+   `⚠ RETRATADA → #N`, que era o gap de integração no núcleo.
 5. ~~o `JA-EXISTE.md` não existe~~ — **fechada: é este arquivo.**
 
 ## Descartado com medida
@@ -88,4 +90,4 @@ cortou. Ideia sem medida não descarta nem sobrevive; só volta.
 
 > **Isto precisa ser uma peça nova, ou é um defeito de uma peça existente?**
 
-Defeito conserta-se. Peça nova custa manutenção para sempre — e este produto já tem 25.
+Defeito conserta-se. Peça nova custa manutenção para sempre — e este produto já tem 26.
