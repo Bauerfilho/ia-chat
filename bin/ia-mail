@@ -1,0 +1,495 @@
+#!/usr/bin/env python3
+"""ia-mail — ponte local e somente leitura para o índice do Mail.app.
+
+O Mail.app continua sendo o dono da autenticação. Este processo abre apenas o
+índice SQLite local em ``mode=ro`` e reforça a conexão com ``query_only``.
+Não há cliente IMAP, envio, edição de estado ou entrada de credencial.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sqlite3
+import sys
+import unicodedata
+from collections import Counter, defaultdict
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional, Sequence
+from urllib.parse import unquote, urlsplit
+
+
+RAIZ_MAIL = Path.home() / "Library" / "Mail"
+NOME_INDICE = "Envelope Index"
+TABELAS_NECESSARIAS = {"mailboxes", "messages", "addresses", "subjects", "summaries"}
+CONTROLES = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+ESPACOS = re.compile(r"\s+")
+EMAIL_NO_TEXTO = re.compile(
+    r"(?<![\w.+-])([\w.!#$%&'*+/=?^_`{|}~-]+)@([a-z0-9.-]+)", re.IGNORECASE
+)
+PREFIXOS_ASSUNTO = re.compile(r"^(?:(?:re|res|enc|fwd|fw)\s*:\s*)+", re.IGNORECASE)
+NAO_ALFANUMERICO = re.compile(r"[^a-z0-9]+")
+
+
+class ErroIaMail(RuntimeError):
+    """Falha operacional segura, já pronta para ser mostrada ao usuário."""
+
+
+def _numero_versao(caminho: Path) -> int:
+    """Ordena ``V10`` depois de ``V9`` sem depender de ordem alfabética."""
+    nome = caminho.parent.parent.name
+    return int(nome[1:]) if nome.startswith("V") and nome[1:].isdigit() else -1
+
+
+def localizar_indice(explicito: Optional[Path] = None) -> Path:
+    """Localiza o índice mais novo; um caminho explícito existe só para teste/auditoria."""
+    if explicito is not None:
+        candidato = explicito.expanduser()
+        if not candidato.is_file():
+            raise ErroIaMail(f"índice local não encontrado: {candidato}")
+        return candidato.resolve()
+
+    candidatos = [
+        caminho
+        for caminho in RAIZ_MAIL.glob("V*/MailData/Envelope Index")
+        if caminho.is_file()
+    ]
+    if not candidatos:
+        raise ErroIaMail(
+            "índice local do Mail.app não encontrado; nenhuma rota com credencial será tentada"
+        )
+    return max(candidatos, key=_numero_versao).resolve()
+
+
+def abrir_somente_leitura(indice: Path) -> sqlite3.Connection:
+    """Abre o SQLite fail-closed: URI ``mode=ro`` mais ``PRAGMA query_only``."""
+    uri = indice.as_uri() + "?mode=ro"
+    try:
+        conexao = sqlite3.connect(uri, uri=True, timeout=1.5)
+        conexao.row_factory = sqlite3.Row
+        conexao.execute("PRAGMA query_only = ON")
+        conexao.execute("PRAGMA busy_timeout = 1500")
+        existentes = {
+            linha[0]
+            for linha in conexao.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        faltantes = sorted(TABELAS_NECESSARIAS - existentes)
+        if faltantes:
+            conexao.close()
+            raise ErroIaMail(
+                "índice do Mail incompatível; tabelas ausentes: " + ", ".join(faltantes)
+            )
+        return conexao
+    except sqlite3.Error as erro:
+        raise ErroIaMail(f"não foi possível abrir o índice local em modo somente leitura: {erro}")
+
+
+def limpar_texto(valor: object, limite: int) -> str:
+    """Remove controles de terminal, achata espaços e aplica um teto previsível."""
+    texto = "" if valor is None else str(valor)
+    texto = CONTROLES.sub(" ", texto)
+    texto = ESPACOS.sub(" ", texto).strip()
+    if len(texto) <= limite:
+        return texto
+    return texto[: max(0, limite - 1)].rstrip() + "…"
+
+
+def nome_caixa(url: str, rowid: int) -> str:
+    """Extrai só o nome humano da caixa e nunca imprime a URL/conta do Mail."""
+    partes = [unquote(p) for p in urlsplit(url or "").path.split("/") if p]
+    bruto = partes[-1] if partes else f"caixa-{rowid}"
+    aliases = {
+        "INBOX": "Entrada",
+        "Sent": "Enviados",
+        "Sent Messages": "Enviados",
+        "Drafts": "Rascunhos",
+        "Trash": "Lixeira",
+        "Junk": "Spam",
+        "Archive": "Arquivo",
+        "All Mail": "Todos os e-mails",
+    }
+    nome = limpar_texto(aliases.get(bruto, bruto), 80) or f"caixa-{rowid}"
+    return mascarar_emails_no_texto(nome)
+
+
+def mascarar_endereco(endereco: object) -> str:
+    """Mantém domínio útil para reconhecer repetição sem revelar endereço completo."""
+    texto = limpar_texto(endereco, 254).casefold()
+    if "@" not in texto:
+        return "***"
+    local, dominio = texto.rsplit("@", 1)
+    inicial = local[:1] if local else ""
+    return f"{inicial}***@{dominio}" if dominio else "***"
+
+
+def mascarar_emails_no_texto(texto: str) -> str:
+    """Mascara endereços que apareçam dentro de nome, assunto, trecho ou caixa."""
+    return EMAIL_NO_TEXTO.sub(lambda m: mascarar_endereco(m.group(0)), texto)
+
+
+def data_legivel(valor: object) -> str:
+    """Converte o timestamp Unix guardado pelo Mail para horário local ISO."""
+    try:
+        instante = datetime.fromtimestamp(int(valor), tz=timezone.utc).astimezone()
+    except (TypeError, ValueError, OSError, OverflowError):
+        return "desconhecida"
+    return instante.isoformat(timespec="minutes")
+
+
+def listar_caixas(conexao: sqlite3.Connection) -> list[dict]:
+    """Lista caixas por consulta SELECT; nenhuma mensagem é aberta ou marcada."""
+    linhas = conexao.execute(
+        """
+        SELECT ROWID AS id, url, total_count, unread_count
+        FROM mailboxes
+        ORDER BY unread_count DESC, total_count DESC, ROWID ASC
+        """
+    ).fetchall()
+    return [
+        {
+            "id": int(linha["id"]),
+            "caixa": nome_caixa(linha["url"], int(linha["id"])),
+            "total": int(linha["total_count"] or 0),
+            "nao_lidas": int(linha["unread_count"] or 0),
+        }
+        for linha in linhas
+    ]
+
+
+def obter_caixa(conexao: sqlite3.Connection, caixa_id: int) -> dict:
+    """Resolve uma caixa pelo ID mostrado por ``ia-mail caixas``."""
+    linha = conexao.execute(
+        """
+        SELECT ROWID AS id, url, total_count, unread_count
+        FROM mailboxes
+        WHERE ROWID = ?
+        """,
+        (caixa_id,),
+    ).fetchone()
+    if linha is None:
+        raise ErroIaMail(f"caixa {caixa_id} não existe; rode `ia-mail caixas`")
+    return {
+        "id": int(linha["id"]),
+        "caixa": nome_caixa(linha["url"], int(linha["id"])),
+        "total": int(linha["total_count"] or 0),
+        "nao_lidas": int(linha["unread_count"] or 0),
+    }
+
+
+def mensagens_recentes(
+    conexao: sqlite3.Connection, caixa_id: int, limite: int, privado: bool
+) -> list[dict]:
+    """Lê cabeçalho e resumo prontos do índice; não abre o corpo nem altera flags."""
+    linhas = conexao.execute(
+        """
+        SELECT
+            m.ROWID AS id,
+            a.address AS endereco,
+            a.comment AS nome_remetente,
+            s.subject AS assunto,
+            sm.summary AS trecho,
+            COALESCE(m.date_received, m.date_sent) AS recebida_em,
+            m.read AS lida
+        FROM messages AS m
+        LEFT JOIN addresses AS a ON a.ROWID = m.sender
+        LEFT JOIN subjects AS s ON s.ROWID = m.subject
+        LEFT JOIN summaries AS sm ON sm.ROWID = m.summary
+        WHERE m.mailbox = ? AND m.deleted = 0
+        ORDER BY COALESCE(m.date_received, m.date_sent) DESC, m.ROWID DESC
+        LIMIT ?
+        """,
+        (caixa_id, limite),
+    ).fetchall()
+
+    mensagens = []
+    for linha in linhas:
+        oculto = "(oculto no modo privado)"
+        mensagens.append(
+            {
+                "id": int(linha["id"]),
+                "remetente": oculto
+                if privado
+                else mascarar_emails_no_texto(
+                    limpar_texto(linha["nome_remetente"], 100) or "(sem nome)"
+                ),
+                "endereco": mascarar_endereco(linha["endereco"]),
+                "assunto": oculto
+                if privado
+                else mascarar_emails_no_texto(
+                    limpar_texto(linha["assunto"], 180) or "(sem assunto)"
+                ),
+                "trecho": oculto
+                if privado
+                else mascarar_emails_no_texto(
+                    limpar_texto(linha["trecho"], 320) or "(sem trecho)"
+                ),
+                "recebida_em": data_legivel(linha["recebida_em"]),
+                "nao_lida": not bool(linha["lida"]),
+            }
+        )
+    return mensagens
+
+
+def normalizar_chave(valor: object) -> str:
+    """Normaliza remetente sem perder dígitos que possam distinguir contas legítimas."""
+    texto = limpar_texto(valor, 500).casefold()
+    decomposicao = unicodedata.normalize("NFKD", texto)
+    sem_acentos = "".join(c for c in decomposicao if not unicodedata.combining(c))
+    return ESPACOS.sub(" ", sem_acentos).strip()
+
+
+def normalizar_assunto(valor: object) -> str:
+    """Une variações cosméticas, mas preserva números para não fabricar repetição."""
+    assunto = PREFIXOS_ASSUNTO.sub("", normalizar_chave(valor))
+    return NAO_ALFANUMERICO.sub(" ", assunto).strip() or "(sem assunto)"
+
+
+def detectar_repeticoes(
+    conexao: sqlite3.Connection,
+    caixa_id: int,
+    limite: int,
+    minimo: int,
+    privado: bool,
+) -> tuple[int, list[dict]]:
+    """Agrupa a janela por remetente e mede linhas de assunto repetidas em memória."""
+    linhas = conexao.execute(
+        """
+        SELECT
+            a.address AS endereco,
+            a.comment AS nome_remetente,
+            s.subject AS assunto
+        FROM messages AS m
+        LEFT JOIN addresses AS a ON a.ROWID = m.sender
+        LEFT JOIN subjects AS s ON s.ROWID = m.subject
+        WHERE m.mailbox = ? AND m.deleted = 0
+        ORDER BY COALESCE(m.date_received, m.date_sent) DESC, m.ROWID DESC
+        LIMIT ?
+        """,
+        (caixa_id, limite),
+    ).fetchall()
+
+    grupos = defaultdict(list)
+    for linha in linhas:
+        endereco = normalizar_chave(linha["endereco"])
+        nome = normalizar_chave(linha["nome_remetente"])
+        chave = endereco or nome or "(remetente desconhecido)"
+        grupos[chave].append(linha)
+
+    repeticoes = []
+    for grupo in grupos.values():
+        if len(grupo) < minimo:
+            continue
+        assuntos = Counter(normalizar_assunto(linha["assunto"]) for linha in grupo)
+        amostras = {}
+        for linha in grupo:
+            chave_assunto = normalizar_assunto(linha["assunto"])
+            amostras.setdefault(
+                chave_assunto,
+                mascarar_emails_no_texto(
+                    limpar_texto(linha["assunto"], 180) or "(sem assunto)"
+                ),
+            )
+        linhas_repetidas = [
+            {
+                "assunto": "(oculto no modo privado)" if privado else amostras[chave],
+                "quantidade": quantidade,
+            }
+            for chave, quantidade in assuntos.most_common()
+            if quantidade >= 2
+        ]
+        primeira = grupo[0]
+        repeticoes.append(
+            {
+                "remetente": "(oculto no modo privado)"
+                if privado
+                else mascarar_emails_no_texto(
+                    limpar_texto(primeira["nome_remetente"], 100) or "(sem nome)"
+                ),
+                "endereco": mascarar_endereco(primeira["endereco"]),
+                "mensagens": len(grupo),
+                "assuntos_distintos": len(assuntos),
+                "linhas_repetidas": linhas_repetidas,
+            }
+        )
+
+    repeticoes.sort(
+        key=lambda item: (-item["mensagens"], item["endereco"], item["remetente"])
+    )
+    return len(linhas), repeticoes
+
+
+def imprimir_json(dados: object) -> None:
+    """Emite JSON UTF-8 estável para uso por outras cascas."""
+    print(json.dumps(dados, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+def cmd_caixas(conexao: sqlite3.Connection, como_json: bool) -> int:
+    caixas = listar_caixas(conexao)
+    if como_json:
+        imprimir_json({"rota": "mail-local-sqlite-readonly", "caixas": caixas})
+        return 0
+
+    print("Caixas locais do Mail.app — somente leitura")
+    print(" ID  NÃO LIDAS   TOTAL  CAIXA")
+    for caixa in caixas:
+        print(
+            f"{caixa['id']:>3}  {caixa['nao_lidas']:>9}  "
+            f"{caixa['total']:>6}  {caixa['caixa']}"
+        )
+    return 0
+
+
+def cmd_recentes(
+    conexao: sqlite3.Connection,
+    caixa_id: int,
+    limite: int,
+    privado: bool,
+    como_json: bool,
+) -> int:
+    caixa = obter_caixa(conexao, caixa_id)
+    mensagens = mensagens_recentes(conexao, caixa_id, limite, privado)
+    dados = {"rota": "mail-local-sqlite-readonly", "caixa": caixa, "mensagens": mensagens}
+    if como_json:
+        imprimir_json(dados)
+        return 0
+
+    print(
+        f"{caixa['caixa']} — {len(mensagens)} recente(s), "
+        f"{caixa['nao_lidas']} não lida(s) na caixa"
+    )
+    for posicao, mensagem in enumerate(mensagens, 1):
+        estado = "não lida" if mensagem["nao_lida"] else "lida"
+        print(f"\n[{posicao}] {mensagem['recebida_em']} · {estado}")
+        print(f"    De: {mensagem['remetente']} <{mensagem['endereco']}>")
+        print(f"    Assunto: {mensagem['assunto']}")
+        print(f"    Trecho: {mensagem['trecho']}")
+    return 0
+
+
+def cmd_repeticoes(
+    conexao: sqlite3.Connection,
+    caixa_id: int,
+    limite: int,
+    minimo: int,
+    privado: bool,
+    como_json: bool,
+) -> int:
+    caixa = obter_caixa(conexao, caixa_id)
+    analisadas, repeticoes = detectar_repeticoes(
+        conexao, caixa_id, limite, minimo, privado
+    )
+    dados = {
+        "rota": "mail-local-sqlite-readonly",
+        "caixa": caixa,
+        "janela_solicitada": limite,
+        "mensagens_analisadas": analisadas,
+        "minimo_para_repetir": minimo,
+        "repeticoes": repeticoes,
+    }
+    if como_json:
+        imprimir_json(dados)
+        return 0
+
+    print(
+        f"{caixa['caixa']} — {analisadas} mensagem(ns) analisada(s); "
+        f"{len(repeticoes)} remetente(s) com {minimo}+ ocorrência(s)"
+    )
+    if not repeticoes:
+        print("Nenhuma repetição na janela.")
+        return 0
+    for posicao, grupo in enumerate(repeticoes, 1):
+        print(
+            f"\n[{posicao}] {grupo['remetente']} <{grupo['endereco']}> · "
+            f"{grupo['mensagens']} mensagens · {grupo['assuntos_distintos']} assuntos"
+        )
+        if not grupo["linhas_repetidas"]:
+            print("    Sem linha de assunto idêntica repetida.")
+        for linha in grupo["linhas_repetidas"]:
+            print(f"    ×{linha['quantidade']}  {linha['assunto']}")
+    return 0
+
+
+def inteiro_entre(minimo: int, maximo: int):
+    """Cria um validador argparse com erro claro e teto contra saída acidental enorme."""
+
+    def converter(valor: str) -> int:
+        try:
+            numero = int(valor)
+        except ValueError:
+            raise argparse.ArgumentTypeError("use um número inteiro")
+        if not minimo <= numero <= maximo:
+            raise argparse.ArgumentTypeError(f"use um valor entre {minimo} e {maximo}")
+        return numero
+
+    return converter
+
+
+def criar_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="ia-mail",
+        description="Lê o índice local do Mail.app sem credencial e sem alterar a caixa.",
+    )
+    parser.add_argument(
+        "--db",
+        type=Path,
+        help="índice SQLite explícito (destinado a teste/auditoria; sempre aberto read-only)",
+    )
+    parser.add_argument(
+        "--json", action="store_true", help="emite saída JSON para outra casca"
+    )
+    parser.add_argument(
+        "--privado",
+        action="store_true",
+        help="oculta nomes, assuntos e trechos; útil para prova sem transcrever conteúdo",
+    )
+
+    sub = parser.add_subparsers(dest="comando", required=True)
+    sub.add_parser("caixas", help="lista caixas, totais e não-lidos")
+
+    recentes = sub.add_parser("recentes", help="lê cabeçalho e trecho das N mais recentes")
+    recentes.add_argument("--caixa", type=inteiro_entre(1, 2_147_483_647), required=True)
+    recentes.add_argument("-n", "--limite", type=inteiro_entre(1, 100), default=10)
+
+    repeticoes = sub.add_parser(
+        "repeticoes", help="agrupa a janela por remetente e aponta recorrência"
+    )
+    repeticoes.add_argument("--caixa", type=inteiro_entre(1, 2_147_483_647), required=True)
+    repeticoes.add_argument("-n", "--limite", type=inteiro_entre(1, 5000), default=500)
+    repeticoes.add_argument(
+        "--minimo", type=inteiro_entre(2, 5000), default=2,
+        help="quantidade mínima do remetente para entrar no laudo",
+    )
+    return parser
+
+
+def executar(argv: Optional[Sequence[str]] = None) -> int:
+    args = criar_parser().parse_args(argv)
+    try:
+        indice = localizar_indice(args.db)
+        with abrir_somente_leitura(indice) as conexao:
+            if args.comando == "caixas":
+                return cmd_caixas(conexao, args.json)
+            if args.comando == "recentes":
+                return cmd_recentes(
+                    conexao, args.caixa, args.limite, args.privado, args.json
+                )
+            if args.comando == "repeticoes":
+                return cmd_repeticoes(
+                    conexao,
+                    args.caixa,
+                    args.limite,
+                    args.minimo,
+                    args.privado,
+                    args.json,
+                )
+        raise ErroIaMail("comando não reconhecido")
+    except ErroIaMail as erro:
+        print(f"ia-mail: {erro}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(executar())

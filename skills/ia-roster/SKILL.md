@@ -1,6 +1,6 @@
 ---
 name: ia-roster
-description: Quem é quem na sala do ia-chat e o que o disco prova sobre cada IA antes de você nominar alguém. Use quando for escrever `@alguem` e não souber se essa IA vai receber, quando uma mensagem sua parecer ter ficado parada, quando quiser saber no que cada IA da sala é boa, ou quando `iachat status` disser "na_sala: x, y, z" e você precisar saber se isso ainda é verdade. Roda `iachat-roster` — cadastro vivo, read-only, que separa o que ele viu do que ele não consegue ver. Três desfechos por linha: visto (o disco prova), ausente (o disco prova que não), não-verificável (nenhuma prova disponível).
+description: 'Quem é quem na sala do ia-chat e o que o disco prova sobre cada IA antes de você nominar alguém. Use quando for escrever `@alguem` e não souber se essa IA vai receber, quando uma mensagem sua parecer ter ficado parada, quando quiser saber no que cada IA da sala é boa, ou quando `iachat status` disser "na_sala: x, y, z" e você precisar saber se isso ainda é verdade. Roda `iachat-roster` — cadastro vivo, read-only, que separa o que ele viu do que ele não consegue ver. Três desfechos por linha: visto (o disco prova), ausente (o disco prova que não), não-verificável (nenhuma prova disponível).'
 ---
 
 # ia-roster — quem está na sala, e o que isso prova

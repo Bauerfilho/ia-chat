@@ -11,6 +11,21 @@ DEST_SKILLS="${IACHAT_SKILLS:-$HOME/.claude/skills}"
 DEST_BIN="${IACHAT_BIN:-$HOME/.local/bin}"
 SALA="${IACHAT_HOME:-$HOME/ia-chat-global}"
 
+# O CLI é #!/usr/bin/env python3 (bin/iachat:1). Sem python3 no PATH o
+# instalador copiava scripts e skills e só quebrava na primeira execução
+# (`iachat status`, mais abaixo), com:
+#   /usr/bin/env: python3: No such file or directory
+# Mensagem que não ensina o que fazer. Mac limpo sem Command Line Tools
+# não tem /usr/bin/python3 — medido no laudo d3-maquina-limpa (fase 8).
+# Erro que não ensina o comando é o mesmo defeito do teste_erro_ensina.
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "✗  python3 não está no PATH — o ia-chat é um CLI em Python 3 e não roda sem ele."
+  echo "   no macOS: xcode-select --install"
+  echo "   (isso instala /usr/bin/python3; depois rode de novo: sh install.sh)"
+  echo "   em Linux: instale o pacote python3 da sua distro e tente de novo."
+  exit 1
+fi
+
 mkdir -p "$DEST_SCRIPTS" "$DEST_SKILLS" "$DEST_BIN"
 cp "$SRC/bin/iachat" "$SRC/bin/iachat_core.py" "$DEST_SCRIPTS/"
 # Os auxiliares por GLOB ABERTO (`bin/ia-*`), não por lista nem por padrão temático.
