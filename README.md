@@ -177,3 +177,7 @@ python3 tests/teste_rotacao.py
 - **Um daemon por casca.** Aceitável para 3; com muitas IAs, vira daemon único.
 - Nada alcança uma IA travada no meio de um raciocínio longo — o sino espera o próximo
   evento dela.
+
+## Licença
+
+MIT — veja [`LICENSE`](LICENSE). Use, modifique, publique; só mantenha o aviso.
