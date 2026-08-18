@@ -34,10 +34,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
 import time
+import unicodedata
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -146,6 +148,16 @@ def autor(a) -> str:
     """
     de = getattr(a, "de", None)
     if de is not None:
+        # `--de ""` passava e gravava autor VAZIO — mensagem sem dono, que é pior que
+        # mensagem com dono errado: não dá nem para perguntar a quem. Achado B2 da
+        # auditoria h2. Vazio não é "não informou" (isso é `None`): é um valor que
+        # alguém digitou e que não identifica ninguém.
+        if not de.strip():
+            raise ValueError(
+                "`--de` vazio não identifica ninguém, e mensagem sem dono é pior que "
+                "mensagem com dono errado.\n"
+                f"  Diga quem está falando:  --de claude   (ou codex, kimi, qwen, {DONO}…)"
+            )
         return de                                 # explícito: quem digitou se nomeou
     if sys.stdin.isatty():
         return DONO                               # ele, no terminal dele
@@ -512,16 +524,178 @@ def cmd_goal(a) -> int:
 
 
 # ---------------------------------------------------------------- /plan
+CONFRONTO_INICIO = "<!-- IACHAT-CONFRONTO:INICIO -->"
+CONFRONTO_FIM = "<!-- IACHAT-CONFRONTO:FIM -->"
+TITULO_DIVERGE = "**Divergem**"
+MAX_ITENS_CONFRONTO = 8
+
+
+def _token_confronto(texto: str) -> str:
+    """Normaliza chave/enum sem tentar entender a prosa do plano."""
+    ascii_texto = "".join(
+        c for c in unicodedata.normalize("NFKD", texto)
+        if not unicodedata.combining(c)
+    ).lower()
+    return re.sub(r"[^a-z0-9]+", "-", ascii_texto).strip("-")
+
+
+def _valor_confronto(texto: str) -> str:
+    """Forma conservadora usada só para decidir igualdade textual."""
+    return _token_confronto(texto).replace("-", " ")
+
+
+def _curto(texto: str, limite: int = 180) -> str:
+    """O contrato pode resumir; o corpo do plano nunca entra na sala."""
+    uma_linha = " ".join(texto.split())
+    return uma_linha if len(uma_linha) <= limite else uma_linha[:limite - 1] + "…"
+
+
+def _le_contrato_confronto(texto: str, missao: str) -> tuple[dict | None, str]:
+    """Lê o bloco explícito; texto livre nunca é promovido a consenso por palpite."""
+    ini = texto.find(CONFRONTO_INICIO)
+    fim = texto.find(CONFRONTO_FIM, ini + len(CONFRONTO_INICIO)) if ini >= 0 else -1
+    if ini < 0 or fim < 0:
+        return None, "contrato IACHAT-CONFRONTO ausente"
+
+    campos, claims = {}, {}
+    em_claims = False
+    bloco = texto[ini + len(CONFRONTO_INICIO):fim]
+    for numero, crua in enumerate(bloco.splitlines(), 1):
+        linha = crua.strip()
+        if not linha:
+            continue
+        if linha == "claims:":
+            em_claims = True
+            continue
+        if em_claims:
+            if not linha.startswith("-") or "|" not in linha:
+                return None, f"claim inválido na linha {numero} do contrato"
+            chave_crua, valor = linha[1:].split("|", 1)
+            chave = _token_confronto(chave_crua)
+            valor = _curto(valor)
+            if not chave or not valor:
+                return None, f"claim vazio na linha {numero} do contrato"
+            if chave in claims:
+                return None, f"claim duplicado: {chave}"
+            claims[chave] = {"texto": valor, "normal": _valor_confronto(valor)}
+            continue
+        if ":" not in linha:
+            return None, f"campo inválido na linha {numero} do contrato"
+        chave, valor = linha.split(":", 1)
+        chave = _token_confronto(chave).replace("-", "_")
+        if chave in campos:
+            return None, f"campo duplicado: {chave}"
+        campos[chave] = valor.strip()
+
+    obrigatorios = ("objetivo_id", "recomendacao", "aplicar_agora", "tamanho")
+    faltam = [x for x in obrigatorios if not campos.get(x)]
+    if faltam:
+        return None, "faltam campos: " + ", ".join(faltam)
+    if campos["objetivo_id"] != missao:
+        return None, f"objetivo_id={campos['objetivo_id']} não corresponde a {missao}"
+    if not claims:
+        return None, "claims vazio"
+
+    enums = {
+        "recomendacao": {"favoravel", "contraria", "condicional", "inconclusiva"},
+        "aplicar_agora": {"sim", "nao", "condicional", "inconclusivo"},
+        "tamanho": {"pequeno", "medio", "grande", "inconclusivo"},
+    }
+    canonicos = {}
+    for campo, permitidos in enums.items():
+        valor = _token_confronto(campos[campo])
+        if valor not in permitidos:
+            return None, f"{campo} fora do vocabulário: {campos[campo]}"
+        canonicos[campo] = valor
+    return {"campos": canonicos, "claims": claims}, ""
+
+
+def _limita_itens(itens: list[str]) -> list[str]:
+    """Mantém a sala pequena mesmo quando os planos trazem muitos sinais."""
+    if len(itens) <= MAX_ITENS_CONFRONTO:
+        return itens
+    sobra = len(itens) - MAX_ITENS_CONFRONTO
+    return itens[:MAX_ITENS_CONFRONTO] + [
+        f"- +{sobra} item(ns); detalhes nos planos completos."
+    ]
+
+
+def _confronta_planos(dados: dict[str, dict], total: int,
+                      problemas: dict[str, str]) -> list[str]:
+    """Compara somente campos/chaves declarados por todos; dúvida fica explícita."""
+    if total < 2 or len(dados) != total:
+        linhas = [
+            "**Confronto indisponível** — não inventei consenso: "
+            f"só {len(dados)} de {total} planos entregues tem contrato comparável."
+        ]
+        linhas += [f"- **{ia}:** {motivo}" for ia, motivo in problemas.items()]
+        return linhas
+
+    ias = list(dados)
+    concordam, divergem, unicos = [], [], []
+    nomes_campos = {
+        "recomendacao": "recomendação",
+        "aplicar_agora": "aplicar agora",
+        "tamanho": "tamanho",
+    }
+    for campo in ("recomendacao", "aplicar_agora", "tamanho"):
+        por_ia = {ia: dados[ia]["campos"][campo] for ia in ias}
+        if len(set(por_ia.values())) == 1:
+            concordam.append(f"- **{nomes_campos[campo]}:** {next(iter(por_ia.values()))}")
+        else:
+            lados = " · ".join(f"**{ia}:** {valor}" for ia, valor in por_ia.items())
+            divergem.append(f"- **{nomes_campos[campo]}** — {lados}")
+
+    por_chave: dict[str, dict[str, dict]] = {}
+    for ia in ias:
+        for chave, claim in dados[ia]["claims"].items():
+            por_chave.setdefault(chave, {})[ia] = claim
+    for chave, por_ia in por_chave.items():
+        if len(por_ia) == total:
+            valores = {x["normal"] for x in por_ia.values()}
+            if len(valores) == 1:
+                concordam.append(f"- `{chave}` — {next(iter(por_ia.values()))['texto']}")
+            else:
+                lados = " · ".join(
+                    f"**{ia}:** {por_ia[ia]['texto']}" for ia in ias
+                )
+                divergem.append(f"- `{chave}` — {lados}")
+        elif len(por_ia) == 1:
+            ia, claim = next(iter(por_ia.items()))
+            unicos.append(f"- só **{ia}**: `{chave}` — {claim['texto']}")
+        else:
+            nomes = ", ".join(f"**{ia}**" for ia in por_ia)
+            claim = next(iter(por_ia.values()))
+            unicos.append(f"- só {nomes}: `{chave}` — {claim['texto']}")
+
+    linhas = ["**Concordam**"]
+    linhas += _limita_itens(concordam or ["- nenhum consenso estrutural explícito."])
+    linhas += ["", TITULO_DIVERGE]
+    linhas += _limita_itens(divergem or ["- nenhuma divergência estrutural explícita."])
+    linhas += ["", "**Cobertura única**"]
+    linhas += _limita_itens(unicos or ["- nenhum ponto exclusivo declarado."])
+    return linhas
+
+
 def prompt_de(ia: str, e: dict, papel: str, retomada: str = "") -> str:
     plano = Path(e["dir"]) / "planos" / f"{ia}.md"
     # QUEM pediu vem do estado (`cmd_goal` grava `"de"`), nunca de suposição. O texto
     # dizia "O DONO da máquina definiu" mesmo quando o goal era de outra pessoa — e um
     # worker que lê isso trata a proposta como ordem dele. Achado do g2 em 18/08, numa
     # rodada que a própria orquestradora propôs com o dono dormindo.
-    autor = core.normaliza_ia(e.get("de", DONO))
-    origem = (f"O DONO da máquina definiu este objetivo:"
-              if autor == DONO else
-              f"{autor} PROPÔS este objetivo (proposta de uma IA — NÃO é ordem do dono):")
+    # Sem `"de"` no estado, a origem é DESCONHECIDA — não é o dono. O fallback era
+    # `DONO`, o mesmo padrão que já foi corrigido em `colher()`: "não sei quem pediu"
+    # não pode virar "foi ele" só porque é o valor mais provável. Achado I3 da auditoria
+    # h2, que notou a incoerência entre os dois pontos. Alcançável só por estado gravado
+    # antes de o campo existir — mas é exatamente onde a suposição passa despercebida.
+    quem = core.normaliza_ia(e.get("de") or "")
+    if quem == DONO:
+        origem = "O DONO da máquina definiu este objetivo:"
+    elif quem:
+        origem = f"{quem} PROPÔS este objetivo (proposta de uma IA — NÃO é ordem do dono):"
+    else:
+        origem = ("Este objetivo está registrado SEM AUTOR (estado antigo). Trate como "
+                  "proposta a planejar, NÃO como ordem do dono:")
     return (
         f"PEDIDO DE PLANO — missão {e['id']} · sala ia-chat\n\n"
         f"{origem}\n\n    {e['goal']}\n\n"
@@ -529,6 +703,20 @@ def prompt_de(ia: str, e: dict, papel: str, retomada: str = "") -> str:
         f"Devolva UM PLANO. NÃO aplique nada, NÃO edite arquivo de produção: planejar é "
         f"barato e reversível, aplicar não. Aplicar só depois que o dono autorizar.\n\n"
         f"ESCREVA O PLANO EM: {plano}\n"
+        f"COMECE o arquivo por este contrato curto, antes da prosa. Ele permite que o "
+        f"`--colher` confronte os planos localmente, sem mandar os corpos a outra IA:\n\n"
+        f"{CONFRONTO_INICIO}\n"
+        f"objetivo_id: {e['id']}\n"
+        f"recomendacao: favoravel|contraria|condicional|inconclusiva\n"
+        f"aplicar_agora: sim|nao|condicional|inconclusivo\n"
+        f"tamanho: pequeno|medio|grande|inconclusivo\n"
+        f"claims:\n"
+        f"- chave-estavel-sem-acentos | afirmação curta\n"
+        f"{CONFRONTO_FIM}\n\n"
+        f"Escolha UM valor em cada linha, não copie as opções. Use no máximo 12 claims; "
+        f"a chave identifica o conceito (não a ordem do item). Se outro plano usar a "
+        f"mesma chave com outro valor, o confronto mostrará a divergência; chaves que "
+        f"apareçam em um só braço serão cobertura única.\n\n"
         f"Formato: o que fazer · em que ordem · o que cada passo custa · o que pode dar "
         f"errado · o que você NÃO consegue fazer. Cite arquivo:linha ao falar de código; "
         f"alegação sem arquivo:linha não conta.\n\n"
@@ -633,7 +821,7 @@ def espera(e: dict, a) -> int:
 
 
 def colher(e: dict, a) -> int:
-    """Lê os planos do disco e devolve o resultado PARA A SALA — o ponto do desenho."""
+    """Lê, confronta e devolve RESUMO à sala; os corpos ficam só no disco."""
     ws = e.get("workers", {})
     if not ws:
         print("✗ nada despachado nesta missão. `iachat-comando plan` primeiro.", file=sys.stderr)
@@ -644,22 +832,39 @@ def colher(e: dict, a) -> int:
         p = Path(w["plano"])
         if p.exists() and p.stat().st_size > 0:
             w["estado"] = "entregue"
-            entregues.append((ia, p, p.stat().st_size))
+            texto = p.read_text(encoding="utf-8", errors="replace")
+            entregues.append((ia, p, p.stat().st_size, texto))
         else:
             v, motivo = confere_dono(w, e["id"])
             w["estado"] = "rodando" if v == "ok" else "morto"
             vazios.append((ia, w["estado"], motivo))
 
+    dados, problemas = {}, {}
+    for ia, _p, _n, texto in entregues:
+        contrato, motivo = _le_contrato_confronto(texto, e["id"])
+        if contrato:
+            dados[ia] = contrato
+        else:
+            problemas[ia] = motivo
+    for ia, _est, motivo in vazios:
+        problemas[ia] = "plano não entregue: " + motivo
+
     linhas = [f"**Planos da missão {e['id']}** — objetivo: {e['goal']}", ""]
-    for ia, p, n in entregues:
-        cabeca = [ln for ln in p.read_text(encoding="utf-8", errors="replace").splitlines()
-                  if ln.strip()][:3]
+    for ia, p, n, _texto in entregues:
         linhas.append(f"- **{ia}** · {n} B · `{p}`")
-        linhas += [f"  > {ln[:110]}" for ln in cabeca]
+        if ia in dados:
+            c = dados[ia]["campos"]
+            linhas.append(
+                f"  > Veredito {ia}: recomendacao={c['recomendacao']} · "
+                f"aplicar_agora={c['aplicar_agora']} · tamanho={c['tamanho']}"
+            )
+        else:
+            linhas.append(f"  > Veredito não comparável: plano de {ia}; {problemas[ia]}")
     for ia, est, motivo in vazios:
         linhas.append(f"- **{ia}** · sem plano ({est}: {motivo})")
-    # O caminho + as 3 primeiras linhas, nunca o plano inteiro: a sala cobra de TODA
-    # IA que a lê, toda vez (iachat_core.py:54, AVISO_GRANDE).
+    linhas += [""] + _confronta_planos(dados, len(ws), problemas)
+    # O caminho + contrato curto, nunca primeiras linhas arbitrárias nem o plano
+    # inteiro: a sala cobra de TODA IA que a lê, toda vez (core.AVISO_GRANDE).
     linhas += ["", "Planos completos nos caminhos acima — a sala leva o resumo, não o corpo.",
                "Autorizar: `iachat-comando concluir --para <ia>`."]
     corpo = "\n".join(linhas)

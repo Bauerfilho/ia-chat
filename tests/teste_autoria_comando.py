@@ -171,7 +171,58 @@ checa("o dono NÃO entra como worker", "bauer" not in saída.lower(),
       f"o humano foi despachado como IA:\n      {saída.strip()[:200]}")
 checa("as IAs entram", "codex" in saída and "kimi" in saída, saída.strip()[:150])
 
-for h in (home, home2, home3, home4):
+# ── M1. os OUTROS pontos de assinatura ──────────────────────────────────────
+# A auditoria h2 provou que este gate ficava 14 ✔ com o `cmd_concluir` INTEIRO
+# revertido ao pré-fix: cobria `goal` e `decidi` e deixava `concluir`, `parar` e
+# `colher` sem um único caso. `concluir` é o pior lugar para essa cegueira — é o
+# comando que AUTORIZA APLICAR, o único que muda o mundo.
+#
+# Exercitar de verdade custa montar o cenário: `concluir` recusa antes de assinar se
+# não houver plano no disco. Um teste que se contentasse com essa recusa mediria a
+# validação de plano, não a autoria — verde pelo motivo errado.
+home5, env5 = sala_nova()
+subprocess.run([sys.executable, str(RAIZ / "bin" / "iachat"), "status"],
+               env=env5, capture_output=True, stdin=subprocess.DEVNULL, timeout=60)
+roda(env5, "goal", "objetivo para autorizar", "--de", "claude", "--calado")
+
+est = home5 / "comando" / "estado.json"
+e = json.loads(est.read_text(encoding="utf-8"))
+plano = Path(e["dir"]) / "planos" / "codex.md"
+plano.parent.mkdir(parents=True, exist_ok=True)
+plano.write_text("# plano de mentira, com corpo\n", encoding="utf-8")
+e["workers"] = {"codex": {"plano": str(plano), "estado": "entregue"}}
+est.write_text(json.dumps(e, ensure_ascii=False, indent=2), encoding="utf-8")
+
+código, saída = roda(env5, "concluir", "--calado")
+checa("`concluir` sem TTY e sem --de: RECUSA", código != 0 and "sem terminal" in saída,
+      f"exit={código} · {saída.strip()[:150]}")
+checa("`concluir` recusado não autoriza nada",
+      json.loads(est.read_text(encoding="utf-8")).get("estado") != "autorizada",
+      "recusou a assinatura mas autorizou assim mesmo — o pior desfecho deste comando")
+
+código, saída = roda(env5, "concluir", "--de", "claude", "--calado")
+por = json.loads(est.read_text(encoding="utf-8")).get("autorizado", {}).get("por")
+checa("`concluir` com --de: autoriza e registra quem", código == 0 and por == "claude",
+      f"exit={código} · por={por!r}")
+
+# `parar`: mata processo, então assina um aviso de aborto na sala.
+home6, env6 = sala_nova()
+subprocess.run([sys.executable, str(RAIZ / "bin" / "iachat"), "status"],
+               env=env6, capture_output=True, stdin=subprocess.DEVNULL, timeout=60)
+roda(env6, "goal", "objetivo para abortar", "--de", "claude", "--calado")
+código, saída = roda(env6, "parar")
+checa("`parar` sem TTY e sem --de não assina pelo dono",
+      "sem terminal" in saída or "bauer" not in saída.lower(),
+      f"exit={código} · {saída.strip()[:150]}")
+
+# `--de ""` — achado B2: gravava autor VAZIO, mensagem sem dono nenhum.
+home7, env7 = sala_nova()
+código, saída = roda(env7, "goal", "x", "--de", "", "--calado")
+checa("`--de \"\"` é recusado (autor vazio não identifica ninguém)",
+      código != 0 and "vazio" in saída.lower(),
+      f"exit={código} · {saída.strip()[:150]}")
+
+for h in (home, home2, home3, home4, home5, home6, home7):
     shutil.rmtree(h.parent, ignore_errors=True)
 
 print(f"\n{_ok} ✔  {_falhou} ✗")

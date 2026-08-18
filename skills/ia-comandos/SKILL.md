@@ -5,6 +5,16 @@ description: Use quando o dono da máquina disser /goal, /plan, /concluir, /para
 
 # Os comandos do dono
 
+> ⚠️ **Se você é uma IA disparando isto, passe `--de <seu-nome>`.** O padrão de `--de` é
+> `bauer` porque estes comandos são dele, digitados no terminal dele. Sem terminal e sem
+> `--de`, o comando **recusa** em vez de assinar por ele — e faz certo: uma decisão
+> assinada por ele que ele não tomou é lida e obedecida por todas as outras IAs da sala.
+> `decidi` é o caso mais grave, porque registra decisão que todas obedecem.
+>
+> ```bash
+> iachat-comando goal "..." --de codex        # não `iachat-comando goal "..."`
+> ```
+
 Estes não são comandos de IA. São **os comandos dele**, e formam um ciclo fechado:
 
 | ele diz | acontece |
