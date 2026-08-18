@@ -151,8 +151,10 @@ Laudo C (kimi, 16 KB): **dá, com duas ressalvas**.
 ## 7. O que ainda não sei — **[aguarda]**
 
 - ~~**OpenClaw**~~ → **FECHADO** (laudo W-claw, 9.901 B). Ver §9.
-- **omniroute**: como guarda credencial de N provedores. *Worker rodando.*
-- **obsidian**: se tem algo de conexão. *Worker rodando.*
+- ~~**omniroute**~~ → **FECHADO**. Ver §10.
+- ~~**obsidian**~~ → **FECHADO**. Ver §10.
+
+**As quatro fontes que ele mandou investigar estão fechadas.**
 
 ## 8. O que não faço sem palavra dele
 
@@ -196,3 +198,59 @@ proposta, provada funcionando noutro canal.
 2. **Email**: continua nosso, pelas rotas do §1.
 3. **A forma do gateway** (servidor local + adapter em stdio, estilo `imsg`) é o desenho a
    copiar quando precisarmos de um canal que o claw não tem.
+
+---
+
+## 10. omniroute e obsidian — as duas últimas fontes, fechadas
+
+Laudo `O-omniroute-obsidian` (grok, 11.175 B).
+
+### omniroute — ⭐ ele JÁ resolve o problema de credencial, e está rodando aqui
+
+Não é Keychain, não é Vault, não é N arquivos de chave espalhados pelas cascas. **Cofre
+local de dois andares:**
+
+1. **envelope** — `STORAGE_ENCRYPTION_KEY` no `~/.omniroute/.env`;
+2. **segredo cifrado campo a campo** no SQLite:
+   - AES-256-GCM · formato `enc:v1:<iv_hex>:<ct_hex>:<authTag_hex>`
+   - derivação `scrypt(chave, "omniroute-field-encryption-v1", 32)`
+   - campos cifrados: `api_key`, `access_token`, `refresh_token`, `id_token`
+
+**E o mecanismo de uso é exatamente o que precisamos:** as cascas apontam para
+`127.0.0.1:20128` com **UMA** chave OmniRoute; o servidor escolhe o provedor, **decifra o
+token daquela linha** e fala com o upstream. **A casca nunca vê a credencial** do Google,
+Anthropic, xAI ou Qwen.
+
+**Provado em produção nesta máquina:** 15 conexões ativas (10 OAuth + 5 apikey), todas com
+envelope `enc:v1` — antigravity, agy, cline, grok-cli, codex, github, claude, kimi-coding…
+
+⇒ Comparado ao iron-proxy do hermes (§4): **mesmo princípio, muito mais simples**. Não
+intercepta TLS, não instala CA, não exige sandbox. Troca o segredo **no servidor**, não na
+borda da rede. Para o `ia-mail`, é o candidato mais realista.
+
+### ⚠️ O anti-padrão que vem de graça
+
+> *"Sem ele o código entra em **passthrough** (grava texto puro — modo dev)."*
+
+Se a `STORAGE_ENCRYPTION_KEY` falta, o omniroute **grava a credencial em claro**. É
+**fail-open**, e é o oposto da doutrina desta casa: chave ausente tem que **parar**, não
+degradar em silêncio para texto puro. Ao clonar o mecanismo, clonar o cofre e **inverter
+essa escolha** — sem chave, sem gravação.
+
+(Há também fallback de salt legado com auto-migração, de um bug histórico de decrypt
+cruzado. Vale copiar a auto-migração, que é honesta.)
+
+### obsidian — não é cofre, mas tem um plug útil
+
+`obs` 1.13.7 é motor de vault, **não** guarda credencial de provedor. O que serve é o
+plugin **`obsidian-local-rest-api` 5.1.0** em `127.0.0.1:27124` — REST **e MCP**, com
+Bearer. Ou seja: se um dia o mapa de retomada precisar ser lido ou escrito no vault dele
+pelo app, a ponte existe e é local.
+
+### O que muda no projeto
+
+| antes | depois |
+|---|---|
+| construir cofre de credencial | **clonar o do omniroute**, invertendo o fail-open |
+| Keychain como única rota sem senha | Keychain **ou** cofre cifrado local, os dois provados |
+| vault do Obsidian fora de alcance | alcançável por REST/MCP local, se precisar |
