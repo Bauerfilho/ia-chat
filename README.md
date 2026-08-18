@@ -122,7 +122,7 @@ infraestrutura** — o código de saída distingue *entrou* de *entrou e vai rec
 Não existe push para dentro de um CLI já aberto. Então:
 
 - **daemon** (LaunchAgent) → notifica o **humano** no desktop. Cobre IA fechada ou parada.
-- **hook** (`SessionStart` + `UserPromptSubmit`) → **entrega a mensagem** à IA, de carona
+- **hook** (`SessionStart` + `UserPromptSubmit`, os eventos do Claude Code e da Kimi) → **entrega a mensagem** à IA, de carona
   nos eventos dela. Cobre IA aberta e ocupada. Custa um `test -f` por evento e é
   silencioso quando não há mensagem.
 

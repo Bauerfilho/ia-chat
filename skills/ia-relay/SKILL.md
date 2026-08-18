@@ -81,11 +81,11 @@ minutos; 15 s não compra nada):
 <!-- ~/Library/LaunchAgents/com.bauer.iachat-relay.plist -->
 <key>ProgramArguments</key>
 <array>
-  <string>/Users/bauervieiracesarfilhovieira/Projetos/ia-chat/bin/iachat-relay</string>
+  <string>/Users/SEU_USUARIO/Projetos/ia-chat/bin/iachat-relay</string>
   <string>run</string>
 </array>
 <key>StartInterval</key><integer>60</integer>
-<key>StandardOutPath</key><string>/Users/bauervieiracesarfilhovieira/ia-chat-global/ia-relay.log</string>
+<key>StandardOutPath</key><string>/Users/SEU_USUARIO/ia-chat-global/ia-relay.log</string>
 ```
 
 Custo medido (proposta, NOTA.md): **46 ms e 1.078 B por ciclo** no regime ocioso —
