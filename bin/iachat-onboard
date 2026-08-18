@@ -30,14 +30,19 @@ escreveu. Duas razões medidas:
   · Decisão que vale não sobrevive na mensagem: a regra de precedência do operador, ensinada
     em 4.851 B na msg #9, some do ativo na primeira rotação (medido) e sobra só a marca com
     `Assuntos: —` vazia (iachat_core.py:474).
-Por isso decisão mora em DECISOES.md — append-only, fora do caminho da rotação, escrito por
-uma linha de CLI (`iachat-onboard decidir`). O briefing lê verbatim. Vazio, ele diz que está
-vazio; não preenche buraco com imaginação.
+Por isso decisão mora num registro próprio, fora do caminho da rotação — e esse registro é
+o `iachat-decide` (`decisoes.md`), um só. Este CLI mantinha o seu, em `DECISOES.md`, e no
+macOS os dois nomes são O MESMO ARQUIVO (filesystem case-insensitive): as duas escritas
+caíam no mesmo lugar com formatos diferentes, e a gravada aqui ficava INVISÍVEL ao
+`iachat-decide decisoes`. Medido em 18/08 — duas decisões gravadas, "1 de 1 registradas".
+Agora `decidir` delega e `briefing` lê o que o registro declara vigente. Vazio, ele diz que
+está vazio; não preenche buraco com imaginação.
 """
 from __future__ import annotations
 
 import argparse
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -130,7 +135,7 @@ def briefing(ia: str, teto: int = TETO_PADRAO) -> str:
         f"{len(txt.encode())} B\n"
         f"- procurar sem pagar .... `iachat search \"termo\" --de codex`\n"
         f"- responder ............. `iachat post --de {ia} --para <ia> \"...\"`\n"
-        f"- registrar uma decisão . `iachat-onboard decidir --de {ia} \"...\"`\n"
+        f"- registrar uma decisão . `iachat-decide decidir --de {ia} --porque \"...\" \"...\"`\n"
         f"\nRegras da sala: nunca escreva no .md com `>>` ou editor (o lock é do CLI) · "
         f"nomine com `@ia` ou nada chama ninguém em sala de 3+ · `@ia` entre crases é "
         f"exemplo e não toca sino · sua mensagem nunca toca o seu sino · escreva "
@@ -178,7 +183,19 @@ def briefing(ia: str, teto: int = TETO_PADRAO) -> str:
 
     # ── B2 · decisões que já valem (prioridade máxima: é o que rotação apaga) ─
     # só as entradas; o cabeçalho do arquivo (`#`, `>`) não é decisão
+    # As decisões vêm do `iachat-decide`, que é o registro — e vêm JÁ FILTRADAS pelo
+    # que está vigente, com revogação respeitada. Antes o briefing lia o arquivo cru e
+    # filtrava linhas `- [`, o formato próprio do onboard: uma decisão gravada pelo
+    # `iachat-decide` (formato `### 📜 D1 …`) era invisível ao recém-chegado, que é
+    # justamente quem mais precisa dela. Achado do worker `k2`.
     linhas_dec = [l for l in dec.splitlines() if l.startswith("- [")]
+    if not linhas_dec:
+        _d = Path(__file__).resolve().parent / "iachat-decide"
+        if _d.is_file():
+            _r = subprocess.run([sys.executable, str(_d), "decisoes"],
+                                capture_output=True, text=True)
+            linhas_dec = [f"- {l.strip()}" for l in _r.stdout.splitlines()
+                          if l.strip().startswith("D") and "[" in l]
     if linhas_dec:
         cab = "\n## Decisões que já valem — não reabra sem medida nova\n"
         acc, corte = cab, 0
@@ -196,7 +213,8 @@ def briefing(ia: str, teto: int = TETO_PADRAO) -> str:
             "\n## Decisões que já valem\n"
             f"(nenhuma registrada — `{p_decisoes()}` não existe ou está vazio)\n"
             "Este bloco é o único que ninguém deriva: uma decisão vale porque alguém a "
-            "declarou. Registrar custa uma linha: `iachat-onboard decidir --de <ia> \"...\"`.\n"
+            "declarou. Registrar: `iachat-decide decidir --de <ia> --porque '<motivo>' "
+            "'<a decisão>'`.\n"
         )
 
     # ── B3 · quem é quem, medido ─────────────────────────────────────────────
@@ -256,24 +274,39 @@ def cmd_briefing(a) -> int:
 
 
 def cmd_decidir(a) -> int:
-    """Append-only, fora do caminho da rotação. Uma linha, sem IA no meio."""
+    """DELEGA ao `iachat-decide`, que é o registro.
+
+    Este comando mantinha um registro PRÓPRIO em `DECISOES.md`, com formato de uma
+    linha, enquanto o `iachat-decide` mantinha o dele em `decisoes.md`, com metadado,
+    id, revogação e vigência. Dois registros para a mesma coisa já seria ruim; no macOS
+    é pior, porque o filesystem é **case-insensitive** e os dois nomes são o MESMO
+    ARQUIVO. Medido em 18/08: gravar por aqui e depois consultar `iachat-decide
+    decisoes` devolvia "1 decisão vigente de 1 registradas" — com duas gravadas. A
+    linha escrita aqui não tem o marcador `<!-- iadec`, então o parser do registro
+    oficial passa por cima dela.
+
+    O efeito prático é o pior possível para uma sala de IAs: alguém registra uma
+    decisão, o comando confirma "✔ registrada", e as outras nunca a obedecem porque o
+    registro que elas leem não a enxerga. Em Linux (case-sensitive) seriam dois
+    arquivos de verdade e o sintoma mudaria de forma — comportamento divergente por
+    plataforma, no lugar onde menos se pode ter.
+
+    Delegar é o que o `iachat-comando decidi` já fazia, pela mesma razão: duplicar o
+    registro cria um segundo lugar onde a verdade mora. Achado do worker `k2`.
+    """
     core.garantir_estrutura()
-    p = p_decisoes()
-    if not p.exists():
-        p.write_text(
-            "# 📌 Decisões da sala — o que não se reabre e o que não se repete\n"
-            "> Append-only. A rotação NÃO toca aqui: o ativo é cortado de cima, e uma "
-            "decisão que morava numa mensagem some com ela.\n\n",
-            encoding="utf-8",
-        )
-    linha = f"- [{core.agora()[:16]} · {core.normaliza_ia(a.de)}] {' '.join(a.texto).strip()}\n"
-    with core.travado():
-        with p.open("a", encoding="utf-8") as f:
-            f.write(linha)
-            f.flush()
-            os.fsync(f.fileno())
-    print(f"✔ registrada em {p}")
-    return 0
+    decide = Path(__file__).resolve().parent / "iachat-decide"
+    if not decide.is_file():
+        print(f"✗ não achei o {decide.name} ao lado — ele é quem grava as decisões.",
+              file=sys.stderr)
+        return 2
+    argv = [sys.executable, str(decide), "decidir", "--de", core.normaliza_ia(a.de)]
+    if getattr(a, "porque", None):
+        argv += ["--porque", a.porque]
+    if getattr(a, "sobre", None):
+        argv += ["--sobre", a.sobre]
+    argv += [" ".join(a.texto).strip()]
+    return subprocess.run(argv).returncode
 
 
 def main() -> int:
@@ -289,8 +322,16 @@ def main() -> int:
     )
     p.set_defaults(f=cmd_briefing)
 
-    p = sub.add_parser("decidir", help="registrar uma decisão (append-only, imune à rotação)")
+    p = sub.add_parser("decidir",
+                       help="registrar uma decisão (delega ao iachat-decide)")
     p.add_argument("--de", required=True)
+    # `--porque` é OBRIGATÓRIO porque o `iachat-decide` o exige, e o gate dele é bom:
+    # decisão sem motivo declarado é ordem, não decisão — quem chega depois não tem como
+    # saber se ainda vale. Herdar o gate é o ponto de delegar; recebê-lo só no
+    # subprocesso daria um erro vindo de um comando que o usuário não digitou.
+    p.add_argument("--porque", required=True,
+                   help="o motivo — sem ele a decisão não se sustenta sozinha")
+    p.add_argument("--sobre", help="assunto, uma palavra")
     p.add_argument("texto", nargs="+")
     p.set_defaults(f=cmd_decidir)
 

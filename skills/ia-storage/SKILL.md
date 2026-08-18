@@ -42,9 +42,16 @@ iachat page recorte-01 4
 ## Como a rotação decide
 
 ```bash
-iachat rotate            # roda se passou do teto
-iachat rotate --forcar   # roda mesmo abaixo
+iachat rotate
+iachat rotate --forcar
 ```
+
+- `iachat rotate` — roda se o ativo passou do teto.
+- `iachat rotate --forcar` — **dispensa a checagem do teto, não a do corte.** Numa sala
+  pequena ele responde "nada cortável sem esvaziar o ativo" e sai sem fazer nada: o corte
+  só existe quando há o que cortar acima de ~60% do teto (`bin/iachat_core.py:585-613`).
+  A skill dizia "roda mesmo abaixo", o que fazia esperar arquivamento onde não há —
+  comportamento certo, descrição enganosa. Achado do worker `k2`.
 
 - Corta **de cima** (mais antigas primeiro), até o ativo caber em ~60% do teto — a folga
   evita rotacionar a cada mensagem.

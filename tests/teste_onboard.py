@@ -241,7 +241,12 @@ def main() -> int:
         base6, env6 = nova_base(teto_bytes=3500)
         bases.append(base6)
         os.environ["IACHAT_HOME"] = str(base6)
-        r = roda("decidir", "--de", "claude",
+        # `--porque` passou a ser obrigatório quando `decidir` virou delegação ao
+        # `iachat-decide`: o gate é dele, e é bom — decisão sem motivo declarado é
+        # ordem, e quem chega depois não tem como saber se ainda vale. Herdar o gate é
+        # o ponto de haver um registro só.
+        r = roda("decidir", "--de", "claude", "--porque",
+                 "o operador decide, e a regra tem de sobreviver à rotação",
                  "Regra que tem de sobreviver à rotação: o operador tem precedência.",
                  env=env6)
         for i in range(3):
@@ -257,18 +262,33 @@ def main() -> int:
             f"rot={rot.get('motivo', 'rodou')}",
         )
 
-        # ---- T7: decidir é append-only, cabeçalho uma vez só -------------------
-        r1 = roda("decidir", "--de", "kimi", "primeira decisão de teste.", env=env)
+        # ---- T7: UM registro só, e o `decide` enxerga o que o `onboard` grava ----
+        # Antes cada um tinha o seu: `onboard` escrevia `DECISOES.md`, `iachat-decide`
+        # escrevia `decisoes.md`. No macOS (case-insensitive) isso é o MESMO ARQUIVO
+        # com dois formatos — e a linha do onboard, sem o marcador `<!-- iadec`, ficava
+        # invisível ao parser oficial: duas decisões gravadas, "1 de 1 registradas".
+        # Numa sala de IAs esse é o pior desfecho possível: alguém registra, o comando
+        # confirma "✔", e as outras nunca obedecem porque não veem. Achado do `k2`.
         os.environ["IACHAT_HOME"] = str(base)
-        r2 = roda("decidir", "--de", "codex", "segunda decisão de teste.", env=env)
-        dec = (base / "DECISOES.md").read_text(encoding="utf-8")
+        r1 = roda("decidir", "--de", "kimi", "--porque", "porque foi medido",
+                  "primeira decisão de teste.", env=env)
+        r2 = roda("decidir", "--de", "codex", "--porque", "porque foi medido",
+                  "segunda decisão de teste.", env=env)
+        decide = RAIZ / "bin" / "iachat-decide"
+        vis = subprocess.run([sys.executable, str(decide), "decisoes"],
+                             env=env, capture_output=True, text=True)
         checa(
-            "T7 decidir grava as duas linhas, cabeçalho criado uma única vez",
+            "T7 as duas decisões caem no registro ÚNICO e o `decide` as enxerga",
             r1.returncode == 0 and r2.returncode == 0
-            and dec.count("# 📌 Decisões da sala") == 1
-            and "· kimi] primeira decisão de teste." in dec
-            and "· codex] segunda decisão de teste." in dec,
+            and "primeira decisão de teste." in vis.stdout
+            and "segunda decisão de teste." in vis.stdout,
+            f"exit={r1.returncode}/{r2.returncode} · {vis.stdout.strip()[:160]}",
         )
+        # E um arquivo só: dois nomes que colidem no macOS voltariam a se misturar.
+        nomes = {p.name.lower() for p in base.glob("*ecisoes*")} | \
+                {p.name.lower() for p in base.glob("*ECISOES*")}
+        checa("T7b existe UM arquivo de decisões, não dois", len(nomes) <= 1,
+              f"encontrados: {sorted(nomes)}")
 
         # ---- T8: --marcar ≡ ausência de cursor (não inventa conceito) ----------
         r = roda("briefing", "--de", "grok", "--marcar", env=env)

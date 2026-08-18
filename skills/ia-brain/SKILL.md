@@ -32,14 +32,23 @@ estoura. Se o corte dependesse do julgamento dele, o arquivo cresceria sem dono.
 ## A rotina diária
 
 ```bash
-iachat status                                  # 1. como está a sala
-iachat rotate                                  # 2. corta se precisar (idempotente)
-# 3. se nasceu recorte novo, ler o que ele tem e preencher os Assuntos da marca no ativo
+iachat status
+iachat rotate
+iachat page recorte-01 1
+iachat assuntos recorte-01 "bypass do codex · defeito do chroma · vigília da janela"
 ```
 
-Para o passo 3, use `iachat search`/`iachat page` — **não** abra o recorte inteiro; ele é
-grande por definição, e ler tudo para escrever 2 linhas de resumo é o desperdício que o
-plugin existe para evitar.
+1. `iachat status` — como está a sala.
+2. `iachat rotate` — corta se precisar; é idempotente.
+3. `iachat page` / `iachat search` — leia **amostras** do recorte novo. Não abra o recorte
+   inteiro: ele é grande por definição, e ler tudo para escrever duas linhas de resumo é o
+   desperdício que este plugin existe para evitar.
+4. `iachat assuntos <recorte> "<os assuntos>"` — grava na marca, dentro do ativo.
+
+> O passo 4 é o comando que faltava aqui. A skill mandava "preencher os Assuntos da marca
+> no ativo" sem dizer como — e uma IA obediente ou editaria o `iachat.md` à mão (violando
+> a regra do `ia-chat-activate`: nunca escrever no arquivo direto) ou não faria. O
+> `iachat assuntos` existe exatamente para isto. Achado do worker `k2`.
 
 ## Uma responsabilidade que vem junto
 

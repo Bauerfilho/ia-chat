@@ -15,7 +15,7 @@ iachat-doctor --repo ~/Projetos/ia-chat   # compara o instalado com o repositór
 iachat-doctor --json                 # laudo machine-parseable
 ```
 
-Enquanto o `install.sh` não instala este CLI (install.sh:15-16 só copia os 6 do
+O `install.sh` instala este CLI junto (distribui por glob `bin/iachat-*`, não por lista — a
 núcleo), rode direto do repositório: `python3 ~/Projetos/ia-chat/bin/iachat-doctor`.
 
 Saída **0** se não houver nenhum ✗. **1** se houver ✗. **2** se o diagnóstico não
@@ -51,7 +51,7 @@ install.sh:15-16 copia) · **todo `bin/iachat-*` com shebang do repo resolve no 
 (com `--repo`; é o item que pega CLI cujo skill chama pelo nome e que o install.sh
 ainda não instala — caso de iachat-claim e iachat-recibo em 17/08).
 
-**Por casca** — as 9 skills do plugin (as 7 originais + ia-claim + ia-recibo) no
+**Por casca** — TODAS as skills que o repositório publica (o doctor as conta no disco, não numa lista fixa) no
 diretório que **aquela** casca lê, com frontmatter válido e `name` igual ao
 diretório · a skill mudou depois da sessão abrir? · o hook `ia-bell-hook.sh`
 declarado nos eventos certos · o comando aponta para binário executável · o config
