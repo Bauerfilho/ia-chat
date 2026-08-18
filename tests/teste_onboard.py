@@ -73,6 +73,61 @@ def sha_conteudo(base: Path) -> str:
     return h.hexdigest()
 
 
+# ⚠️ Este bloco vivia DEPOIS de `sys.exit(main())` — 54 linhas inalcançáveis, que
+# nunca rodaram e davam impressão de cobertura. E não teria rodado mesmo alcançável:
+# terminava com `print(f"{_ok} ✔ {_falhou} ✗")`, nomes de OUTRO arquivo de teste
+# (aqui a contagem é `falhas`) — foi colado de lá e emendado no fim. Código morto
+# esconde código quebrado: a inalcançabilidade era o que impedia o NameError de
+# aparecer. Achado do worker `codex` na missão m2.
+# ── onboarding automático pelo HOOK — patch aplicado em 18/08 ────────────────
+# Achado da Kimi: uma IA que chega pela primeira vez era INVISÍVEL para a entrega. O
+# hook saía quando não havia flag em `pendente/` — e um recém-chegado nunca tem flag,
+# porque nominar alguém exige que já soubessem que ele entrou. Ela só descobria a sala
+# se um humano contasse.
+#
+# O bloco tem que valer nos DOIS lados: entregar na primeira vez, e ficar em silêncio
+# depois — um hook que repete o briefing a cada evento é pior que o defeito original.
+def _hook_onboarding() -> None:
+    import json as _json
+    import os as _os
+    import shutil as _shutil
+    import subprocess as _sp
+    import tempfile as _tempfile
+    from pathlib import Path as _Path
+
+    hook = _Path(__file__).resolve().parent.parent / "bin" / "ia-bell-hook.sh"
+    binp = _Path.home() / ".local" / "bin"
+    if not hook.is_file() or not (binp / "iachat").is_file():
+        checa("hook de onboarding: ambiente sem instalação (pulado)", True)
+        return
+
+    h = _Path(_tempfile.mkdtemp(prefix="hookonb-"))
+    for d in ("pendente", "cursor", "arquivo"):
+        (h / d).mkdir()
+    (h / "config.json").write_text(_json.dumps(
+        {"na_sala": ["claude", "codex", "novata"], "brain": "claude"}))
+    (h / "iachat.md").write_text("")
+    env = dict(_os.environ, IACHAT_HOME=str(h), IACHAT_BIN=str(binp))
+    for de, txt in (("claude", "primeira decisão da sala"), ("codex", "segunda mensagem")):
+        _sp.run([str(binp / "iachat"), "post", "--de", de, "--para", "claude", txt],
+                env=env, capture_output=True)
+
+    r1 = _sp.run(["bash", str(hook)], env={**env, "IACHAT_EU": "novata"},
+                 capture_output=True, text=True, timeout=40)
+    n1 = len((r1.stdout or "").encode())
+    checa("hook: IA nova recebe o briefing sem ter sido nominada", n1 > 200,
+          f"saíram {n1} B — a IA nova continua invisível para a entrega")
+    checa("hook: o cursor da IA nova foi criado",
+          (h / "cursor" / "novata.json").is_file())
+
+    r2 = _sp.run(["bash", str(hook)], env={**env, "IACHAT_EU": "novata"},
+                 capture_output=True, text=True, timeout=40)
+    checa("hook: segunda passada fica em SILÊNCIO (auto-extinguiu)",
+          len((r2.stdout or "").encode()) == 0,
+          "repetiu o briefing — hook que repete a cada evento é pior que o defeito original")
+    _shutil.rmtree(h, ignore_errors=True)
+
+
 def main() -> int:
     bases: list[Path] = []
     sys.dont_write_bytecode = True
@@ -236,6 +291,8 @@ def main() -> int:
             f"rc={r.returncode} · {r.stderr.strip().splitlines()[0][:80] if r.stderr else ''}",
         )
 
+        _hook_onboarding()
+
     finally:
         for b in bases:
             shutil.rmtree(b, ignore_errors=True)
@@ -250,57 +307,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-
-
-# ── onboarding automático pelo HOOK — patch aplicado em 18/08 ────────────────
-# Achado da Kimi: uma IA que chega pela primeira vez era INVISÍVEL para a entrega. O
-# hook saía quando não havia flag em `pendente/` — e um recém-chegado nunca tem flag,
-# porque nominar alguém exige que já soubessem que ele entrou. Ela só descobria a sala
-# se um humano contasse.
-#
-# O bloco tem que valer nos DOIS lados: entregar na primeira vez, e ficar em silêncio
-# depois — um hook que repete o briefing a cada evento é pior que o defeito original.
-def _hook_onboarding() -> None:
-    import json as _json
-    import os as _os
-    import shutil as _shutil
-    import subprocess as _sp
-    import tempfile as _tempfile
-    from pathlib import Path as _Path
-
-    hook = _Path(__file__).resolve().parent.parent / "bin" / "ia-bell-hook.sh"
-    binp = _Path.home() / ".local" / "bin"
-    if not hook.is_file() or not (binp / "iachat").is_file():
-        checa("hook de onboarding: ambiente sem instalação (pulado)", True)
-        return
-
-    h = _Path(_tempfile.mkdtemp(prefix="hookonb-"))
-    for d in ("pendente", "cursor", "arquivo"):
-        (h / d).mkdir()
-    (h / "config.json").write_text(_json.dumps(
-        {"na_sala": ["claude", "codex", "novata"], "brain": "claude"}))
-    (h / "iachat.md").write_text("")
-    env = dict(_os.environ, IACHAT_HOME=str(h), IACHAT_BIN=str(binp))
-    for de, txt in (("claude", "primeira decisão da sala"), ("codex", "segunda mensagem")):
-        _sp.run([str(binp / "iachat"), "post", "--de", de, "--para", "claude", txt],
-                env=env, capture_output=True)
-
-    r1 = _sp.run(["bash", str(hook)], env={**env, "IACHAT_EU": "novata"},
-                 capture_output=True, text=True, timeout=40)
-    n1 = len((r1.stdout or "").encode())
-    checa("hook: IA nova recebe o briefing sem ter sido nominada", n1 > 200,
-          f"saíram {n1} B — a IA nova continua invisível para a entrega")
-    checa("hook: o cursor da IA nova foi criado",
-          (h / "cursor" / "novata.json").is_file())
-
-    r2 = _sp.run(["bash", str(hook)], env={**env, "IACHAT_EU": "novata"},
-                 capture_output=True, text=True, timeout=40)
-    checa("hook: segunda passada fica em SILÊNCIO (auto-extinguiu)",
-          len((r2.stdout or "").encode()) == 0,
-          "repetiu o briefing — hook que repete a cada evento é pior que o defeito original")
-    _shutil.rmtree(h, ignore_errors=True)
-
-
-_hook_onboarding()
-print(f"\n{_ok} ✔  {_falhou} ✗")
-sys.exit(1 if _falhou else 0)
