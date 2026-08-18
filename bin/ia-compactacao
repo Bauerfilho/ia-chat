@@ -1,0 +1,453 @@
+#!/usr/bin/env python3
+# ia-compactacao — mapa curto + compact-bell. Zero dependência. Python 3.9.
+#
+# Irmão do ia-server-connection: um gatilho, um sino (o ia-bell), um documento.
+# NÃO é resumo da conversa. É o caminho de volta, lido do disco.
+#
+# --pre / --pos  escrevem o mapa (hooks PreCompact / PostCompact)
+# --inicio       injeta o caminho se o mapa já existe (SessionStart / sala)
+# --mapa         só escreve (CLI / teste)
+# --validar ARQ  gate: exit 0 se o mapa passa, 1 se reprova
+#
+# Fail-silent no hook (exit 0). IACHAT_TEST=1 devolve o código real.
+"""Mapa curto depois de compactar — passivo, no disco, sem LLM."""
+from __future__ import annotations
+
+import json
+import os
+import sys
+import tempfile
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+SECOES = ("## Onde parou", "## Rodando agora", "## Espera decisão", "## 3 links")
+TETO_BYTES = 12000  # a captura-resumo de 18/08 tem 45683 B — isso aqui é mapa
+GLIFO = "🧭"
+SINO = "compact-bell"
+
+
+def _home() -> Path:
+    return Path(os.environ.get("IACHAT_HOME") or (Path.home() / "ia-chat-global"))
+
+
+def _agora() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M")
+
+
+def _ler_json(p: Path) -> Dict[str, Any]:
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _payload_stdin() -> Dict[str, Any]:
+    raw = sys.stdin.read() if not sys.stdin.isatty() else ""
+    if not raw.strip():
+        return {}
+    try:
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _sino_dono_ligado(sala: Path) -> bool:
+    cfg = _ler_json(sala / "config.json")
+    return bool(cfg.get("notificar_operador", False))
+
+
+def _ias_na_sala(sala: Path) -> List[str]:
+    cfg = _ler_json(sala / "config.json")
+    ias = cfg.get("na_sala") or []
+    return [str(x) for x in ias if str(x).strip()]
+
+
+def _mtime_iso(p: Path) -> str:
+    try:
+        return datetime.fromtimestamp(p.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+    except OSError:
+        return "?"
+
+
+def _tam(p: Path) -> str:
+    try:
+        n = p.stat().st_size
+    except OSError:
+        return "?"
+    if n < 1024:
+        return "%d B" % n
+    return "%.1f KB" % (n / 1024.0)
+
+
+def _acha_run() -> Optional[Path]:
+    env = os.environ.get("IASWARM_RUN", "").strip()
+    if env:
+        p = Path(env).expanduser()
+        return p if p.is_dir() else None
+    raiz = Path.home() / ".claude" / "iaswarm-runs"
+    if not raiz.is_dir():
+        return None
+    cands: List[Tuple[float, Path]] = []
+    try:
+        for d in raiz.iterdir():
+            if not d.is_dir() or d.name.startswith("."):
+                continue
+            marca = d / "state.json"
+            if not marca.is_file():
+                marca = d / "progress"
+            if marca.exists():
+                cands.append((marca.stat().st_mtime, d))
+    except OSError:
+        return None
+    if not cands:
+        return None
+    cands.sort(reverse=True)
+    return cands[0][1]
+
+
+def _landmarks_vizinhos(run: Optional[Path]) -> List[Path]:
+    """BOM-DIA/MAPA/CICLOS das rodadas recentes — foi o que salvou a madrugada."""
+    raiz = Path.home() / ".claude" / "iaswarm-runs"
+    if not raiz.is_dir():
+        return []
+    nomes = ("BOM-DIA.md", "MAPA.md", "CICLOS.md", "RETOMADA.md")
+    achados: List[Path] = []
+    try:
+        dirs = [run] if run else []
+        dirs.extend(sorted(
+            (d for d in raiz.iterdir() if d.is_dir() and not d.name.startswith(".")),
+            key=lambda d: d.stat().st_mtime,
+            reverse=True,
+        )[:8])
+        vistos = set()
+        for d in dirs:
+            if d is None:
+                continue
+            for nome in nomes:
+                p = d / nome
+                if p.is_file() and p not in vistos:
+                    vistos.add(p)
+                    achados.append(p)
+    except OSError:
+        return achados
+    return achados
+
+
+def _provas_disco(run: Optional[Path], sala: Path) -> List[str]:
+    pistas = []
+    if run:
+        for nome in ("BOM-DIA.md", "MAPA.md", "CICLOS.md", "RETOMADA.md",
+                     "state.json", "workers.tsv"):
+            p = run / nome
+            if p.is_file():
+                pistas.append((p.stat().st_mtime, p))
+        res = run / "resultados"
+        if res.is_dir():
+            for p in res.glob("*.md"):
+                if p.name.startswith("L") and "EM ANDAMENTO" in p.read_text(
+                        encoding="utf-8", errors="replace")[:400]:
+                    continue
+                pistas.append((p.stat().st_mtime, p))
+        prog = run / "progress"
+        if prog.is_dir():
+            for p in prog.glob("*.jsonl"):
+                pistas.append((p.stat().st_mtime, p))
+    for p in _landmarks_vizinhos(run):
+        pistas.append((p.stat().st_mtime, p))
+    chat = sala / "iachat.md"
+    if chat.is_file() and "iachat-caminho-ex-" not in str(chat):
+        pistas.append((chat.stat().st_mtime, chat))
+    elif chat.is_file():
+        # home temporário de teste: só entra se não houver prova melhor
+        pistas.append((0.0, chat))
+    pistas.sort(reverse=True)
+    linhas = []
+    vistos = set()
+    for _, p in pistas:
+        key = str(p)
+        if key in vistos:
+            continue
+        vistos.add(key)
+        linhas.append("- `%s` · %s · %s" % (p, _mtime_iso(p), _tam(p)))
+        if len(linhas) >= 5:
+            break
+    if not linhas:
+        linhas.append("- (nenhuma prova no disco ainda — grave o parcial agora)")
+    return linhas
+
+
+def _rodando(run: Optional[Path]) -> List[str]:
+    if run is None:
+        return ["- nenhum run iaswarm visível em `~/.claude/iaswarm-runs/`"]
+    linhas = ["- run `%s`" % run]
+    # progress/*.jsonl é a prova viva; state.json do painel pode nascer "entregue"
+    # no despacho (visto neste run às 07:24 — L4 já vinha 5/5 antes de trabalhar).
+    prog = run / "progress"
+    if prog.is_dir():
+        for p in sorted(prog.glob("*.jsonl")):
+            try:
+                last = p.read_text(encoding="utf-8").strip().splitlines()[-1]
+                rec = json.loads(last)
+                linhas.append(
+                    "- **%s** · etapa %s/%s · %s"
+                    % (p.stem, rec.get("etapa", "?"), rec.get("de", "?"),
+                       rec.get("estado", "?"))
+                )
+            except Exception:
+                linhas.append("- **%s** · (jsonl ilegível)" % p.stem)
+    return linhas[:8] if len(linhas) > 1 else linhas + ["- (sem progress no run)"]
+
+
+def _espera(run: Optional[Path], sala: Path) -> List[str]:
+    achados: List[str] = []
+    arquivos: List[Path] = []
+    arquivos.extend(_landmarks_vizinhos(run))
+    if run:
+        res = run / "resultados"
+        if res.is_dir():
+            arquivos.extend(sorted(res.glob("*.md"))[:8])
+    for nome in ("DECISOES.md",):
+        p = sala / nome
+        if p.is_file():
+            arquivos.append(p)
+    fortes = ("**PENDENTE**", "**BLOQUEIO**", "PENDENTE —", "BLOQUEIO —",
+              "PENDENTE:", "BLOQUEIO:")
+    lixo = ("em andamento", "cabeçalho escrito", "cabeçalho de contingência",
+            "etapas: (1)", "16 marcações", "ninguém", "desde sempre")
+    for p in arquivos:
+        try:
+            linhas_arq = p.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        captura = False
+        for ln in linhas_arq:
+            baixa = ln.lower()
+            if any(x in baixa for x in lixo):
+                continue
+            if "espera a palavra" in baixa or "esperam sua palavra" in baixa:
+                captura = True
+                continue
+            forte = any(k.lower() in baixa or k in ln for k in fortes)
+            item = captura and ln.lstrip()[:2] in ("1.", "2.", "3.", "4.", "5.")
+            if captura and ln.strip() and not item and not ln.startswith((" ", "\t")):
+                captura = False
+            if not (forte or item):
+                continue
+            t = ln.strip().lstrip("#-* ").strip()
+            if len(t) > 140:
+                t = t[:137] + "…"
+            if t and t not in achados:
+                achados.append(t)
+            if len(achados) >= 4:
+                break
+        if len(achados) >= 3:
+            break
+    if not achados:
+        return ["- (nada marcado no disco como espera do dono)"]
+    return ["- " + a for a in achados]
+
+
+def _links(run: Optional[Path], sala: Path) -> List[str]:
+    porta = None
+    if run:
+        pf = run / "painel-porta.txt"
+        if pf.is_file():
+            porta = pf.read_text(encoding="utf-8").strip().splitlines()[0].strip()
+    painel = ("http://127.0.0.1:%s/" % porta) if porta else (
+        "`~/.claude/iaswarm-runs/<run>/` (painel-porta.txt ausente)"
+    )
+    rel = str(run / "resultados") if run else "`~/.claude/iaswarm-runs/`"
+    return [
+        "- **sala** — `open -a ia-chat` · `%s`" % (sala / "iachat.md"),
+        "- **painel** — %s" % painel,
+        "- **relatórios** — `%s`" % rel,
+    ]
+
+
+def monta_mapa(sala: Path, payload: Dict[str, Any], modo: str) -> str:
+    run = _acha_run()
+    trig = payload.get("trigger") or modo
+    sid = str(payload.get("session_id") or payload.get("sessionId") or "")[:8]
+    eu = os.environ.get("IACHAT_EU") or os.environ.get("COMPACT_EU") or "?"
+    cab = [
+        "---",
+        "tipo: caminho-abreviado",
+        "trilho: compact-bell",
+        "gerado: %s" % _agora(),
+        "ia: %s" % eu,
+        "trigger: %s" % trig,
+        "sessao: %s" % (sid or "?"),
+        "---",
+        "",
+        "# %s CAMINHO — compactação %s" % (GLIFO, _agora()),
+        "",
+        "O contexto sumiu. O chão está no disco. Isto **não é um resumo** —",
+        "é o mapa de para onde ir. Skill `ia-compactacao`.",
+        "",
+        "## Onde parou",
+        "",
+        "Último passo com prova no disco (mtime, não memória):",
+        "",
+    ]
+    cab.extend(_provas_disco(run, sala))
+    cab.extend(["", "## Rodando agora", ""])
+    cab.extend(_rodando(run))
+    cab.extend(["", "## Espera decisão", ""])
+    cab.extend(_espera(run, sala))
+    cab.extend(["", "## 3 links", ""])
+    cab.extend(_links(run, sala))
+    cab.extend([
+        "",
+        "---",
+        "",
+        "Próximo gesto: abra o primeiro caminho de **Onde parou** e retome dali.",
+        "Não releia a captura longa em `Obsidian/inbox-capturas/` — ela é buffer,",
+        "não o mapa.",
+        "",
+    ])
+    return "\n".join(cab)
+
+
+def valida_mapa(texto: str) -> Tuple[bool, str]:
+    if not texto or not texto.strip():
+        return False, "mapa vazio"
+    raw = texto.encode("utf-8")
+    if len(raw) > TETO_BYTES:
+        return False, "mapa grande demais (%d B > %d) — virou resumo" % (
+            len(raw), TETO_BYTES)
+    baixa = texto.lower()
+    if "<analysis>" in baixa or "primary request and intent" in baixa:
+        return False, "parece resumo de compactação, não mapa"
+    faltam = [s for s in SECOES if s not in texto]
+    if faltam:
+        return False, "faltam seções: %s" % ", ".join(faltam)
+    return True, "ok"
+
+
+def _escreve_atomico(destino: Path, texto: str) -> None:
+    destino.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".caminho-", suffix=".tmp",
+                               dir=str(destino.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(texto)
+        os.replace(tmp, destino)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def toca_sino(sala: Path, destino_mapa: Path) -> List[str]:
+    """Reusa ia-bell: escreve pendente/<ia>.md. Silêncio total se o dono desligou."""
+    escritos: List[str] = []
+    if not _sino_dono_ligado(sala):
+        return escritos
+    eu = os.environ.get("IACHAT_EU") or os.environ.get("COMPACT_EU")
+    alvos = [eu] if eu else _ias_na_sala(sala)
+    alvos = [a for a in alvos if a and a != "--operador"]
+    if not alvos:
+        return escritos
+    linha = (
+        "- %s **%s · %s · contexto compactado** — leia o mapa em `%s` "
+        "ANTES de continuar. Skill `ia-compactacao`."
+        % (GLIFO, _agora(), SINO, destino_mapa)
+    )
+    pend = sala / "pendente"
+    pend.mkdir(parents=True, exist_ok=True)
+    for ia in alvos:
+        f = pend / ("%s.md" % ia)
+        if f.exists():
+            prev = f.read_text(encoding="utf-8")
+            if SINO in prev:
+                continue
+            f.write_text(prev.rstrip() + "\n" + linha + "\n", encoding="utf-8")
+        else:
+            f.write_text(
+                "# %s %s, você foi compactada\n\n"
+                "O contexto sumiu. O chão está no disco.\n\n"
+                "Leia agora: `%s`\n\n"
+                "## Chamados pendentes\n\n%s\n"
+                % (GLIFO, ia, destino_mapa, linha),
+                encoding="utf-8",
+            )
+        escritos.append(ia)
+    return escritos
+
+
+def injeta(sala: Path) -> str:
+    mapa = sala / "caminho.md"
+    if not mapa.is_file():
+        return ""
+    return (
+        "# %s %s — você foi compactada\n"
+        "O contexto sumiu; o chão está no disco.\n"
+        "Leia AGORA, integralmente: `%s`\n"
+        "Não é um resumo. É o mapa de para onde ir. Skill `ia-compactacao`.\n"
+        % (GLIFO, SINO, mapa)
+    )
+
+
+def _sair(code: int) -> int:
+    if os.environ.get("IACHAT_TEST") == "1":
+        return code
+    return 0
+
+
+def main(argv: List[str]) -> int:
+    if not argv or argv[0] in ("-h", "--help"):
+        sys.stderr.write(
+            "uso: ia-compactacao --pre|--pos|--inicio|--mapa|--validar ARQ\n"
+        )
+        return _sair(2)
+    cmd = argv[0]
+    sala = _home()
+    try:
+        if cmd == "--validar":
+            if len(argv) < 2:
+                sys.stderr.write("uso: ia-compactacao --validar ARQ\n")
+                return _sair(2)
+            p = Path(argv[1])
+            texto = p.read_text(encoding="utf-8", errors="replace") if p.is_file() else ""
+            ok, motivo = valida_mapa(texto)
+            sys.stdout.write(("%s %s\n" % ("✔" if ok else "✗", motivo)))
+            return 0 if ok else 1
+        if cmd == "--inicio":
+            txt = injeta(sala)
+            if txt:
+                sys.stdout.write(txt)
+            return 0
+        if cmd not in ("--pre", "--pos", "--mapa"):
+            sys.stderr.write("modo desconhecido: %s\n" % cmd)
+            return _sair(2)
+        payload = _payload_stdin()
+        texto = monta_mapa(sala, payload, cmd.lstrip("-"))
+        ok, motivo = valida_mapa(texto)
+        if not ok:
+            sys.stderr.write("mapa reprovado: %s\n" % motivo)
+            return _sair(1)
+        destino = sala / "caminho.md"
+        _escreve_atomico(destino, texto)
+        extra = os.environ.get("CAMINHO_OBS", "").strip()
+        if extra:
+            try:
+                _escreve_atomico(Path(extra).expanduser(), texto)
+            except OSError:
+                pass
+        toca_sino(sala, destino)
+        if os.environ.get("IACHAT_TEST") == "1":
+            sys.stdout.write(str(destino) + "\n")
+        else:
+            sys.stdout.write(injeta(sala))
+        return 0
+    except Exception as exc:
+        sys.stderr.write("ia-compactacao: %s\n" % exc)
+        return _sair(1)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

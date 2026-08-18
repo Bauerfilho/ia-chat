@@ -28,8 +28,19 @@ for extra in "$SRC"/bin/iachat-*; do [ -f "$extra" ] && cp "$extra" "$DEST_SCRIP
 chmod +x "$DEST_SCRIPTS/iachat" "$DEST_SCRIPTS"/ia-*.sh 2>/dev/null
 chmod +x "$DEST_SCRIPTS"/iachat-* 2>/dev/null
 ln -sf "$DEST_SCRIPTS/iachat" "$DEST_BIN/iachat"
-for extra in "$DEST_SCRIPTS"/iachat-*; do
-  [ -f "$extra" ] && [ -x "$extra" ] && ln -sf "$extra" "$DEST_BIN/$(basename "$extra")"
+# TODO executável ganha symlink, não só os `iachat-*`. A lição de 17/08 registrada
+# acima ("8 CLIs no repo, 8 sem resolver") foi consertada pela metade: os auxiliares
+# `ia-*` passaram a ser COPIADOS, mas continuaram sem entrar no PATH. O defeito voltou
+# em 18/08 com o `ia-compactacao`, que é chamado por um hook apontando para
+# `~/.local/bin/` — o hook falharia em silêncio, que é o pior desfecho para uma peça
+# cuja função é justamente avisar.
+#
+# Os `.sh` de daemon/instalador ficam de fora de propósito: são invocados por caminho
+# absoluto pelo LaunchAgent, e poluir o PATH do dono com eles não ajuda ninguém.
+for extra in "$DEST_SCRIPTS"/iachat-* "$DEST_SCRIPTS"/ia-*; do
+  [ -f "$extra" ] || continue
+  case "$extra" in *.sh|*.py) continue ;; esac
+  [ -x "$extra" ] && ln -sf "$extra" "$DEST_BIN/$(basename "$extra")"
 done
 
 for s in "$SRC"/skills/*/; do

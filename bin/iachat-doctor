@@ -433,7 +433,7 @@ def checa_sala(L: Laudo, sala: Path, scripts: Path, repo: Path | None) -> dict:
     #                           a entrega dirigida morre em silêncio. É ✗.
     #   teto_bytes ausente    → fallback consistente 204800 (:38, :397, :443). Nota.
     #   brain ausente         → status mostra vazio (:446). Nota.
-    #   notificar_operador    → bin/iachat:94 e ia-bell-daemon.sh:48 caem em True. Nota.
+    #   notificar_operador    → CLI, core e daemon caem em False. Nota.
     cfg, erro_cfg = json_carrega(sala / "config.json")
     if cfg is None:
         L.add(e, "sala-config", FALHA, erro_cfg, f"json.loads({sala}/config.json)",
@@ -458,7 +458,7 @@ def checa_sala(L: Laudo, sala: Path, scripts: Path, repo: Path | None) -> dict:
                 L.add(e, "sala-config", OK,
                       "em fallback consistente: " + ", ".join(faltam) +
                       " (teto_bytes→204800: iachat_core.py:38/:397/:443; "
-                      "brain→vazio: :446; notificar_operador→True: bin/iachat:94) · "
+                      "brain→vazio: :446; notificar_operador→False: core/daemon) · "
                       + resumo,
                       f"json.loads({sala}/config.json)")
             else:

@@ -28,6 +28,15 @@ POR QUE MATA O GRUPO, NÃO O PID: o despacho nasce em sessão própria (`setsid`
 o PID do adaptador é também o líder do grupo. Matar só ele deixaria o `codex`/`agy`
 filho vivo — que foi exatamente a dor da madrugada de 18/08, quando os processos
 tiveram que ser caçados à mão com `pgrep`.
+
+COMO A INTERFACE CHAMA ISTO (`--via-app`, 18/08 — decisão do dono, fase 9): a paleta
+do app não monta linha de comando com texto de usuário. O servidor (`ui/servir.py`)
+traz uma allowlist de argv CONSTANTES e chama `iachat-comando <sub> --de <papel do
+servidor> --via-app`; tudo o que é variável — o enunciado do `/goal`, a IA do
+`/refaz`, o motivo do `/decidi` — entra como UM OBJETO JSON pelo stdin, validado
+chave a chave em `le_via_app`. Texto vira dado, nunca argumento. E o `--de` vem do
+papel com que o servidor subiu, nunca do cliente: foi aceitando identidade do cliente
+que apareceu na sala uma mensagem assinada `bauer` que ele não escreveu.
 """
 from __future__ import annotations
 
@@ -992,6 +1001,12 @@ def parar_run(a) -> int:
 
 def cmd_parar(a) -> int:
     if a.run:
+        if a.seco:
+            # Um run se prevê com o instrumento de presença, que é read-only: matar
+            # lá tem as mesmas travas daqui, e a previsão é a mesma leitura do ps.
+            print("✗ --seco é só para a missão corrente; um run se prevê com "
+                  "`iachat-comando quem --run <dir>`.", file=sys.stderr)
+            return 2
         return parar_run(a)
     e = le_estado()
     if not e:
@@ -1009,6 +1024,31 @@ def cmd_parar(a) -> int:
               f"(há: {', '.join(ws)})", file=sys.stderr)
         return 2
     alvos = pedidos or list(ws)
+
+    if a.seco:
+        # Previsão sem efeito colateral: os MESMOS veredictos que o disparo usaria,
+        # mas ninguém morre, nada se grava, nada se anuncia. É o que a interface
+        # mostra ANTES de pedir a confirmação do dono. A previsão não congela o
+        # mundo: entre ela e o ato há uma pausa humana — um PID pode ser reciclado
+        # nesse intervalo —, e é por isso que no instante do kill o `confere_dono`
+        # roda DE NOVO. O seco mostra o presente; a prova vale é na hora.
+        print(f"🧪 seco — missão {e['id']}: o que o disparo faria")
+        for ia in alvos:
+            w = ws[ia]
+            veredito, motivo = confere_dono(w, e["id"])
+            if veredito == "ok":
+                try:
+                    grupo = os.getpgid(w["pid"]) == w["pid"]
+                except OSError:
+                    grupo = False
+                escopo = "o grupo inteiro" if grupo else "só o processo"
+                print(f"   {ia:10} pid {w['pid']:>6}  {w.get('papel', '')} "
+                      f"— pararia {escopo}")
+            elif veredito == "morto":
+                print(f"   {ia:10} já não está rodando ({motivo})")
+            else:
+                print(f"   {ia:10} ⛔ NÃO seria parado — {motivo}")
+        return 0
 
     sig = signal.SIGKILL if a.forte else signal.SIGTERM
     mortos, recusados, ja = [], [], []
@@ -1298,6 +1338,12 @@ def cmd_refaz(a) -> int:
     if not e:
         print("✗ não há missão.", file=sys.stderr)
         return 2
+    # `--ia` deixou de ser `required=True` no argparse porque via `--via-app` ele
+    # chega pelo JSON do stdin DEPOIS do parse. A validação mora aqui, no mesmo
+    # lugar para os dois caminhos.
+    if not a.ia or not str(a.ia).strip():
+        print("✗ diga qual IA: `iachat-comando refaz --ia <ia>`.", file=sys.stderr)
+        return 2
     ia = core.normaliza_ia(a.ia)
     w = e.get("workers", {}).get(ia)
     if not w:
@@ -1403,6 +1449,71 @@ def cmd_decidi(a) -> int:
     return 0
 
 
+# ---------------------------------------------------------------- interface (app)
+# O que atravessa o stdin de cada comando quando chamado pela interface.
+# Chave → (tipo, obrigatória). O mapa é a ALLOWLIST do payload: chave fora dele é
+# RECUSADA, nunca vira argumento. Foi assim que a tentativa de contrabandear
+# `forcar`/`forte`/`--forte` pelo JSON morreu na borda, no gate, sem chegar perto
+# do despacho (teste_comandos_ui.py prova o caso que reprova).
+VIA_APP = {
+    "goal": {"texto": (str, True)},
+    "plan": {"seco": (bool, False), "colher": (bool, False)},
+    "concluir": {"texto": (str, False), "para": (list, False)},
+    "parar": {"seco": (bool, False)},
+    "refaz": {"ia": (str, True), "seco": (bool, False)},
+    "decidi": {"texto": (str, True), "porque": (str, True),
+               "sobre": (str, False), "revoga": (list, False)},
+}
+
+
+def le_via_app(a) -> None:
+    """Lê o objeto JSON que o servidor da interface manda pelo stdin.
+
+    O argv que chegou até aqui é CONSTANTE (allowlist de `ui/servir.py`); tudo o
+    que é variável — o enunciado do `/goal`, a IA do `/refaz`, o motivo do
+    `/decidi` — entra por aqui, validado chave a chave. É a fronteira onde
+    "linha de comando montada com texto do usuário" deixa de ser possível:
+    texto vira dado, nunca argumento.
+
+    `texto` merece o único tratamento especial: os comandos o recebem como
+    `nargs="*"` e juntam com espaço, então uma string única vira lista de uma.
+    """
+    try:
+        dados = json.load(sys.stdin)
+    except (OSError, ValueError) as e:
+        raise ValueError(f"--via-app: o stdin não trouxe JSON válido ({e})")
+    if not isinstance(dados, dict):
+        raise ValueError("--via-app: o payload é UM OBJETO JSON — nada mais")
+    mapa = VIA_APP.get(a.cmd)
+    if mapa is None:
+        raise ValueError(f"--via-app: '{a.cmd}' não atravessa a interface")
+    fora = sorted(set(dados) - set(mapa))
+    if fora:
+        raise ValueError(
+            f"--via-app recusa chave(s) fora da allowlist: {', '.join(fora)}. "
+            f"Aceitas: {', '.join(mapa)}")
+    faltam = [k for k, (_t, obrigatoria) in mapa.items()
+              if obrigatoria and not dados.get(k)]
+    if faltam:
+        raise ValueError(f"--via-app: faltam campos obrigatórios: {', '.join(faltam)}")
+    for chave, (tipo, _obrigatoria) in mapa.items():
+        if chave not in dados:
+            continue
+        valor = dados[chave]
+        if tipo is list:
+            if not isinstance(valor, list) or not all(isinstance(x, str) for x in valor):
+                raise ValueError(f"--via-app: `{chave}` é lista de texto")
+        elif tipo is str:
+            if not isinstance(valor, str) or not valor.strip():
+                raise ValueError(f"--via-app: `{chave}` é texto não-vazio")
+        elif not isinstance(valor, bool):       # bool por último: True é int também
+            raise ValueError(f"--via-app: `{chave}` é true/false")
+        if chave == "texto":
+            a.texto = [valor]
+        else:
+            setattr(a, chave, valor)
+
+
 # ---------------------------------------------------------------- main
 def main() -> int:
     ap = argparse.ArgumentParser(prog="iachat-comando", description=__doc__,
@@ -1416,12 +1527,20 @@ def main() -> int:
         p.add_argument("--calado", action="store_true", help="não postar na sala")
         return p
 
-    p = dono(sub.add_parser("goal", help="o enunciado: o objetivo que ele explica"))
+    def app(p):
+        # ESCONDIDA (help=SUPPRESS): quem usa é o servidor da interface
+        # (`ui/servir.py`), nunca o dono no terminal. Com ela o comando lê UM
+        # OBJETO JSON no stdin (`le_via_app`) em vez de receber o dado variável
+        # como argumento — o argv fica sendo a constante da allowlist do servidor.
+        p.add_argument("--via-app", action="store_true", help=argparse.SUPPRESS)
+        return p
+
+    p = app(dono(sub.add_parser("goal", help="o enunciado: o objetivo que ele explica")))
     p.add_argument("--novo", action="store_true", help="abre missão nova mesmo com worker vivo")
     p.add_argument("texto", nargs="*")
     p.set_defaults(f=cmd_goal)
 
-    p = dono(sub.add_parser("plan", help="a frota ativa planeja junta e devolve na sala"))
+    p = app(dono(sub.add_parser("plan", help="a frota ativa planeja junta e devolve na sala")))
     p.add_argument("--ias", action="append", help="quem planeja (padrão: a sala menos o brain)")
     p.add_argument("--braco", help="forçar um braço para todas (codex, kimi, agy…)")
     p.add_argument("--colher", action="store_true", help="ler os planos e devolver na sala")
@@ -1430,16 +1549,18 @@ def main() -> int:
     p.add_argument("--forcar", action="store_true", help="despachar por cima de worker vivo")
     p.set_defaults(f=cmd_plan)
 
-    p = dono(sub.add_parser("concluir", help="autorizado: pode aplicar"))
+    p = app(dono(sub.add_parser("concluir", help="autorizado: pode aplicar")))
     p.add_argument("--para", action="append", help="quem fica autorizado a aplicar")
     p.add_argument("--forcar", action="store_true", help="autorizar sem plano no disco")
     p.add_argument("texto", nargs="*", help="a nota da autorização")
     p.set_defaults(f=cmd_concluir)
 
-    p = dono(sub.add_parser("parar", help="abortar a missão em andamento"))
+    p = app(dono(sub.add_parser("parar", help="abortar a missão em andamento")))
     p.add_argument("--ia", action="append", help="só esta(s) (padrão: todas da missão)")
     p.add_argument("--run", help="abortar worker(s) de um run do iaswarm")
     p.add_argument("--forte", action="store_true", help="SIGKILL em vez de SIGTERM")
+    p.add_argument("--seco", action="store_true",
+                   help="mostrar o que seria parado, sem matar nem gravar nada")
     p.add_argument("--espera", type=float, default=2.0, help="segundos até conferir se saiu")
     p.set_defaults(f=cmd_parar)
 
@@ -1448,15 +1569,17 @@ def main() -> int:
     p.add_argument("--run", help="presença sobre um run do iaswarm (read-only)")
     p.set_defaults(f=cmd_quem)
 
-    p = sub.add_parser("refaz", help="redisparar worker morto, de onde parou")
-    p.add_argument("--ia", required=True)
+    p = app(sub.add_parser("refaz", help="redisparar worker morto, de onde parou"))
+    # Não é `required=True` no argparse: via `--via-app` o valor chega pelo JSON
+    # do stdin depois do parse, e o cmd_refaz valida nos dois caminhos.
+    p.add_argument("--ia", help="qual IA (obrigatório)")
     p.add_argument("--run", help="worker de um run do iaswarm")
     p.add_argument("--braco", help="trocar de braço na retomada")
     p.add_argument("--seco", action="store_true", help="mostrar o que faria, sem gastar")
     p.add_argument("--forcar", action="store_true", help="mesmo vivo ou com plano entregue")
     p.set_defaults(f=cmd_refaz)
 
-    p = sub.add_parser("decidi", help="registrar decisão que todas obedecem")
+    p = app(sub.add_parser("decidi", help="registrar decisão que todas obedecem"))
     p.add_argument("--de", default=None)
     p.add_argument("--calado", action="store_true", help="não postar na sala")
     p.add_argument("--porque", help="o motivo — obrigatório (gate do iachat-decide)")
@@ -1468,6 +1591,8 @@ def main() -> int:
 
     a = ap.parse_args()
     try:
+        if getattr(a, "via_app", False):
+            le_via_app(a)          # o JSON do stdin vira argumento, validado na borda
         return a.f(a)
     except ValueError as e:
         print(f"✗ {e}", file=sys.stderr)

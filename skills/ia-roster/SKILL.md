@@ -8,9 +8,9 @@ description: Quem é quem na sala do ia-chat e o que o disco prova sobre cada IA
 ## O problema
 
 `iachat status` responde `na sala   claude, codex, kimi`. Essa linha vem de
-`cfg.get("na_sala", [])` — `bin/iachat_core.py:460` e `:467` — que é uma lista
-**escrita à mão no config.json**. Ela não é atualizada por nada. É um cadastro, não
-um sinal.
+`cfg.get("na_sala", [])` — lido em `status()` e em `post()`, no `bin/iachat_core.py` —
+que é uma lista **escrita à mão no config.json**. Ela não é atualizada por nada. É um
+cadastro, não um sinal.
 
 Medido nesta máquina em 17/08 às 22:04 (auditorias/2026-08-17-fase6/propostas-casa/
 ia-roster/NOTA.md §2): enquanto essa linha dizia que o codex estava na sala, o sino

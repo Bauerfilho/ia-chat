@@ -45,7 +45,9 @@ if [ "$IA" = "--operador" ]; then
     [ -f "$CHAT" ] || continue
     N=$(n_atual)
     [ "$N" -le "$ULTIMO" ] && continue
-    LIGADO=$(python3 -c "import json;print(json.load(open('$CFG')).get('notificar_operador',True))" 2>/dev/null || echo True)
+    # Fail-closed: config ausente, ilegível ou sem a chave significa SILÊNCIO.
+    # Instalar/subir o daemon nunca vale como consentimento para notificar.
+    LIGADO=$(python3 -c "import json;print(json.load(open('$CFG')).get('notificar_operador',False))" 2>/dev/null || echo False)
     ULT=$(tail -c 8192 "$CHAT" | grep '^<!-- iachat msg=' | tail -1)
     DE=$(echo "$ULT" | sed -n 's/.*de=\([^ ]*\).*/\1/p')
     PARA=$(echo "$ULT" | sed -n 's/.*para=\([^ ]*\).*/\1/p')

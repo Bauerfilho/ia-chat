@@ -46,9 +46,9 @@ CONFIG_PADRAO = {
     # que é paginado (~1.000 tokens por página). O teto grande sem leitura dirigida seria
     # só uma conta maior; com ela, é espaço que não se paga.
     "teto_bytes": TETO_PADRAO,
-    # O dono da sala quer saber quando as IAs conversam — mas desligável, porque
-    # notificação que não se desliga vira spam, e spam a gente aprende a ignorar.
-    "notificar_operador": True,
+    # O sino do dono nasce MUDO. Ele só toca depois de uma ação explícita no app
+    # ou em `iachat sino on`; instalar a infraestrutura não equivale a consentir.
+    "notificar_operador": False,
 }
 MARCA_MSGS = "<!-- iachat:msgs -->"
 # Acima disto, a mensagem devia ter virado arquivo + resumo. ~2 KB ≈ 500 tokens por leitura.
@@ -210,6 +210,30 @@ def _escrever_atomico(caminho: Path, texto: str) -> None:
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, caminho)
+
+
+def configurar_notificacao_operador(ligado: bool) -> dict:
+    """Grava o ÚNICO estado do sino do dono, sob o lock da sala.
+
+    O app e o CLI passam por esta função. Assim, os dois não mantêm cópias da
+    decisão e uma escrita concorrente não apaga `na_sala`, `brain` ou o teto.
+    Configuração ilegível é falha barulhenta: nunca a substituímos pelo padrão.
+    """
+    if type(ligado) is not bool:
+        raise ValueError("notificar_operador exige booleano")
+
+    with travado():
+        try:
+            cfg = json.loads(p_config().read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError("config.json inválido; sino não alterado") from exc
+        if not isinstance(cfg, dict):
+            raise ValueError("config.json não é objeto; sino não alterado")
+        cfg["notificar_operador"] = ligado
+        _escrever_atomico(
+            p_config(), json.dumps(cfg, ensure_ascii=False, indent=2) + "\n"
+        )
+        return cfg
 
 
 def p_estado() -> Path:

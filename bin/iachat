@@ -189,12 +189,8 @@ def cmd_sino(a) -> int:
     """Liga/desliga a notificação do OPERADOR (a das IAs nunca desliga por aqui)."""
     cfg = core.config()
     if a.estado:
-        cfg["notificar_operador"] = a.estado == "on"
-        core.p_config().write_text(
-            __import__("json").dumps(cfg, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
-    ligado = cfg.get("notificar_operador", True)
+        cfg = core.configurar_notificacao_operador(a.estado == "on")
+    ligado = cfg.get("notificar_operador", False) is True
     print(f"sino do operador: {'🔔 ligado' if ligado else '🔕 mudo'}")
     if a.estado:
         print("  (vale no próximo ciclo do daemon, ~15s — não precisa reiniciar nada)")
