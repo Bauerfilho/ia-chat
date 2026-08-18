@@ -117,8 +117,10 @@ ler as 8, respeitar cursores existentes e numerar o próximo post sem colidir.
 **Se você tocou em `RE_META`, no formato do metadado, na numeração ou na rotação:**
 
 ```bash
-python3 tests/teste_compat.py     # antes de commitar, não depois
+python3 tests/teste_compat.py
 ```
+
+- `python3 tests/teste_compat.py` — antes de commitar, não depois
 
 E some ao seu PR uma sala de fixture da versão anterior, se o formato mudou de verdade.
 O `sala-v1` só cobre o que existia quando foi congelado.
@@ -208,9 +210,12 @@ Aconteceu em 18/08, no mesmo dia em que a armadilha gêmea pegou o `ia-chat-app`
 mesmo desenho: **a fonte é o repo, o que roda é a cópia.**
 
 ```bash
-diff bin/iachat-comando ~/.claude/scripts/ia-chat/iachat-comando   # divergiu?
-./install.sh                                                        # então reinstale
+diff bin/iachat-comando ~/.claude/scripts/ia-chat/iachat-comando
+./install.sh
 ```
+
+- `diff bin/iachat-comando ~/.claude/scripts/ia…` — divergiu?
+- `./install.sh` — então reinstale
 
 A bateria não pega: os testes invocam `bin/` diretamente, que é o certo para eles. O
 defeito só existe no caminho que passa pelo PATH — ou seja, no caminho do usuário.
