@@ -1,6 +1,6 @@
 ---
 name: ia-comandos
-description: Use quando o dono da máquina disser /goal, /plan, /concluir, /parar, /quem, /decidi ou /refaz — os comandos dele sobre a sala das IAs. Também quando precisar abortar uma missão em andamento, saber quem da frota está vivo e há quanto tempo, redisparar um worker que caiu, ou entender por que planejar é coletivo e aplicar é só dele.
+description: Use quando o dono da máquina disser /goal, /plan, /concluir, /parar, /quem, /decidi ou /refaz — os comandos dele sobre a sala das IAs e sobre os runs do iaswarm. Também quando precisar abortar uma missão ou um worker de enxame em andamento, saber quem da frota está vivo e há quanto tempo, ressuscitar um worker que caiu de onde ele parou, ou entender por que planejar é coletivo e aplicar é só dele.
 ---
 
 # Os comandos do dono
@@ -64,6 +64,45 @@ diz qual, e sai com `exit 3` sem tocar em nada:
 Recusar é o desfecho seguro. Um worker que sobrevive custa uma segunda tentativa; um
 PID reciclado morto custa o processo de outra pessoa.
 
+**Nunca por `pkill -f`.** `pkill -f codex` casa a linha de comando de quem só
+*menciona* o nome — inclusive a própria busca, e qualquer processo com o nome no
+`PATH`. Com `exec`, o processo ainda troca de nome no meio do caminho. Aqui o alvo é
+sempre o PID gravado no despacho, conferido contra o `ps`.
+
+**SIGTERM é pedido, não ordem.** `bash` esperando em `wait` recebe o sinal e só sai
+quando o `wait` retorna — medido: o filho morria e o shell continuava de pé. Então o
+comando confere depois de `--espera` (2s) e manda SIGKILL em quem ficou; se ainda
+assim restar alguém, ele **diz** em vez de anunciar sucesso.
+
+## Sobre os runs do iaswarm: `--run`
+
+`quem`, `parar` e `refaz` aceitam `--run ~/.claude/iaswarm-runs/<nome>`, que é onde o
+enxame de verdade roda. O run é **dado de outro programa**: o `quem` e o `parar` não
+escrevem nada lá.
+
+```bash
+iachat-comando quem  --run ~/.claude/iaswarm-runs/ia-chat-fase8-pecas
+iachat-comando parar --run ~/.claude/iaswarm-runs/ia-chat-fase8-pecas --ia e3-squad
+iachat-comando refaz --run ~/.claude/iaswarm-runs/ia-chat-fase8-pecas --ia e3-squad
+```
+
+**Três desfechos, nunca dois** — 🟢 vivo · 🔴 morto · 🟡 **não-verificável**. O terceiro
+existe porque o `dispatch.sh` grava o PID mas não grava o instante de nascimento, então
+a identidade se prova por duas coisas derivadas do disco: o caminho do run tem que
+aparecer na linha de comando do processo, e o processo tem que ter nascido **antes** de
+o `.pid` ser escrito. Não fechou, é não-verificável — e não-verificável **não se mata**.
+
+O `--run` também denuncia dois enganos que o painel não vê:
+
+- **processo vivo sem `.pid`** — ausência de arquivo não prova morte. Aconteceu:
+  `d1-watchdog` rodando sem `.pid` e sem linha no `workers.tsv`;
+- **o `state.json` mentindo** — em 18/08 ele dizia `rodando` para seis workers cujos
+  PIDs já não existiam no `ps`. O comando põe painel e `ps` lado a lado e nomeia a
+  divergência.
+
+**Zumbi não é vivo.** `ps -o pid=` continua listando o defunto até o pai colhê-lo; o
+veredito olha `ps -o state=` e trata `Z` como morto.
+
 ## `/quem` — a presença
 
 ```bash
@@ -111,6 +150,17 @@ onde a mesma decisão pode estar diferente. Valem os gates de lá: `--porque` é
 obrigatório, `--revoga D3` mata a antiga com ponteiro para quem a derrubou, e
 `iachat-decide decisoes` lista o que está vigente. Ver a skill `ia-decide`.
 
+**E anuncia na sala com a linha `DECIDIDO:`.** Havia dois instrumentos de decisão nesta
+casa que não se enxergavam: o `decisoes.md` do `iachat-decide`, e a marca `DECIDIDO:`
+dentro de mensagem do chat, que o `iachat-report` lê. Medido em 18/08: a sala real
+tinha **cinco** decisões `DECIDIDO:` e o `decisoes.md` **não existia** — o registro
+vazio e o que valia de fato só no texto. Um ato do `/decidi` agora alimenta os dois:
+registro durável de um lado, relatório do dono do outro.
+
+O dono não está em `na_sala`, então quem posta por ele é a orquestradora, com
+`📣 do dono (bauer):` na frente. `--anunciar codex` faz o sino tocar só em quem tem que
+obedecer.
+
 ## O que sai errado, e o que o comando faz
 
 | situação | resposta |
@@ -119,8 +169,14 @@ obrigatório, `--revoga D3` mata a antiga com ponteiro para quem a derrubou, e
 | `/concluir` sem plano no disco | recusa (`exit 3`) — assinar em branco |
 | `/goal` novo com worker vivo | recusa (`exit 3`) — abandonaria quem está rodando |
 | `/parar` com PID reciclado ou sem a marca | **recusa e não mata** (`exit 3`) |
+| `/parar --run` em worker não-verificável | **recusa e não mata** (`exit 3`) |
 | `/refaz` de quem está vivo | recusa (`exit 3`) — dois no mesmo arquivo |
+| `/refaz --run` de quem não se prova morto | recusa (`exit 3`) — duplicaria trabalho pago |
+| `/refaz` de quem já entregou | recusa (`exit 3`) — apagaria trabalho pronto |
 | `/decidi` sem `--porque` | recusa — gate herdado do `iachat-decide` |
+
+`--seco` (no `plan` e no `refaz`) mostra o que aconteceria **sem gastar assinatura e
+sem escrever arquivo** — inclusive dentro de um run alheio.
 
 ## Onde as coisas ficam
 

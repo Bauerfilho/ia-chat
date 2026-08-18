@@ -71,8 +71,12 @@ def falso_despachante(base: Path) -> Path:
 
 
 def vivo_no_so(pid: int) -> bool:
-    r = subprocess.run(["ps", "-o", "pid=", "-p", str(pid)], capture_output=True, text=True)
-    return r.returncode == 0 and r.stdout.strip() != ""
+    """Vivo de verdade. `ps -o pid=` também lista ZUMBI (defunto ainda não colhido
+    pelo pai), e zumbi não está rodando nada — contá-lo como vivo faria o teste
+    aprovar um `parar` que não parou, e reprovar um que parou."""
+    r = subprocess.run(["ps", "-o", "state=", "-p", str(pid)], capture_output=True, text=True)
+    est = r.stdout.strip()
+    return r.returncode == 0 and est != "" and not est.startswith("Z")
 
 
 def estado(base: Path) -> dict:
@@ -359,14 +363,20 @@ def main() -> int:
             f"rc={sem_porque.returncode}",
         )
 
-        # ---- T-RED 9: --anunciar por quem não pode postar REPROVA ------------
-        anuncio = roda(env, "decidi", "--de", "bauer", "--porque", "x",
-                       "--anunciar", "codex", "terceira decisão")
+        # ---- T9b: o DONO anuncia mesmo não estando em `na_sala` ---------------
+        # `iachat-decide --anunciar` chama core.post(de,…), que rejeita quem não está
+        # na sala (iachat_core.py:258-262): com `--de bauer` daria traceback. Quem
+        # anuncia é o `/decidi`, por `voz()`, que faz o dono falar pela orquestradora.
+        anuncio = roda(env, "decidi", "--de", "bauer", "--porque",
+                       "o sino tem que tocar em quem vai obedecer",
+                       "--anunciar", "codex", "decisão nominada ao codex")
+        chat_d = core.p_chat().read_text(encoding="utf-8")
         checa(
-            "T-RED decidi --anunciar por quem não está na sala REPROVA sem traceback",
-            anuncio.returncode == 2 and "só funciona para quem pode postar" in anuncio.stderr
-            and "Traceback" not in anuncio.stderr
-            and "id=D2" not in registro.read_text(encoding="utf-8"),
+            "T9b decidi do DONO anuncia pela orquestradora e nomina, sem traceback",
+            anuncio.returncode == 0 and "Traceback" not in anuncio.stderr
+            and "do dono (bauer)" in chat_d
+            and "DECIDIDO: decisão nominada ao codex" in chat_d
+            and "para=codex" in chat_d,
             f"rc={anuncio.returncode}",
         )
 
@@ -383,6 +393,239 @@ def main() -> int:
             braco.returncode == 3 and "braço sem adaptador" in braco.stderr
             and "codex" in braco.stderr,
             f"rc={braco.returncode}",
+        )
+
+        # ================================================================
+        # RUNS DO IASWARM — o mundo real: dispatch.sh grava logs/<w>.pid,
+        # três workers morrem na queda de energia, e o painel jura que andam.
+        # Tudo forjado em /tmp; nenhum processo da frota é tocado.
+        # ================================================================
+        run = base / "run-forjado"
+        for sub in ("logs", "contratos", "progress", "resultados"):
+            (run / sub).mkdir(parents=True, exist_ok=True)
+        (run / "workers.tsv").write_text(
+            "e3-squad\tcodex\t5\tcontratos/e3-squad.md\n"
+            "e5-handoff\tgrok\t5\tcontratos/e5-handoff.md\n"
+            "e6-roster\tqwen\t5\tcontratos/e6-roster.md\n"
+            "e9-vivo\tkimi\t5\tcontratos/e9-vivo.md\n",
+            encoding="utf-8",
+        )
+        for w in ("e3-squad", "e5-handoff", "e6-roster", "e9-vivo"):
+            (run / "contratos" / f"{w}.md").write_text(f"# contrato {w}\n", encoding="utf-8")
+        # os três que caíram deixaram log parcial e nenhum resultado
+        for w in ("e3-squad", "e5-handoff", "e6-roster"):
+            (run / "logs" / f"{w}.log").write_text(
+                f"[{w}] etapa 2 de 5: li o núcleo e comecei o gate\n", encoding="utf-8")
+        # PIDs mortos: números que não existem (alto o bastante para não colidir)
+        pids_mortos = {"e3-squad": 999731, "e5-handoff": 999735, "e6-roster": 999739}
+        for w, p in pids_mortos.items():
+            (run / "logs" / f"{w}.pid").write_text(f"{p}\n", encoding="utf-8")
+
+        # um worker VIVO de verdade: script DENTRO do run, então o caminho do run
+        # aparece na linha de comando — é esse o âncora, não o nome do worker
+        (run / "logs" / "worker-falso.sh").write_text(
+            "#!/usr/bin/env bash\nsleep 300 &\necho \"$!\" > \"$2\"\nwait\n", encoding="utf-8")
+        (run / "logs" / "worker-falso.sh").chmod(0o755)
+        neto_f = run / "logs" / "e9-vivo.neto"
+        proc_vivo = subprocess.Popen(
+            ["bash", str(run / "logs" / "worker-falso.sh"), "e9-vivo", str(neto_f)],
+            start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        faxina.append(proc_vivo.pid)
+        (run / "logs" / "e9-vivo.pid").write_text(f"{proc_vivo.pid}\n", encoding="utf-8")
+
+        # o VIZINHO que só MENCIONA o nome do worker, e não pertence ao run: é ele que
+        # um `pkill -f e3-squad` mataria por engano
+        vizinho_sh = base / "processo-que-menciona-e3-squad.sh"
+        vizinho_sh.write_text("#!/usr/bin/env bash\nsleep 300\n", encoding="utf-8")
+        vizinho_sh.chmod(0o755)
+        vizinho = subprocess.Popen(
+            ["bash", str(vizinho_sh), "e3-squad", "e5-handoff", "e6-roster"],
+            start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        faxina.append(vizinho.pid)
+
+        # o órfão VIVO sem `.pid`: aconteceu de verdade (d1-watchdog, 18/08)
+        orfao = subprocess.Popen(
+            ["bash", str(run / "logs" / "worker-falso.sh"), "d1-watchdog",
+             str(run / "logs" / "d1.neto")],
+            start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        faxina.append(orfao.pid)
+
+        # o painel mentindo, como o real: state.json diz que todo mundo anda
+        (run / "state.json").write_text(json.dumps({"workers": [
+            {"worker": w, "braco": b, "estado": "rodando"}
+            for w, b in (("e3-squad", "codex"), ("e5-handoff", "grok"),
+                         ("e6-roster", "qwen"), ("e9-vivo", "kimi"))]}), encoding="utf-8")
+        time.sleep(0.8)
+
+        # ---- T11: quem --run separa os TRÊS desfechos ------------------------
+        qr = roda(env, "quem", "--run", str(run))
+        qrj = json.loads(roda(env, "quem", "--run", str(run), "--json").stdout)
+        por_w = {x["worker"]: x for x in qrj["workers"]}
+        checa(
+            "T11 quem --run acerta vivo × morto, ancorado no PID gravado",
+            qr.returncode == 0
+            and all(por_w[w]["veredito"] == "morto" for w in pids_mortos)
+            and por_w["e9-vivo"]["veredito"] == "vivo"
+            and "3 morto(s)" in qr.stdout and "1 vivo(s)" in qr.stdout,
+            f"e9={por_w['e9-vivo']['veredito']}",
+        )
+        checa(
+            "T11b quem --run denuncia o state.json que jura que os mortos andam",
+            "state.json diz que" in qr.stdout and "painel=rodando      ps=morto" in qr.stdout,
+            "painel × ps",
+        )
+        checa(
+            "T11c quem --run acha o VIVO sem `.pid` (ausência de .pid ≠ morte)",
+            any(p == orfao.pid for p, _ in
+                [(x["pid"], x["cmd"]) for x in qrj["orfaos"]]),
+            f"órfãos={[x['pid'] for x in qrj['orfaos']]}",
+        )
+        # A linha de comando do PRÓPRIO `quem --run` contém o caminho do run: se ele se
+        # contasse, todo diagnóstico viria com um fantasma dentro. A conferência é por
+        # PID — o conjunto tem que ser EXATAMENTE o órfão plantado, nem mais nem menos.
+        # (Por nome não dá: o diretório do teste se chama `iachat-comandos-teste-…`, e
+        # um filtro por substring engoliria o órfão legítimo junto.)
+        checa(
+            "T-RED quem --run não se conta como órfão: o conjunto é exatamente o plantado",
+            {x["pid"] for x in qrj["orfaos"]} == {orfao.pid}
+            and os.getpid() not in {x["pid"] for x in qrj["orfaos"]},
+            f"órfãos={[x['pid'] for x in qrj['orfaos']]} plantado={orfao.pid}",
+        )
+
+        # ---- T-RED 10: PID que existe mas NÃO é do run → recusa --------------
+        (run / "logs" / "e3-squad.pid").write_text(f"{vizinho.pid}\n", encoding="utf-8")
+        intruso = roda(env, "parar", "--run", str(run), "--ia", "e3-squad", "--calado")
+        checa(
+            "T-RED parar --run recusa PID que existe mas não cita o run; vizinho sobrevive",
+            intruso.returncode == 3 and "NÃO cita este run" in intruso.stderr
+            and vivo_no_so(vizinho.pid),
+            f"rc={intruso.returncode}",
+        )
+        # este é o teste do `pkill -f`: o vizinho MENCIONA e3-squad na linha de comando
+        cmd_vizinho = subprocess.run(["ps", "-o", "command=", "-p", str(vizinho.pid)],
+                                     capture_output=True, text=True).stdout
+        checa(
+            "T-RED o vizinho de fato casaria `pkill -f e3-squad`, e mesmo assim viveu",
+            "e3-squad" in cmd_vizinho and vivo_no_so(vizinho.pid),
+            "âncora é o PID gravado + o run no cmd, nunca o nome",
+        )
+        (run / "logs" / "e3-squad.pid").write_text(f"{pids_mortos['e3-squad']}\n",
+                                                   encoding="utf-8")
+
+        # ---- T-RED 11: nasceu DEPOIS do despacho → reciclado → recusa --------
+        antigo = time.time() - 7200  # o `.pid` foi escrito há 2h; o processo é de agora
+        os.utime(run / "logs" / "e9-vivo.pid", (antigo, antigo))
+        temporal = roda(env, "parar", "--run", str(run), "--ia", "e9-vivo", "--calado")
+        checa(
+            "T-RED parar --run recusa PID nascido DEPOIS do despacho (reciclado no tempo)",
+            temporal.returncode == 3 and "reciclado" in temporal.stderr
+            and vivo_no_so(proc_vivo.pid),
+            f"rc={temporal.returncode} vivo={vivo_no_so(proc_vivo.pid)}",
+        )
+        agora_ts = time.time()
+        os.utime(run / "logs" / "e9-vivo.pid", (agora_ts, agora_ts))
+
+        # ---- T-RED 12: refaz --run recusa o não-verificável ------------------
+        os.utime(run / "logs" / "e9-vivo.pid", (antigo, antigo))
+        rf_nv = roda(env, "refaz", "--run", str(run), "--ia", "e9-vivo")
+        checa(
+            "T-RED refaz --run recusa quem não se prova morto (duplicaria trabalho pago)",
+            rf_nv.returncode == 3 and "não consigo provar" in rf_nv.stderr,
+            f"rc={rf_nv.returncode}",
+        )
+        os.utime(run / "logs" / "e9-vivo.pid", (agora_ts, agora_ts))
+
+        # ---- T12: refaz --run ressuscita os três, retomando o parcial --------
+        seco_r = roda(env, "refaz", "--run", str(run), "--ia", "e3-squad", "--seco")
+        checa(
+            "T12a refaz --run --seco mostra a retomada sem gastar assinatura",
+            seco_r.returncode == 0 and "seria redisparado" in seco_r.stdout
+            and "retomando" in seco_r.stdout
+            and not (run / "logs" / "e3-squad.r2.log").exists(),
+            f"rc={seco_r.returncode}",
+        )
+        ressuscitados = []
+        for w in ("e3-squad", "e5-handoff", "e6-roster"):
+            rr = roda(env, "refaz", "--run", str(run), "--ia", w)
+            novo = int((run / "logs" / f"{w}.pid").read_text().strip())
+            faxina.append(novo)
+            ressuscitados.append((w, rr.returncode, novo))
+        # o `--seco` acima não escreveu nada, então esta é a tentativa r2
+        prompts = sorted((run / "logs").glob("e3-squad.r*.prompt.txt"))
+        checa(
+            "T12b o refaz --seco não deixou prompt no disco: só a rodada real escreveu",
+            [p.name for p in prompts] == ["e3-squad.r2.prompt.txt"],
+            f"{[p.name for p in prompts]}",
+        )
+        pr3 = prompts[-1].read_text(encoding="utf-8")
+        checa(
+            "T12 refaz --run ressuscita os 3 mortos, com PID novo e protocolo iaswarm",
+            all(rc == 0 and pid not in pids_mortos.values() for _, rc, pid in ressuscitados)
+            and "PROTOCOLO IASWARM" in pr3 and "RETOMADA" in pr3
+            and "etapa 2 de 5" in pr3
+            and str(run / "progress" / "e3-squad.jsonl") in pr3,
+            f"{[(w, p) for w, _, p in ressuscitados]}",
+        )
+
+        # ---- T-RED 13: refaz --run de quem já entregou REPROVA ---------------
+        (run / "resultados" / "e5-handoff.md").write_text("missão: x\nresultado: pronto\n",
+                                                          encoding="utf-8")
+        roda(env, "parar", "--run", str(run), "--ia", "e5-handoff", "--calado")
+        time.sleep(0.4)
+        entregue = roda(env, "refaz", "--run", str(run), "--ia", "e5-handoff")
+        checa(
+            "T-RED refaz --run recusa quem já entregou (apagaria trabalho pronto)",
+            entregue.returncode == 3 and "já entregou" in entregue.stderr,
+            f"rc={entregue.returncode}",
+        )
+        fora_run = roda(env, "refaz", "--run", str(run), "--ia", "nao-existe")
+        checa(
+            "T-RED refaz --run de worker fora do workers.tsv REPROVA",
+            fora_run.returncode == 2 and "não está neste run" in fora_run.stderr,
+            f"rc={fora_run.returncode}",
+        )
+
+        # ---- T13: parar --run mata a árvore do alvo e SÓ dele ----------------
+        neto_vivo = int(neto_f.read_text(encoding="utf-8").strip())
+        faxina.append(neto_vivo)
+        antes = sorted(p.name for p in (run / "logs").iterdir())
+        pr_run = roda(env, "parar", "--run", str(run), "--ia", "e9-vivo", "--calado")
+        time.sleep(0.6)
+        checa(
+            "T13 parar --run derruba a árvore do worker e não encosta nos vizinhos",
+            pr_run.returncode == 0
+            and not vivo_no_so(proc_vivo.pid) and not vivo_no_so(neto_vivo)
+            and vivo_no_so(vizinho.pid) and vivo_no_so(orfao.pid),
+            f"alvo={vivo_no_so(proc_vivo.pid)} vizinho={vivo_no_so(vizinho.pid)}",
+        )
+        checa(
+            "T13b parar --run não escreve nada no run (é dado de outro programa)",
+            sorted(p.name for p in (run / "logs").iterdir()) == antes
+            and "nada foi escrito" in pr_run.stdout,
+            f"{len(antes)} arquivos",
+        )
+        naorun = roda(env, "quem", "--run", str(base))
+        checa(
+            "T-RED --run em pasta que não é run do iaswarm REPROVA",
+            naorun.returncode == 2 and "não parece um run" in naorun.stderr,
+            f"rc={naorun.returncode}",
+        )
+
+        # ---- T14: /decidi alimenta os DOIS instrumentos ----------------------
+        d2 = roda(env, "decidi", "--de", "bauer", "--sobre", "energia",
+                  "--porque", "a queda de 18/08 matou 3 workers sem aviso",
+                  "worker que cai volta pelo refaz, nunca por kill na mão")
+        chat4 = core.p_chat().read_text(encoding="utf-8")
+        reg = (base / "decisoes.md").read_text(encoding="utf-8")
+        rel = subprocess.run(
+            [sys.executable, str(RAIZ / "bin" / "iachat-report"), "--horas", "24"],
+            env=env, capture_output=True, text=True)
+        checa(
+            "T14 decidi grava no registro E posta DECIDIDO: que o iachat-report lê",
+            d2.returncode == 0 and "id=D2" in reg
+            and "DECIDIDO: worker que cai volta pelo refaz" in chat4
+            and "worker que cai volta pelo refaz" in rel.stdout,
+            f"report={len(rel.stdout)} B",
         )
 
     finally:

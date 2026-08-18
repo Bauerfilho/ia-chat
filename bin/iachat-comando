@@ -127,6 +127,19 @@ def _ps(pid: int, campo: str) -> str:
     return r.stdout.strip() if r.returncode == 0 else ""
 
 
+def esta_vivo(pid: int) -> bool:
+    """Zumbi NÃO é vivo — e `ps -o pid=` não sabe a diferença.
+
+    Medido em 18/08: depois de um SIGKILL certeiro, `ps -o pid= -p PID` continuava
+    devolvendo o número enquanto o pai não colhia o filho, e o `parar` anunciava
+    "ainda de pé" para um processo que já tinha morrido. `ps -o state=` devolve `Z`
+    para o defunto. Contar zumbi como vivo é a mesma mentira do painel que este
+    programa existe para denunciar, só que do meu lado.
+    """
+    est = _ps(pid, "state")
+    return bool(est) and not est.startswith("Z")
+
+
 def confere_dono(w: dict, missao: str) -> tuple[str, str]:
     """O gate do `parar`. Devolve (veredito, motivo).
 
@@ -140,7 +153,7 @@ def confere_dono(w: dict, missao: str) -> tuple[str, str]:
     if pid == os.getpid() or pid == os.getppid():
         return "recusado", f"pid {pid} é este próprio comando"
     lstart = _ps(pid, "lstart")
-    if not lstart:
+    if not lstart or not esta_vivo(pid):
         return "morto", "processo já não existe"
     if lstart != w.get("lstart"):
         return "recusado", (
@@ -207,6 +220,23 @@ def _tabela_ps() -> list[tuple[int, int, str]]:
     return out
 
 
+def _minha_linhagem(tabela: list[tuple[int, int, str]]) -> set[int]:
+    """Eu e meus ancestrais, por PID.
+
+    A linha de comando de `iachat-comando quem --run <dir>` CONTÉM o caminho do run:
+    sem me excluir, eu apareceria como "processo vivo citando este run" no meu próprio
+    diagnóstico. A exclusão é por PID e não por nome porque nome casa por acaso —
+    medido em 18/08: o filtro `"iachat-comando" not in cmd` engoliu um órfão legítimo
+    só porque o diretório do teste se chamava `iachat-comandos-teste-…`.
+    """
+    pais = {p: pp for p, pp, _ in tabela}
+    meus, atual = set(), os.getpid()
+    while atual and atual not in meus:
+        meus.add(atual)
+        atual = pais.get(atual, 0)
+    return meus
+
+
 def descendentes(pid: int, tabela: list[tuple[int, int, str]]) -> list[int]:
     """A árvore abaixo de `pid`, das folhas para a raiz — a ordem em que se mata.
 
@@ -227,23 +257,78 @@ def descendentes(pid: int, tabela: list[tuple[int, int, str]]) -> list[int]:
     return list(reversed(ordem))
 
 
+def _sinaliza(pids: list[int], sig: int) -> list[int]:
+    atingidos = []
+    for p in pids:
+        try:
+            os.kill(p, sig)
+            atingidos.append(p)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    return atingidos
+
+
+def _insiste(pids: list[int], espera: float) -> list[int]:
+    """Espera a saída educada e manda SIGKILL em quem ficou. Devolve os teimosos."""
+    fim = time.time() + max(espera, 0.1)
+    while time.time() < fim:
+        if not any(esta_vivo(p) for p in pids):
+            return []
+        time.sleep(0.15)
+    teimosos = [p for p in pids if esta_vivo(p)]
+    if teimosos:
+        _sinaliza(teimosos, signal.SIGKILL)
+        time.sleep(0.4)
+    return teimosos
+
+
 def _nascimento(pid: int) -> datetime | None:
-    bruto = " ".join(_ps(pid, "lstart").split())
+    """Quando o processo nasceu, por `etime` — aritmética, sem idioma no meio.
+
+    NÃO usa `lstart` + strptime: nesta máquina o `ps` responde em português
+    (`'ter 18 ago 03:39:08 2026'`), e `%a %b` em inglês levanta ValueError. Medido em
+    18/08 com o gate já escrito: ele devolvia None em silêncio e o veredito caía em
+    "vivo" — um gate morto que parecia aprovado. `etime` é `[[dd-]hh:]mm:ss`, número
+    puro, igual em qualquer locale.
+
+    (Em `confere_dono` o `lstart` continua sendo usado, e lá isso não é problema: a
+    comparação é de STRING contra a string gravada no despacho, nunca de data.)
+    """
+    bruto = _ps(pid, "etime")
     if not bruto:
         return None
+    dias, _, resto = bruto.rpartition("-")
+    partes = resto.split(":")
     try:
-        return datetime.strptime(bruto, "%a %b %d %H:%M:%S %Y").astimezone()
+        nums = [float(x) for x in partes]
     except ValueError:
         return None
+    seg = 0.0
+    for n in nums:                      # mm:ss ou hh:mm:ss
+        seg = seg * 60 + n
+    if dias:
+        try:
+            seg += float(dias) * 86400
+        except ValueError:
+            return None
+    return datetime.now().astimezone() - timedelta(seconds=seg)
 
 
 def le_run(d: Path) -> dict:
     """Lê um run do iaswarm. READ-ONLY: não cria, não escreve, não pega lock."""
-    d = d.expanduser().resolve()
+    bruto = Path(d).expanduser()
+    d = bruto.resolve()
     if not (d / "workers.tsv").is_file():
         raise ValueError(f"{d} não parece um run do iaswarm (sem workers.tsv)")
     tabela = _tabela_ps()
-    alvo = str(d)
+    # DUAS grafias do mesmo diretório, porque o processo foi lançado com UMA delas e
+    # `ps` devolve o texto literal: `/var/folders/…` resolve para `/private/var/…` no
+    # macOS. Comparar só a resolvida faria todo worker de um caminho com symlink cair
+    # em "não-verificável" — o instrumento diria "não sei" sobre um worker que sabe.
+    marcas = {str(d), str(bruto)}
+
+    def cita_o_run(linha: str) -> bool:
+        return any(m in linha for m in marcas)
     workers: dict[str, dict] = {}
     for tsv in sorted(d.glob("workers*.tsv")):
         for ln in tsv.read_text(encoding="utf-8", errors="replace").splitlines():
@@ -282,7 +367,10 @@ def le_run(d: Path) -> dict:
             info.update(veredito="morto", motivo="pid não está no ps")
             continue
         info["cmd"] = linha[:140]
-        if alvo not in linha:
+        if not esta_vivo(pid):
+            info.update(veredito="morto", motivo="zumbi (defunto, pai ainda não colheu)")
+            continue
+        if not cita_o_run(linha):
             info.update(veredito="nao-verificavel",
                         motivo=f"pid {pid} existe mas NÃO cita este run: {linha[:70]!r}")
             continue
@@ -297,11 +385,9 @@ def le_run(d: Path) -> dict:
     # Vivos que o run NÃO registrou: o `.pid` ausente não é prova de morte. Aconteceu
     # de verdade em 18/08 — `d1-watchdog` rodando sem `.pid` e sem linha no workers.tsv.
     conhecidos = {i.get("pid") for i in workers.values() if i.get("pid")}
-    meus = {os.getpid(), os.getppid()}
     orfaos = [
         (p, c[:140]) for p, _, c in tabela
-        if alvo in c and p not in conhecidos and p not in meus
-        and "iachat-comando" not in c   # a minha própria linha cita o run: não sou órfão
+        if cita_o_run(c) and p not in conhecidos and p not in _minha_linhagem(tabela)
     ]
     return {"dir": d, "workers": workers, "orfaos": orfaos}
 
@@ -601,16 +687,22 @@ def parar_run(a) -> int:
             continue
         pid = i["pid"]
         arvore = descendentes(pid, tabela) + [pid]   # folhas primeiro, raiz por último
-        atingidos = []
-        for alvo_pid in arvore:
-            try:
-                os.kill(alvo_pid, sig)
-                atingidos.append(alvo_pid)
-            except (ProcessLookupError, PermissionError, OSError):
-                pass
+        atingidos = _sinaliza(arvore, sig)
+        # SIGTERM é pedido, não ordem: `bash` esperando em `wait` recebe o sinal e só
+        # sai quando o `wait` retorna — medido em 18/08, o shell continuou de pé com o
+        # filho já morto. Um `parar` que anuncia "parado" para quem ficou de pé é o
+        # mesmo defeito do painel que este comando existe para denunciar.
+        sobreviventes = _insiste(arvore, a.espera)
         mortos.append(w)
         print(f"   {w:16} {sig.name} em {len(atingidos)} processo(s): "
               f"{', '.join(str(x) for x in atingidos)}")
+        if sobreviventes:
+            print(f"   {'':16} ↳ SIGKILL nos {len(sobreviventes)} que ignoraram o "
+                  f"{sig.name}: {', '.join(str(x) for x in sobreviventes)}")
+        restam = [x for x in arvore if esta_vivo(x)]
+        if restam:
+            recusados.append((w, f"AINDA DE PÉ após SIGKILL: {restam}"))
+            print(f"   {w:16} ⚠️  ainda de pé: {restam}", file=sys.stderr)
 
     print(f"\n🛑 {len(mortos)} parado(s) · {len(ja)} já morto(s) · {len(recusados)} recusado(s)")
     print(f"   (nada foi escrito em {r['dir']} — o run é de outro programa)")
@@ -665,13 +757,17 @@ def cmd_parar(a) -> int:
         mortos.append(ia)
         print(f"   {ia:10} pid {w['pid']} ({alvo_str}) ← {sig.name}")
 
-    # SIGTERM é pedido, não ordem: confere se o processo de fato saiu.
+    # SIGTERM é pedido, não ordem — e um `parar` que anuncia "parado" para quem
+    # continua de pé mente igual ao painel. Confere e escala.
     if mortos and not a.forte:
-        time.sleep(a.espera)
-        teimosos = [ia for ia in mortos if _ps(ws[ia]["pid"], "lstart") == ws[ia].get("lstart")]
+        teimosos = _insiste([ws[ia]["pid"] for ia in mortos], a.espera)
         if teimosos:
-            print(f"⚠️  ainda de pé após {a.espera}s: {', '.join(teimosos)} — "
-                  f"`iachat-comando parar --forte` manda SIGKILL", file=sys.stderr)
+            print(f"   ↳ SIGKILL nos que ignoraram o SIGTERM: "
+                  f"{', '.join(str(x) for x in teimosos)}")
+        restam = [ia for ia in mortos if esta_vivo(ws[ia]["pid"])]
+        if restam:
+            print(f"⚠️  AINDA de pé após SIGKILL: {', '.join(restam)}", file=sys.stderr)
+            recusados += [(ia, "sobreviveu ao SIGKILL") for ia in restam]
 
     e["estado"] = "parada" if not any(
         vivo(w, e["id"]) for w in ws.values()) else e.get("estado", "planejando")
@@ -878,13 +974,15 @@ def refaz_run(a) -> int:
         tentativa += 1
     pr = d / "logs" / f"{w}.r{tentativa}.prompt.txt"
     novo_log = d / "logs" / f"{w}.r{tentativa}.log"
-    pr.write_text(protocolo, encoding="utf-8")
 
     if a.seco:
+        # Seco não escreve NADA: o run é dado de outro programa, e uma simulação que
+        # deixa arquivo no diretório alheio não é simulação.
         print(f"🧪 seco — {w} seria redisparado no braço {a.braco or i['braco']}")
-        print(f"   prompt {len(protocolo)} B em {pr}")
+        print(f"   prompt de {len(protocolo)} B iria para {pr}")
         print(f"   {'retomando ' + str(len(parcial)) + ' B de parcial' if parcial else 'do zero'}")
         return 0
+    pr.write_text(protocolo, encoding="utf-8")
 
     despachante = os.environ.get("IACHAT_DESPACHO", str(DESPACHO_PADRAO))
     # A marca vai sem barras: o adaptador da kimi usa este campo como nome de sessão
@@ -939,10 +1037,16 @@ def cmd_refaz(a) -> int:
                   file=sys.stderr)
             return 3
         parcial = plano.read_text(encoding="utf-8", errors="replace")[-2000:]
-        plano.rename(plano.with_suffix(f".parcial{w.get('tentativas', 1)}.md"))
+        if not a.seco:   # seco não move arquivo: simulação que mexe no disco não simula
+            plano.rename(plano.with_suffix(f".parcial{w.get('tentativas', 1)}.md"))
     elif Path(w["log"]).exists():
         # Sem plano no disco, o log é o que sobrou do que ele pensou.
         parcial = Path(w["log"]).read_text(encoding="utf-8", errors="replace")[-1500:]
+
+    if a.seco:
+        print(f"🧪 seco — {ia} seria redisparado no braço {a.braco or w['braco']}")
+        print(f"   {'retomando ' + str(len(parcial)) + ' B de parcial' if parcial else 'do zero'}")
+        return 0
 
     novo = despacha(ia, a.braco or w["braco"], e, w["papel"], parcial)
     novo["tentativas"] = w.get("tentativas", 1) + 1
@@ -956,31 +1060,58 @@ def cmd_refaz(a) -> int:
 
 # ---------------------------------------------------------------- /decidi
 def cmd_decidi(a) -> int:
-    """Delega ao `iachat-decide`, que já é o registro. Duplicar seria criar um segundo
-    lugar onde a mesma decisão pode estar diferente."""
+    """Delega ao `iachat-decide` E anuncia na sala com o marcador `DECIDIDO:`.
+
+    Há DOIS instrumentos de decisão nesta casa, e eles não se enxergavam:
+
+      · `decisoes.md`, escrito pelo `iachat-decide` — registro durável, com revogação
+        gravada no arquivo;
+      · a linha `DECIDIDO:` dentro de uma mensagem do chat, que o `iachat-report` lê
+        pelo `RE_MARCA` (iachat-report:28-31) e mostra no relatório do dono.
+
+    Medido em 18/08: a sala real tinha CINCO decisões `DECIDIDO:` (iachat.md:376, 378,
+    380, 382, 413) e `decisoes.md` NÃO EXISTIA. O registro estava vazio e o que valia
+    de fato só existia como texto no chat. Mandar o `/decidi` alimentar só um dos dois
+    seria escolher qual metade da casa fica desatualizada.
+
+    Então um ato só alimenta os dois: grava no registro (sem duplicar a lógica dele) e
+    posta na sala uma mensagem cuja primeira linha é `DECIDIDO: …`.
+    """
     if not DECIDE.is_file():
         print(f"✗ {DECIDE} não existe — o registro de decisões é dele, não deste comando.",
               file=sys.stderr)
         return 2
     de = core.normaliza_ia(a.de)
-    if a.anunciar and de not in sala():
-        # `iachat-decide --anunciar` chama core.post(de,...), que exige `de` na sala
-        # (iachat_core.py:258-262). Com --de bauer isso seria um traceback; barrar aqui
-        # é mais honesto do que deixar a decisão gravar e o anúncio explodir depois.
-        print(f"✗ '{de}' não está na sala {sala()}: `--anunciar` só funciona para quem "
-              f"pode postar. Grave sem `--anunciar` e anuncie pela orquestradora.",
-              file=sys.stderr)
-        return 2
+    texto = " ".join(a.texto).strip()
 
+    # O `--anunciar` do iachat-decide chama core.post(de,…), que exige `de` na sala
+    # (iachat_core.py:258-262): com `--de bauer` seria traceback. O anúncio é feito
+    # aqui, por `voz()`, que sabe fazer o dono falar pela orquestradora.
     argv = [sys.executable, str(DECIDE), "decidir", "--de", de]
-    for flag, val in (("--porque", a.porque), ("--sobre", a.sobre), ("--anunciar", a.anunciar)):
+    for flag, val in (("--porque", a.porque), ("--sobre", a.sobre)):
         if val:
             argv += [flag, val]
     for r in a.revoga or []:
         argv += ["--revoga", r]
     argv += list(a.texto)
-    r = subprocess.run(argv, text=True)
-    return r.returncode
+    r = subprocess.run(argv, text=True, capture_output=True)
+    sys.stdout.write(r.stdout)
+    sys.stderr.write(r.stderr)
+    if r.returncode != 0:
+        return r.returncode
+
+    if not a.calado:
+        marca = f"DECIDIDO: {texto}"
+        corpo = (f"{marca}\n\nPorque: {a.porque.strip()}\n\n"
+                 f"Assunto: {a.sobre or 'geral'} · registro durável: "
+                 f"`iachat-decide decisoes`")
+        alvo = [a.anunciar] if a.anunciar else ["all"]
+        post = anuncia(de, corpo, alvo)
+        if post:
+            print(f"  ↪ anunciada na sala como #{post['n']} → "
+                  f"{', '.join(post['para']) or 'ninguém'} (com marcador DECIDIDO:, "
+                  f"que o `iachat-report` lê)")
+    return 0
 
 
 # ---------------------------------------------------------------- main
@@ -1036,6 +1167,7 @@ def main() -> int:
 
     p = sub.add_parser("decidi", help="registrar decisão que todas obedecem")
     p.add_argument("--de", default="bauer")
+    p.add_argument("--calado", action="store_true", help="não postar na sala")
     p.add_argument("--porque", help="o motivo — obrigatório (gate do iachat-decide)")
     p.add_argument("--sobre", help="assunto, uma palavra")
     p.add_argument("--revoga", action="append", help="D3 (repetível)")
