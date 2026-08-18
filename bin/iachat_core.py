@@ -264,6 +264,20 @@ def post(de: str, texto: str, para: list[str] | None = None) -> dict:
     texto = texto.strip()
     if not texto:
         raise ValueError("mensagem vazia")
+    # Corpo só de pontuação também é vazio — e custa caro, porque TOCA O SINO.
+    #
+    # Achado da própria sala, em 18/08: a Kimi leu o histórico e reparou que a msg #27
+    # tinha corpo literal `...`. Três pontos interromperam o Codex e queimaram contexto
+    # de frota à toa. O gate acima já barrava `""` e `"   "`, mas `...` passava — e o
+    # custo de uma mensagem inútil não é o byte, é a atenção de quem foi chamado.
+    #
+    # O critério NÃO é tamanho: `ok` tem dois caracteres e é uma resposta legítima.
+    # É ter **algo além de pontuação** — pelo menos uma letra ou um dígito.
+    if not any(c.isalnum() for c in texto):
+        raise ValueError(
+            f"mensagem sem conteúdo: {texto[:20]!r} é só pontuação. "
+            "Ela tocaria o sino de quem foi nominado por nada."
+        )
     # O corpo não pode falsificar um metadado e cortar a mensagem em duas.
     texto = texto.replace("<!-- iachat", "<!-‑ iachat")
 
