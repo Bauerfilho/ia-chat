@@ -86,11 +86,24 @@ def sala() -> list[str]:
     return [core.normaliza_ia(x) for x in core.config().get("na_sala", [])]
 
 
+# Quem estes comandos tratam como DONO — o mesmo nome que é default de `--de`.
+# Não vira campo de config: inventar `"dono"` no config.json exigiria migrar toda
+# sala já existente para consertar um problema que uma constante resolve.
+DONO = "bauer"
+
+
 def voz(de: str) -> tuple[str, str]:
-    """Quem assina o post. O dono não está em `na_sala`; ele fala pela orquestradora.
+    """Quem assina o post.
 
     Devolve (autor, prefixo). Sem brain na sala, ninguém pode falar por ele — e
     inventar um autor seria pôr palavra na boca de uma IA que não disse aquilo.
+
+    ⚠️ O desenho original assumia que o dono NÃO estava em `na_sala`: `voz("bauer")`
+    caía no ramo do brain e a orquestradora assinava com o prefixo "📣 do dono",
+    declarando a procedência. Em 18/08 ele entrou na sala pelo app — e o MESMO código
+    passou a devolver `("bauer", "")`, assinando COMO ele, sem prefixo. A premissa
+    mudou embaixo do código; o código não soube. Por isso o guarda-corpo do `--de`
+    (`autor`) existe: aqui não dá para saber quem digitou.
     """
     de = core.normaliza_ia(de)
     if de in sala():
@@ -104,11 +117,54 @@ def voz(de: str) -> tuple[str, str]:
     return brain, f"📣 **do dono ({de}):**\n\n"
 
 
+def autor(a) -> str:
+    """Quem assina — resolvido na hora de assinar, nunca antes.
+
+    O dono só assina o que ele digitou.
+
+    `--de` tem padrão `bauer` porque estes comandos são DELE: ele digita
+    `iachat-comando goal "..."` e não deveria ter que se identificar na própria máquina.
+    Mas uma IA que dispare o mesmo comando sem `--de` faz a mensagem sair ASSINADA POR
+    ELE — e as outras IAs leem a sala e OBEDECEM. Esta casa já teve uma mensagem-fantasma
+    assinada `bauer` que ele não escreveu; `decidi` é pior ainda, porque registra decisão
+    que todas obedecem.
+
+    O sinal barato que separa os dois casos: um humano digitando tem TTY; um subprocesso
+    disparado por uma IA, não. Sem TTY e sem `--de`, exigimos o autor explícito em vez de
+    assinar por ele.
+
+    NÃO é infalível — uma casca que aloque TTY volta ao padrão —, e por isso não é a
+    única defesa: `prompt_de` declara a procedência no texto do despacho. Um guarda-corpo
+    que pega o caso real vale mais que a trava perfeita que ninguém escreve.
+
+    ⚠️ Chamada AQUI, no ponto de uso, e não no `main()`. Rodando no `main()` ela
+    disparava antes das validações de estado: `plan` sem `goal` respondia "diga quem
+    está falando" em vez de "não há objetivo", e o `plan` sequer assina nada — recebe
+    `--de` e nunca o usa. O gate `teste_comandos.py` pegou isso, reprovando dois T-RED
+    que cobram a mensagem certa. Erro deve falar do problema que o usuário tem, não do
+    próximo da fila.
+    """
+    de = getattr(a, "de", None)
+    if de is not None:
+        return de                                 # explícito: quem digitou se nomeou
+    if sys.stdin.isatty():
+        return DONO                               # ele, no terminal dele
+    raise ValueError(
+        f"sem terminal e sem `--de`: eu assinaria como '{DONO}' uma mensagem que ele não "
+        f"digitou, e as outras IAs da sala obedeceriam.\n"
+        f"  Diga quem está falando:  --de claude   (ou codex, kimi, qwen, …)\n"
+        f"  Se for mesmo ele:        --de {DONO}"
+    )
+
+
 def anuncia(de: str, texto: str, para: list[str]) -> dict | None:
     """Posta na sala. Falha de post não derruba o comando — o disco já foi gravado."""
     try:
-        autor, prefixo = voz(de)
-        return core.post(autor, prefixo + texto, para)
+        # `quem`, não `autor`: existe uma FUNÇÃO `autor(a)` no módulo, e reusar o nome
+        # aqui a sombreia. Não quebra hoje (ela não é chamada nesta função), mas é o
+        # tipo de alçapão que só dispara quando alguém editar isto daqui a meses.
+        quem, prefixo = voz(de)
+        return core.post(quem, prefixo + texto, para)
     except ValueError as e:
         print(f"⚠️  não anunciado na sala: {e}", file=sys.stderr)
         return None
@@ -437,7 +493,7 @@ def cmd_goal(a) -> int:
     (d / "logs").mkdir(parents=True, exist_ok=True)
     (d / "planos").mkdir(parents=True, exist_ok=True)
     grava_estado({
-        "id": mid, "goal": texto, "de": core.normaliza_ia(a.de),
+        "id": mid, "goal": texto, "de": core.normaliza_ia(autor(a)),
         "criado": core.agora(), "estado": "aberta", "dir": str(d), "workers": {},
     })
     (d / "goal.md").write_text(f"# {mid} · objetivo\n\n{texto}\n", encoding="utf-8")
@@ -446,7 +502,7 @@ def cmd_goal(a) -> int:
     print(f"   {texto}")
     print(f"   {d}")
     if not a.calado:
-        r = anuncia(a.de, f"**Objetivo da missão {mid}**\n\n{texto}\n\n"
+        r = anuncia(autor(a), f"**Objetivo da missão {mid}**\n\n{texto}\n\n"
                           f"Nada a aplicar ainda. O plano vem pelo `/plan`; aplicar, só no `/concluir`.",
                     ["all"])
         if r:
@@ -458,9 +514,17 @@ def cmd_goal(a) -> int:
 # ---------------------------------------------------------------- /plan
 def prompt_de(ia: str, e: dict, papel: str, retomada: str = "") -> str:
     plano = Path(e["dir"]) / "planos" / f"{ia}.md"
+    # QUEM pediu vem do estado (`cmd_goal` grava `"de"`), nunca de suposição. O texto
+    # dizia "O DONO da máquina definiu" mesmo quando o goal era de outra pessoa — e um
+    # worker que lê isso trata a proposta como ordem dele. Achado do g2 em 18/08, numa
+    # rodada que a própria orquestradora propôs com o dono dormindo.
+    autor = core.normaliza_ia(e.get("de", DONO))
+    origem = (f"O DONO da máquina definiu este objetivo:"
+              if autor == DONO else
+              f"{autor} PROPÔS este objetivo (proposta de uma IA — NÃO é ordem do dono):")
     return (
         f"PEDIDO DE PLANO — missão {e['id']} · sala ia-chat\n\n"
-        f"O DONO da máquina definiu este objetivo:\n\n    {e['goal']}\n\n"
+        f"{origem}\n\n    {e['goal']}\n\n"
         f"Você é {ia}. Seu ângulo nesta rodada: {papel}.\n"
         f"Devolva UM PLANO. NÃO aplique nada, NÃO edite arquivo de produção: planejar é "
         f"barato e reversível, aplicar não. Aplicar só depois que o dono autorizar.\n\n"
@@ -524,9 +588,13 @@ def cmd_plan(a) -> int:
     if not alvos:
         brain = core.normaliza_ia(core.config().get("brain", ""))
         # A orquestradora não se despacha: ela é quem está rodando este comando.
-        alvos = [x for x in sala() if x != brain]
+        # O DONO também não: `na_sala` virou `[claude, codex, kimi, bauer]` quando ele
+        # entrou pelo app, e um worker `bauer` cairia em "braço sem adaptador" — o
+        # comando tentaria despachar o humano como se fosse uma IA. Ele é destinatário
+        # do plano, nunca operário dele.
+        alvos = [x for x in sala() if x not in (brain, DONO)]
     if not alvos:
-        print(f"✗ nenhuma IA para planejar (sala={sala()}, brain fora). "
+        print(f"✗ nenhuma IA para planejar (sala={sala()}, brain e dono fora). "
               f"Use `--ias codex,kimi`.", file=sys.stderr)
         return 2
 
@@ -628,7 +696,7 @@ def cmd_concluir(a) -> int:
     alvo = [core.normaliza_ia(x) for x in (a.para or [])] or prontos
     texto = " ".join(a.texto).strip()
     e["estado"] = "autorizada"
-    e["autorizado"] = {"em": core.agora(), "por": core.normaliza_ia(a.de),
+    e["autorizado"] = {"em": core.agora(), "por": core.normaliza_ia(autor(a)),
                        "para": alvo, "nota": texto}
     grava_estado(e)
 
@@ -643,7 +711,7 @@ def cmd_concluir(a) -> int:
     )
     print(corpo)
     if not a.calado:
-        r = anuncia(a.de, corpo, alvo or ["all"])
+        r = anuncia(autor(a), corpo, alvo or ["all"])
         if r:
             print(f"\n↪ na sala como #{r['n']} → {', '.join(r['para']) or 'ninguém'}")
     return 0
@@ -775,7 +843,7 @@ def cmd_parar(a) -> int:
 
     print(f"\n🛑 {len(mortos)} parado(s) · {len(ja)} já morto(s) · {len(recusados)} recusado(s)")
     if not a.calado and mortos:
-        anuncia(a.de, f"🛑 **Missão {e['id']} abortada pelo dono.** Parados: "
+        anuncia(autor(a), f"🛑 **Missão {e['id']} abortada pelo dono.** Parados: "
                       f"{', '.join(mortos)}. Quem estava planejando, pare — o plano "
                       f"incompleto no disco não vale como entrega.", ["all"])
     if recusados:
@@ -1081,7 +1149,7 @@ def cmd_decidi(a) -> int:
         print(f"✗ {DECIDE} não existe — o registro de decisões é dele, não deste comando.",
               file=sys.stderr)
         return 2
-    de = core.normaliza_ia(a.de)
+    de = core.normaliza_ia(autor(a))
     texto = " ".join(a.texto).strip()
 
     # O `--anunciar` do iachat-decide chama core.post(de,…), que exige `de` na sala
@@ -1121,7 +1189,9 @@ def main() -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     def dono(p):
-        p.add_argument("--de", default="bauer", help="quem comanda (padrão: bauer)")
+        # default=None (não "bauer") para `resolve_autor` distinguir "ele digitou" de
+        # "veio por omissão". O texto de ajuda continua anunciando o padrão real.
+        p.add_argument("--de", default=None, help="quem comanda (padrão: bauer)")
         p.add_argument("--calado", action="store_true", help="não postar na sala")
         return p
 
@@ -1166,7 +1236,7 @@ def main() -> int:
     p.set_defaults(f=cmd_refaz)
 
     p = sub.add_parser("decidi", help="registrar decisão que todas obedecem")
-    p.add_argument("--de", default="bauer")
+    p.add_argument("--de", default=None)
     p.add_argument("--calado", action="store_true", help="não postar na sala")
     p.add_argument("--porque", help="o motivo — obrigatório (gate do iachat-decide)")
     p.add_argument("--sobre", help="assunto, uma palavra")
