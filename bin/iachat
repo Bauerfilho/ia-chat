@@ -41,9 +41,7 @@ def cmd_post(a) -> int:
     print(f"✔ #{r['n']} postada por {r['de']} → {alvo}")
     for w in r["avisos"]:
         print(f"⚠️  {w}", file=sys.stderr)
-    if os.environ.get("IACHAT_TELEMETRIA", "").strip().lower() in (
-        "1", "true", "on", "sim"
-    ):
+    if telemetria_ligada():
         # A mensagem já foi postada. Falha do sidecar fala alto, mas não muda o
         # exit code: devolver erro aqui induziria retry e duplicaria a fala.
         try:
@@ -51,6 +49,30 @@ def cmd_post(a) -> int:
         except Exception as e:
             print(f"⚠️  telemetria não emitida: {e}", file=sys.stderr)
     return 0
+
+
+def telemetria_ligada() -> bool:
+    """A barra de contexto do groupchat só tem número se alguém escrever o sidecar.
+
+    Ela nasceu ligada só por variável de ambiente — e variável de ambiente some entre
+    sessões e é diferente em cada braço, então na prática ninguém ligava e a barra ficava
+    permanentemente `desconhecido`. Funcionalidade que depende de alguém lembrar de exportar
+    uma variável é funcionalidade morta.
+
+    Ordem: a variável de ambiente MANDA (é o escape para ligar/desligar num comando só), e
+    na ausência dela vale o `telemetria` do `config.json` da sala, que é onde moram as
+    decisões que persistem (`na_sala`, `brain`, `teto_bytes`). Default continua desligado:
+    quem não pediu não paga o custo de ler rollout a cada post.
+    """
+    bruto = os.environ.get("IACHAT_TELEMETRIA", "").strip().lower()
+    if bruto in ("1", "true", "on", "sim"):
+        return True
+    if bruto in ("0", "false", "off", "nao", "não"):
+        return False
+    try:
+        return bool(core.config().get("telemetria", False))
+    except Exception:
+        return False        # config ilegível não liga nada por conta própria
 
 
 def cmd_read(a) -> int:
