@@ -150,9 +150,7 @@ Laudo C (kimi, 16 KB): **dá, com duas ressalvas**.
 
 ## 7. O que ainda não sei — **[aguarda]**
 
-- **OpenClaw**: 27 canais de chat (iMessage, WhatsApp, Telegram, Signal…), **email não está
-  no catálogo**. Falta saber como cada canal autentica, se ele fala **MCP**, e se o gateway
-  local (:18789) serve de modelo. *Worker rodando.*
+- ~~**OpenClaw**~~ → **FECHADO** (laudo W-claw, 9.901 B). Ver §9.
 - **omniroute**: como guarda credencial de N provedores. *Worker rodando.*
 - **obsidian**: se tem algo de conexão. *Worker rodando.*
 
@@ -160,3 +158,41 @@ Laudo C (kimi, 16 KB): **dá, com duas ressalvas**.
 
 apagar email — nunca · mandar email a terceiros · guardar senha em arquivo do projeto,
 nem cifrada · ligar a porta de volta antes das cinco travas provadas com isca.
+
+---
+
+## 9. OpenClaw — a fonte nº 1 dele, fechada
+
+Laudo `W-claw` (grok). Veredito: **o `ia-chat` não reimplementa canais — pluga como
+cliente MCP no claw.**
+
+### O que ele é
+
+Agregador de **chat**, não de caixa postal. Gateway local **WS :18789**, loopback, auth por
+token, LaunchAgent já rodando nesta máquina. **E tem ponte MCP pronta: `openclaw mcp serve`.**
+
+### Autenticação por canal — o que serve de modelo
+
+| canal | mecanismo | senha do usuário? |
+|---|---|---|
+| ⭐ **iMessage** | sessão do **Messages.app** já logado; o gateway sobe `imsg rpc` (JSON-RPC em **stdio**, sem porta, sem daemon) | **zero** |
+| WhatsApp | QR do WhatsApp Web (Baileys); credencial em `~/.openclaw/credentials/` | nenhuma (QR no celular) |
+| Telegram | token de bot do @BotFather | token de **bot**, não da conta |
+| Signal | `signal-cli` com QR ou SMS em número dedicado | QR no app |
+| Slack / Discord | tokens de app / bot | tokens de app |
+
+⭐ **O iMessage é o padrão que eu procurava para o Mail.app**: o app do sistema já
+autenticou, e a peça só conversa com ele por um CLI local em stdio. É a rota 1 do §1 desta
+proposta, provada funcionando noutro canal.
+
+### Email
+
+**Não é canal do OpenClaw.** O mais perto: hook de Gmail (inbound) ou a skill Himalaya
+(IMAP com senha). Ou seja — para email, o caminho continua sendo o do §1, não o claw.
+
+### O que isso muda no projeto
+
+1. **Canais de chat**: não construir. Plugar por MCP no claw, que já resolveu.
+2. **Email**: continua nosso, pelas rotas do §1.
+3. **A forma do gateway** (servidor local + adapter em stdio, estilo `imsg`) é o desenho a
+   copiar quando precisarmos de um canal que o claw não tem.
