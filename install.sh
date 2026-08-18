@@ -40,9 +40,37 @@ done
 
 IACHAT_HOME="$SALA" "$DEST_SCRIPTS/iachat" status >/dev/null   # cria a sala se não existe
 
+# O `~/.local/bin` NÃO está no PATH de um macOS recém-instalado. Sem esta checagem o
+# instalador terminava com três ✔ e o `iachat` não existia para quem acabou de instalar —
+# a primeira coisa que a pessoa tenta, e o produto já falhou sem explicar por quê.
+# Um ✔ que não corresponde a nada é pior que um ✗: ensina a não confiar no instalador.
+# Achado do worker `qwen` na missão m2, provado em sandbox com PATH limpo.
+case ":$PATH:" in
+  *":$DEST_BIN:"*) NO_PATH="" ;;
+  *) NO_PATH="1" ;;
+esac
+
 echo "✔ CLI      $DEST_BIN/iachat  →  $DEST_SCRIPTS/iachat"
 echo "✔ skills   $DEST_SKILLS/ia-*  ($(ls -d "$SRC"/skills/*/ | wc -l | tr -d ' ') instaladas)"
 echo "✔ sala     $SALA"
+if [ -n "$NO_PATH" ]; then
+  # O nome do arquivo é do SHELL de quem instala, não do meu. Mandar todo mundo editar
+  # `.zshrc` erra em quem usa bash — e um conserto que não funciona é o mesmo defeito
+  # com outra roupa.
+  case "$(basename "${SHELL:-/bin/zsh}")" in
+    bash) PERFIL="~/.bash_profile" ;;
+    fish) PERFIL="~/.config/fish/config.fish" ;;
+    *)    PERFIL="~/.zshrc" ;;
+  esac
+  echo
+  echo "⚠  $DEST_BIN não está no seu PATH — o comando \`iachat\` ainda não existe."
+  if [ "$PERFIL" = "~/.config/fish/config.fish" ]; then
+    echo "   echo 'fish_add_path $DEST_BIN' >> $PERFIL && exec fish"
+  else
+    echo "   echo 'export PATH=\"$DEST_BIN:\$PATH\"' >> $PERFIL && exec \$SHELL"
+  fi
+  echo "   (ou use o caminho inteiro: $DEST_BIN/iachat status)"
+fi
 echo
 # A linha do Claude era afirmada SEM verificar nada — "já vê as skills" saía igual numa
 # máquina onde o Claude Code nem está instalado, e ficava duplamente falsa quando

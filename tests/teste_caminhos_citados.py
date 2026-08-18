@@ -126,6 +126,11 @@ checa("o gate varreu a documentação viva", conferidos > 0,
 readmes_ruins: list[str] = []
 for doc in (RAIZ / "README.md", RAIZ.parent / "ia-chat-app" / "README.md"):
     if not doc.is_file():
+        # DIZER que não olhou. O `continue` calado dava o mesmo verde de quem conferiu
+        # os dois READMEs — e no CI, sem o repo irmão, isso é falso verde exatamente
+        # onde o gate mais importa (o README do app é o que o estranho lê primeiro).
+        # "Não consegui olhar" é um terceiro desfecho, e ele só serve se aparecer.
+        print(f"  ⊘ {doc} ausente — este README NÃO foi conferido nesta rodada")
         continue
     t = doc.read_text(errors="replace")
     for rel in re.findall(r"\]\((\.\./[^)]+)\)", t):

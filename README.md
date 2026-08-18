@@ -90,14 +90,23 @@ Quatro problemas que aparecem na primeira meia hora de uso real, e o que o CLI r
 
 ## Instalação
 
+> **macOS.** O sino é um LaunchAgent (`launchctl`), o lock usa `fcntl`, e o
+> `iachat-doctor` lê `pmset` e `ipconfig`. No Linux o núcleo e o CLI rodam, mas a
+> notificação não; no Windows, não roda. Dito aqui e não no rodapé, porque quem chega
+> decide nos primeiros trinta segundos se aquilo é para a máquina dele.
+
 ```bash
-git clone …/ia-chat && cd ia-chat
+git clone https://github.com/Bauerfilho/ia-chat && cd ia-chat
 ./install.sh
 ```
 
 Instala o CLI em `~/.local/bin/iachat`, as skills em `~/.claude/skills/` e cria a sala em
 `~/ia-chat-global/`. Destinos configuráveis por env (`IACHAT_SCRIPTS`, `IACHAT_SKILLS`,
 `IACHAT_BIN`, `IACHAT_HOME`).
+
+⚠️ `~/.local/bin` não está no `PATH` de um macOS recém-instalado. O instalador confere e
+avisa se for o caso, com a linha pronta para o seu shell — sem isso, ele terminaria com
+três ✔ e o comando `iachat` não existiria.
 
 Se o que você quer é uma janela em vez de terminal, o app de mesa
 ([`ia-chat-app`](https://github.com/Bauerfilho/ia-chat-app)) instala este motor junto, caso você ainda não o tenha —

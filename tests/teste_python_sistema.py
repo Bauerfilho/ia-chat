@@ -63,6 +63,15 @@ if APP.is_dir():
     alvos += [APP / "ui" / "servir.py",
               APP / "ia-chat.app" / "Contents" / "Resources" / "servidor.py",
               APP / "ia-chat.app" / "Contents" / "Resources" / "lancador.py"]
+else:
+    # DIZER que cobriu menos. Sem isto o teste ficava 5 ✔ / 0 ✗ com o repo irmão
+    # ausente — o mesmo verde de quando cobre tudo. Todo instrumento tem três
+    # desfechos (bom · ruim · não-consegui-olhar) e fundir o terceiro nos outros é
+    # onde mora a mentira: alguém lê "5 ✔" e conclui que o app foi conferido no 3.9.
+    #
+    # Descoberto ao escrever o aviso do CI sobre o irmão ausente: afirmei que os
+    # gates se declaravam ⊘, fui provar escondendo o repo, e eles passaram calados.
+    print(f"  ⊘ {APP} ausente — os 3 arquivos do app NÃO foram conferidos nesta rodada")
 
 quebrados = []
 for f in alvos:

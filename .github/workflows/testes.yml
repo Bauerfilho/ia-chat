@@ -66,19 +66,37 @@ jobs:
       # `teste_caminhos_citados.py` cobrem os arquivos de lá. Sem o irmão, os dois
       # simplesmente cobrem menos e continuam verdes — falso verde silencioso. Por
       # isso o clone é obrigatório e a ausência dele FALHA, no passo seguinte.
+      # `continue-on-error` para separar dois casos que a falha crua confundia. No
+      # PRIMEIRO push deste repo o irmão ainda não foi publicado — e o CI ficava
+      # vermelho de saída, que é a primeira coisa que um visitante vê. Vermelho por
+      # ordem de publicação não mede qualidade nenhuma; ensina a ignorar o selo.
       - name: o repositório irmão, ao lado
+        id: irmao
+        continue-on-error: true
         uses: actions/checkout@v4
         with:
           repository: ${{ env.REPO_IRMAO }}
           path: ia-chat-app
 
+      # O fail-closed CONTINUA — só passou a saber a diferença entre "ainda não existe"
+      # e "existe e não veio". O segundo é defeito real (permissão, nome errado, rede) e
+      # segue falhando; o primeiro é o dia da publicação, e vira aviso alto.
       - name: o irmão está mesmo do lado
         run: |
-          if [ ! -f "$GITHUB_WORKSPACE/ia-chat-app/ia-chat.app/Contents/Resources/lancador.py" ]; then
-            echo "::error::$REPO_IRMAO não veio. teste_python_sistema.py e teste_caminhos_citados.py cobririam MENOS arquivos e continuariam verdes — isso é falso verde, e por isso este job para aqui."
-            exit 1
+          if [ -f "$GITHUB_WORKSPACE/ia-chat-app/ia-chat.app/Contents/Resources/lancador.py" ]; then
+            echo "· irmão presente: $(ls "$GITHUB_WORKSPACE/ia-chat-app" | tr '\n' ' ')"
+            exit 0
           fi
-          echo "· irmão presente: $(ls "$GITHUB_WORKSPACE/ia-chat-app" | tr '\n' ' ')"
+          # Existe lá fora? A pergunta é para o GitHub, não para o meu palpite.
+          codigo="$(curl -s -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer ${{ github.token }}" \
+            "https://api.github.com/repos/$REPO_IRMAO")"
+          if [ "$codigo" = "404" ]; then
+            echo "::warning::$REPO_IRMAO ainda não existe. teste_python_sistema.py e teste_caminhos_citados.py cobrem MENOS arquivos nesta rodada — eles se declaram ⊘ em vez de inventar verde. Publique o irmão e rode de novo por workflow_dispatch."
+            exit 0
+          fi
+          echo "::error::$REPO_IRMAO existe (HTTP $codigo) mas não veio para o workspace — permissão, nome ou rede. Sem ele os dois gates cobririam menos e continuariam verdes, e falso verde é pior que vermelho."
+          exit 1
 
       - name: python moderno
         if: matrix.interpretador == 'moderno'
