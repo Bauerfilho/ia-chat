@@ -196,3 +196,21 @@ Um detalhe de instalação que já custou uma peça inteira: o `install.sh` dist
 binários por glob (`bin/iachat-*` e `bin/ia-*`). Um executável fora desse padrão é
 escrito no repositório e **nunca instalado** — funciona na sua máquina, some na de quem
 clonou. Nome novo segue o padrão.
+
+## Mexeu no `bin/`? O que você digita não é o que você editou
+
+`~/.local/bin/iachat*` é symlink para `~/.claude/scripts/ia-chat/`, que é **cópia** do
+que o `install.sh` levou. Editar `bin/iachat-comando` no repo e rodar `iachat-comando`
+no terminal testa a versão **instalada** — a antiga.
+
+Aconteceu em 18/08, no mesmo dia em que a armadilha gêmea pegou o `ia-chat-app`
+(`montar.sh` monta no repo, `open -a` abre o de `/Applications`). Duas encarnações do
+mesmo desenho: **a fonte é o repo, o que roda é a cópia.**
+
+```bash
+diff bin/iachat-comando ~/.claude/scripts/ia-chat/iachat-comando   # divergiu?
+./install.sh                                                        # então reinstale
+```
+
+A bateria não pega: os testes invocam `bin/` diretamente, que é o certo para eles. O
+defeito só existe no caminho que passa pelo PATH — ou seja, no caminho do usuário.

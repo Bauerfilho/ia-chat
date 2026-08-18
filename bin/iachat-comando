@@ -1136,7 +1136,14 @@ def cmd_quem(a) -> int:
     cfg = core.config()
     brain = core.normaliza_ia(cfg.get("brain", ""))
     linhas = []
-    for ia in sala():
+    # Quem está na sala MAIS quem está trabalhando na missão. Antes o laço percorria só
+    # `na_sala`, e um worker despachado para braço de fora — `qwen`, `grok`, `agy`, que
+    # planejam sem morar na sala — ficava INVISÍVEL no comando cuja única função é dizer
+    # quem está vivo. Medido em 18/08 na missão m2: `qwen` rodando com pid 34029 e
+    # ausente da listagem. Quem olha um painel que esconde metade da frota conclui que
+    # ela morreu e redispara em cima de trabalho vivo.
+    trabalhando = [ia for ia in (e or {}).get("workers", {}) if ia not in sala()]
+    for ia in sala() + trabalhando:
         c = core.p_cursor(ia)
         try:
             em = json.loads(c.read_text(encoding="utf-8")).get("em")
@@ -1158,7 +1165,12 @@ def cmd_quem(a) -> int:
             else:
                 fazendo = f"caiu sem entregar — {motivo}"
                 estado = "🔴"
-            quando = desde(w["inicio"])
+            # `.get`, não `w["inicio"]`: um worker com estado parcial derrubava o
+            # comando inteiro com KeyError. `/quem` é a ferramenta de DIAGNÓSTICO —
+            # quem a chama já está tentando entender algo que deu errado, e um
+            # traceback ali tira a única visão que resta. Falta de um campo vira
+            # coluna vazia; nunca tela preta.
+            quando = desde(w.get("inicio"))
         else:
             fazendo = "—"
             estado = "⚪ fora da missão"
