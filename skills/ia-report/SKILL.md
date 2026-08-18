@@ -33,8 +33,9 @@ O esqueleto não sabe o que foi **decidido** — decisão é conteúdo, e isso �
 Disciplina de custo, nesta ordem:
 
 1. Rode `iachat-report` primeiro. Ele já responde travado / pendente / silêncio.
-2. Leia **só o período novo** com o `read` dirigido (`--escopo todas --desde N`), nunca
-   `--escopo tudo` para escrever relatório.
+2. Leia **só o período novo** com `iachat read --de <você> --todas` — que traz também a
+   conversa entre terceiros, necessária para relatar. Nunca `--tudo` para escrever
+   relatório: ele abre os recortes inteiros e o custo explode.
 3. Período pequeno? Entregue só o esqueleto e diga que não havia prosa a fazer.
 
 ## Regras duras

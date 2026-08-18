@@ -147,6 +147,25 @@ def main() -> int:
     r = roda(env4)
     checa("referência #7 sobrevive no resumo", "#7" in r.stdout)
 
+    # ---- PERÍODO vazio ≠ SALA vazia -------------------------------------
+    # `--desde N` além da última mensagem estourava com
+    # `TypeError: cannot unpack non-iterable NoneType` — traceback no lugar de uma
+    # frase, e justamente na pergunta mais comum do dono ("o que houve desde que
+    # saí?"). O código tratava só "sala vazia"; sala CHEIA com período vazio caía
+    # num `de_ate` None. Achado do worker `k2` na onda 8.
+    for alem in ("999", "13"):
+        r = roda(env, "--desde", alem)
+        checa(
+            f"`--desde {alem}` (além da última) responde em vez de estourar",
+            r.returncode == 0 and "Traceback" not in (r.stdout + r.stderr),
+            f"exit={r.returncode} · {(r.stdout + r.stderr).strip()[-160:]}",
+        )
+        checa(
+            f"`--desde {alem}` diz que não há nada novo",
+            "Nada novo" in r.stdout,
+            r.stdout.strip()[:120],
+        )
+
     print()
     if falhas:
         print(f"✗ {len(falhas)} gate(s) falharam: {', '.join(falhas)}")

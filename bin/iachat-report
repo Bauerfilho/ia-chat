@@ -147,6 +147,14 @@ def coletar(desde_n: int = 0, horas: float | None = None) -> dict:
 def render(d: dict) -> str:
     if d["vazia"]:
         return "# 📋 ia-chat\n\nSala vazia.\n"
+    # PERÍODO vazio é diferente de SALA vazia, e não é erro: "não aconteceu nada desde
+    # que você saiu" é a resposta certa para a pergunta mais comum do dono. O código
+    # tratava só o primeiro caso, e `--desde N` além da última mensagem estourava com
+    # `TypeError: cannot unpack non-iterable NoneType` — um traceback no lugar de uma
+    # frase. Achado do worker `k2`, medido com `--desde 13` numa sala com última #12.
+    if not d["de_ate"]:
+        return (f"# 📋 ia-chat\n\nNada novo: a sala parou na **#{d['ultimo_n']}** e "
+                f"você já viu até aí.\n")
     ini, fim = d["de_ate"]
     autores = " · ".join(f"{q}({n})" for q, n in d["por_autor"].items() if n)
     dur = int((fim - ini).total_seconds() // 60)
