@@ -134,13 +134,22 @@ def main() -> int:
             busca.stdout.replace("\n", " | ")[:300],
         )
 
-        # Evidência do handoff: a CLI nativa não tem ponto de extensão para a marca.
+        # Este caso NASCEU invertido, e a inversão é a história do handoff: o autor da
+        # peça o escreveu provando que o `iachat search` nativo NÃO marcava — a
+        # integração mora no núcleo, que era fronteira proibida para ele, então ele
+        # documentou o gap em vez de mascarar. A orquestradora integrou em 18/08, e o
+        # caso virou o oposto: agora ele guarda a integração.
+        #
+        # Isto importa mais que a marca em si — sem ele, quem procura daqui a uma semana
+        # acha a versão errada e a correção lado a lado, sem nada dizendo qual vale.
         busca_nativa = roda(IACHAT, env, "search", "e-mail")
+        linha_alvo = next(
+            (l for l in busca_nativa.stdout.splitlines() if "#7 " in l), ""
+        )
         checa(
-            "R4 gap de integração nativa é reproduzido sem tocar no núcleo",
-            busca_nativa.returncode == 0
-            and "#7" in busca_nativa.stdout
-            and "RETRATADA" not in busca_nativa.stdout,
+            "R4 o search NATIVO marca a mensagem retratada (integração do núcleo)",
+            busca_nativa.returncode == 0 and "RETRATADA" in linha_alvo,
+            f"a busca nativa devolve a versão errada sem aviso: {linha_alvo.strip()[:110]}",
         )
 
         # ---- R-RED 1: terceiro contesta, mas NÃO retrata --------------------
@@ -229,6 +238,21 @@ def main() -> int:
             and any(m["n"] == 9 for m in finais)
             and "⚠ RETRATADA → #11" in busca_final.stdout,
             f"rc={substituta.returncode} ultima={ultima['n']}",
+        )
+
+        # Nem uma marca publicada pela porta crua pode converter governança em dado vencido.
+        core.post(
+            "claude",
+            f"retrata: #{decisao['n']}\nestado: RETRATADA\n\ncorreção:\nTentativa crua.",
+            ["codex"],
+        )
+        busca_dono = roda(RETRATAR, env, "search", "O histórico permanece append-only")
+        checa(
+            "R-RED busca ignora retratação crua de decisão do dono",
+            busca_dono.returncode == 0
+            and f"#{decisao['n']}" in busca_dono.stdout
+            and "RETRATADA" not in busca_dono.stdout,
+            busca_dono.stdout.replace("\n", " | ")[:260],
         )
 
         print()

@@ -102,7 +102,11 @@ def _mapa_retratacoes(mensagens: list[dict]) -> dict[int, dict]:
         if original is None:
             continue
         # Só uma retratação publicada pelo próprio autor tem efeito semântico.
-        if original["de"] != mensagem["de"] or _alvo_retratado(original) is not None:
+        if (
+            original["de"] != mensagem["de"]
+            or _alvo_retratado(original) is not None
+            or _decisao_do_dono(original)
+        ):
             continue
         mapa[alvo] = mensagem
     return mapa

@@ -69,9 +69,9 @@ A própria correção aparece como `↪ RETRATA #27`. Com `--abrir`, a saída mo
 página da primeira ocorrência e, se ela estiver retratada, o bloco integral da
 correção vigente.
 
-Enquanto o núcleo não consumir a relação `retrata: #N`, use esta busca para
-decisões. O `iachat search` nativo ainda lista o histórico sem o campo de estado;
-o wiring pertence à integração do núcleo, não a esta skill.
+O `iachat search` nativo também marca o original e aponta a correção. A variante
+`iachat-retratar search` mantém a mesma leitura semântica e, com `--abrir`, mostra
+também o bloco integral da correção vigente.
 
 ## Quem pode retratar
 

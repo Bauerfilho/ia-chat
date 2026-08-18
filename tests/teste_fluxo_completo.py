@@ -128,6 +128,40 @@ achou = cli("search", "UTF-8 de 3 bytes")
 checa("a busca acha mensagem que já foi arquivada", "#1" in achou or "recorte" in achou.lower(),
       f"depois de arquivar, a mensagem #1 sumiu do alcance:\n      {achou[:200]}")
 
+# ── 8. retratação: o search NATIVO precisa marcar, não só a peça ────────────
+# A peça `ia-retratar` deixou este gap declarado: ela marca no `iachat-retratar search`,
+# mas a integração no `iachat search` mora no núcleo — fronteira proibida para ela. Sem
+# a integração, quem procura daqui a uma semana acha a versão errada e a correção lado a
+# lado, sem nada dizendo qual vale.
+retratar = BIN / "iachat-retratar"
+if retratar.is_file():
+    h2 = Path(tempfile.mkdtemp(prefix="fluxo-retrat-"))
+    for d in ("pendente", "cursor", "arquivo"):
+        (h2 / d).mkdir()
+    (h2 / "config.json").write_text(json.dumps({"na_sala": ["claude", "codex"],
+                                                "brain": "claude"}))
+    (h2 / "iachat.md").write_text("")
+    env2 = dict(os.environ, IACHAT_HOME=str(h2))
+
+    def _cli(b: Path, *a: str) -> str:
+        r = subprocess.run([sys.executable, str(b), *a], env=env2,
+                           capture_output=True, text=True, timeout=40)
+        return r.stdout + r.stderr
+
+    _cli(IACHAT, "post", "--de", "codex", "--para", "claude",
+         "o teto do arquivo é de 100 KB, confira antes de rotacionar")
+    _cli(retratar, "post", "--de", "codex", "--msg", "1",
+         "o teto é 200 KB — li a constante errada")
+    achado = _cli(IACHAT, "search", "teto")
+    linha1 = next((l for l in achado.splitlines() if "#1 " in l), "")
+    checa("o search NATIVO marca a mensagem retratada",
+          "RETRATADA" in linha1,
+          f"a busca devolve a versão errada sem aviso:\n      {linha1.strip()[:120]}")
+    linha2 = next((l for l in achado.splitlines() if "#2 " in l), "")
+    checa("e NÃO marca a própria retratação", "RETRATADA" not in linha2,
+          f"a correção apareceu marcada como retratada:\n      {linha2.strip()[:120]}")
+    shutil.rmtree(h2, ignore_errors=True)
+
 shutil.rmtree(h, ignore_errors=True)
 print(f"\n{_ok} ✔  {_falhou} ✗")
 sys.exit(1 if _falhou else 0)

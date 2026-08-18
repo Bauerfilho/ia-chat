@@ -266,8 +266,42 @@ def cmd_search(a) -> int:
         return 0
     filtro = " ".join(x for x in [f"de={r['de']}" if r["de"] else "", f"data={r['data']}" if r["data"] else ""] if x)
     print(f"🔎 {len(ac)} mensagem(ns) casam com '{r['termo']}' {filtro}".rstrip())
+
+    # Mensagem RETRATADA tem que vir marcada aqui, não só no `iachat-retratar search`.
+    # Sem isto, quem procura daqui a uma semana acha a versão errada e a correção lado a
+    # lado, sem nada dizendo qual vale — numa sala onde IAs decidem a partir do que leem,
+    # é dado envenenado com prazo indeterminado. A peça `ia-retratar` deixou este gap
+    # declarado: a integração mora no núcleo, que era fronteira proibida para ela.
+    #
+    # A varredura é sobre o HISTÓRICO parseado (recortes + ativo), a mesma fonte que a
+    # peça usa — e não sobre o índice da busca. Motivo medido: o achado de `core.buscar`
+    # traz `linha` como NÚMERO da linha, não como conteúdo, e `n` como string. Um regex
+    # sobre `linha` nunca casaria, e o `except` teria escondido isso para sempre — o
+    # índice sairia sem marca, calado, exatamente como antes.
+    retratado: dict[str, str] = {}
+    try:
+        import re as _re
+
+        for caminho in core._recortes() + [core.p_chat()]:
+            for msg in core.parse(caminho.read_text(errors="replace")):
+                corpo = msg.get("bruto", "")
+                # o vínculo canônico é a PRIMEIRA linha do corpo da retratação
+                primeira = next(
+                    (ln.strip() for ln in corpo.split("\n\n", 1)[-1].splitlines()
+                     if ln.strip()), "")
+                m = _re.fullmatch(r"retrata:\s*#(\d+)", primeira)
+                if m:
+                    alvo = m.group(1)
+                    # correção de correção: a mais recente é a vigente
+                    if int(msg["n"]) > int(retratado.get(alvo, 0)):
+                        retratado[alvo] = str(msg["n"])
+    except Exception:
+        retratado = {}    # na dúvida, índice SEM marca — nunca com marca errada
+
     for x in ac[:12]:
-        print(f"   {x['fonte']:34} #{x['n']:<3} {x['de']:7} {x['ts']}  → página {x['pagina']}")
+        marca = (f"  ⚠ RETRATADA → #{retratado[str(x['n'])]}"
+                 if str(x["n"]) in retratado else "")
+        print(f"   {x['fonte']:34} #{x['n']:<3} {x['de']:7} {x['ts']}  → página {x['pagina']}{marca}")
     if len(ac) > 12:
         print(f"   … e mais {len(ac)-12}")
     if not a.abrir:
