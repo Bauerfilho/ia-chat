@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import plistlib
+import re
 import shutil
 import subprocess
 import sys
@@ -53,6 +54,20 @@ def linha_de(stdout: str, ia: str) -> str:
 
 def agora_iso(delta_s: float = 0.0) -> str:
     return (datetime.now().astimezone() - timedelta(seconds=delta_s)).isoformat()
+
+
+def minutos_de(texto: str) -> float | None:
+    """A primeira duração do texto, em minutos — o formato é livre, o valor não.
+
+    Aceita `há 56min`, `há 56 min`, `56m`, `há 0.9h`, `3360s`. O que o gate
+    cobra é a MEDIÇÃO estar lá (e certa), não a grafia que ela usa hoje —
+    `"há 56min ⚠"` literal reprovaria `há 56 min ⚠` sem defeito nenhum.
+    """
+    m = re.search(r"(?:há\s*)?(\d+(?:[.,]\d+)?)\s*(min|m|h|s)\b", texto)
+    if not m:
+        return None
+    v = float(m.group(1).replace(",", "."))
+    return v / 60 if m.group(2) == "s" else (v * 60 if m.group(2) == "h" else v)
 
 
 def monta_sala(base: Path, na_sala: list[str], ultima: int | None = None,
@@ -220,13 +235,23 @@ def main() -> int:
         planta_plist(base / "r5", "com.bauer.ia-bell-kimi", str(sala5))
         r5 = roda(env5)
         l5 = linha_de(r5.stdout, "codex")
+        # O alarme é o mecanismo; `"há 56min ⚠"` era a fotografia dele. O ⚠ tem
+        # que existir no campo do chamado, com o atraso MEDIDO (~56 min, plantado
+        # pelo mtime acima) — em qualquer grafia: `há 56min`, `56m`, `há 0.9h`.
+        m_parado = re.search(r"(\d+(?:[.,]\d+)?)\s*(min|m|h|s)\s*⚠", l5)
+        atraso_linha = minutos_de(m_parado.group(0)) if m_parado else None
         checa("R5 caso real: chamado parado medido no chat pré-existente (atraso 4)",
-              r5.returncode == 0 and "há 56min ⚠" in l5 and "4" in l5.split(),
-              f"linha={l5!r}")
+              r5.returncode == 0 and atraso_linha is not None
+              and 53 <= atraso_linha <= 59 and "4" in l5.split(),
+              f"linha={l5!r} · atraso medido={atraso_linha}min")
+        alerta_codex = [l for l in r5.stdout.splitlines()
+                        if l.startswith("⚠") and "codex:" in l
+                        and "chamado" in l and "não leu" in l]
+        atraso_alerta = minutos_de(alerta_codex[0]) if alerta_codex else None
         checa("R5 REPROVA se o instrumento ficar calado: alarme de sino ausente "
-              "e alarme de chamado parado saem os dois",
+              "e alarme de chamado parado saem os dois, com o atraso medido",
               "sino NÃO INSTALADO" in r5.stdout and "ia-bell-codex" in r5.stdout
-              and "chamado há 56min e ainda não leu" in r5.stdout
+              and atraso_alerta is not None and 53 <= atraso_alerta <= 59
               and "cursor #1" in r5.stdout and "sala #5" in r5.stdout,
               f"alertas={[l for l in r5.stdout.splitlines() if l.startswith('⚠')]}")
 
