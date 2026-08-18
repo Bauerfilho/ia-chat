@@ -1,0 +1,784 @@
+#!/usr/bin/env python3
+"""iachat-squad — coordena IAs já abertas pela própria sala do ia-chat.
+
+O comando não abre nenhuma IA. Ele posta ponteiros de contrato pela porta pública
+``iachat post``, registra aceite/recusa no run-dir, mostra peças órfãs e fixa um
+juiz diferente do autor antes de aceitar qualquer veredito.
+"""
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from contextlib import contextmanager
+from datetime import datetime
+from pathlib import Path
+
+
+# O núcleo é somente leitura aqui: caminhos do sino, cursor, configuração e relógio.
+for candidato in (
+    Path(__file__).resolve().parent,
+    Path.home() / ".claude/scripts/ia-chat",
+    Path.home() / "Projetos/ia-chat/bin",
+):
+    if (candidato / "iachat_core.py").exists():
+        sys.path.insert(0, str(candidato))
+        break
+
+try:
+    import iachat_core as core  # noqa: E402
+except ModuleNotFoundError:
+    print("✗ não achei iachat_core.py ao lado do CLI nem nos caminhos conhecidos", file=sys.stderr)
+    raise SystemExit(2)
+
+
+WORKER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+MSG_RE = re.compile(r"#(\d+)")
+VEREDITO_FINAL_RE = re.compile(
+    r"^(?:veredito\s+final\s*:\s*)?(PASS|ITERA)$", re.IGNORECASE
+)
+
+
+def falha(mensagem: str, codigo: int = 2) -> "NoReturn":
+    """Encerra alto; validação nunca degrada em silêncio."""
+    print(f"✗ {mensagem}", file=sys.stderr)
+    raise SystemExit(codigo)
+
+
+def sha256_bytes(conteudo: bytes) -> str:
+    return hashlib.sha256(conteudo).hexdigest()
+
+
+def sha256_arquivo(caminho: Path) -> str:
+    return sha256_bytes(caminho.read_bytes())
+
+
+def gravar_atomico(caminho: Path, conteudo: str) -> None:
+    """Grava por arquivo temporário + fsync + replace."""
+    caminho.parent.mkdir(parents=True, exist_ok=True)
+    temporario = caminho.with_name(f".{caminho.name}.{os.getpid()}.tmp")
+    try:
+        with temporario.open("w", encoding="utf-8") as arquivo:
+            arquivo.write(conteudo)
+            arquivo.flush()
+            os.fsync(arquivo.fileno())
+        os.replace(temporario, caminho)
+    finally:
+        temporario.unlink(missing_ok=True)
+
+
+def gravar_json(caminho: Path, dados: dict) -> None:
+    gravar_atomico(caminho, json.dumps(dados, ensure_ascii=False, indent=2) + "\n")
+
+
+@contextmanager
+def run_travado(run: Path):
+    """Serializa mutações do mesmo run; chamada permanece estritamente read-only."""
+    lock = run / ".iachat-squad.lock"
+    fd = os.open(str(lock), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def run_dir(valor: str) -> Path:
+    run = Path(valor).expanduser().resolve()
+    if not run.is_dir():
+        falha(f"run inexistente ou não é diretório: {run}")
+    return run
+
+
+def caminho_no_run(run: Path, relativo: str) -> Path:
+    caminho = Path(relativo)
+    if caminho.is_absolute():
+        falha(f"caminho no squad.tsv deve ser relativo ao run: {relativo!r}")
+    resolvido = (run / caminho).resolve()
+    try:
+        resolvido.relative_to(run)
+    except ValueError:
+        falha(f"caminho escapa do run-dir: {relativo!r}")
+    return resolvido
+
+
+def ler_squad(run: Path) -> list[dict]:
+    """Lê ``worker<TAB>ia<TAB>n_etapas<TAB>contrato`` com fronteira estrita."""
+    tsv = run / "squad.tsv"
+    if not tsv.is_file():
+        falha(f"{tsv} ausente")
+
+    squad: list[dict] = []
+    for numero, linha in enumerate(tsv.read_text(encoding="utf-8").splitlines(), start=1):
+        limpa = linha.strip()
+        if not limpa or limpa.startswith("#"):
+            continue
+        campos = linha.split("\t")
+        if len(campos) != 4:
+            falha(f"squad.tsv:{numero}: esperado 4 campos separados por TAB")
+        worker, ia_bruta, etapas_brutas, contrato = (campo.strip() for campo in campos)
+        if not WORKER_RE.fullmatch(worker):
+            falha(f"squad.tsv:{numero}: worker inseguro: {worker!r}")
+        ia = core.normaliza_ia(ia_bruta)
+        if not ia:
+            falha(f"squad.tsv:{numero}: IA vazia")
+        try:
+            etapas = int(etapas_brutas)
+        except ValueError:
+            falha(f"squad.tsv:{numero}: n_etapas não é inteiro: {etapas_brutas!r}")
+        if not 1 <= etapas <= 999:
+            falha(f"squad.tsv:{numero}: n_etapas deve ficar entre 1 e 999")
+        caminho_no_run(run, contrato)
+        squad.append(
+            {"worker": worker, "ia": ia, "etapas": etapas, "contrato": contrato}
+        )
+
+    if not squad:
+        falha("squad.tsv vazio")
+    workers = [item["worker"] for item in squad]
+    ias = [item["ia"] for item in squad]
+    duplicados_worker = sorted({x for x in workers if workers.count(x) > 1})
+    duplicados_ia = sorted({x for x in ias if ias.count(x) > 1})
+    if duplicados_worker:
+        falha(f"worker repetido: {', '.join(duplicados_worker)}")
+    if duplicados_ia:
+        falha(
+            f"mesma IA em dois workers: {', '.join(duplicados_ia)}. Um worker por IA."
+        )
+    return squad
+
+
+def por_worker(squad: list[dict], worker: str) -> dict:
+    encontrado = next((item for item in squad if item["worker"] == worker), None)
+    if encontrado is None:
+        falha(f"worker {worker!r} não existe em squad.tsv")
+    return encontrado
+
+
+def iachat_bin() -> str:
+    candidatos = (
+        os.environ.get("IACHAT_BIN"),
+        shutil.which("iachat"),
+        str(Path.home() / ".local/bin/iachat"),
+        str(Path(__file__).resolve().parent / "iachat"),
+        str(Path.home() / "Projetos/ia-chat/bin/iachat"),
+    )
+    for candidato in candidatos:
+        if candidato and os.path.isfile(candidato) and os.access(candidato, os.X_OK):
+            return candidato
+    falha("não achei o executável `iachat`; defina IACHAT_BIN")
+
+
+def post(de: str, para: str, texto: str) -> int:
+    """Posta pela porta única do canal e extrai o número de forma fail-closed."""
+    resposta = subprocess.run(
+        [iachat_bin(), "post", "--de", de, "--para", para, texto],
+        capture_output=True,
+        text=True,
+    )
+    if resposta.returncode != 0:
+        detalhe = (resposta.stderr or resposta.stdout).strip()
+        falha(f"iachat post falhou: {detalhe}")
+    casamento = MSG_RE.search(resposta.stdout)
+    if casamento is None:
+        falha(f"não consegui ler o número da mensagem em: {resposta.stdout!r}")
+    return int(casamento.group(1))
+
+
+def arquivo_resultado(run: Path, worker: str) -> Path:
+    return run / "resultados" / f"{worker}.md"
+
+
+def resultado_pronto(run: Path, worker: str) -> bool:
+    caminho = arquivo_resultado(run, worker)
+    return caminho.is_file() and bool(caminho.read_text(encoding="utf-8").strip())
+
+
+def hash_squad(run: Path) -> str:
+    return sha256_arquivo(run / "squad.tsv")
+
+
+PONTEIRO = """🎯 **SQUAD {run_id}** — `{worker}`, {etapas} etapas.
+
+contrato: {contrato}
+progresso: {progresso}
+resultado: {resultado}
+
+Responda antes de executar:
+`iachat-squad responder {run} --worker {worker} --de {ia} --aceitar`
+ou `--recusar --motivo \"motivo objetivo\"`.
+Depois de aceitar, cumpra o contrato. Cada etapa appenda o JSON exigido no progresso.{prazo}"""
+
+
+def carregar_despacho(run: Path) -> dict:
+    caminho = run / "despacho.json"
+    if not caminho.is_file():
+        return {}
+    try:
+        dados = json.loads(caminho.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as erro:
+        falha(f"despacho.json inválido: {erro}")
+    if not isinstance(dados, dict) or not isinstance(dados.get("workers", {}), dict):
+        falha("despacho.json não tem o formato esperado")
+    return dados
+
+
+def cmd_despachar(args: argparse.Namespace) -> int:
+    run = run_dir(args.run)
+    squad = ler_squad(run)
+    if not (run / "missao.md").is_file():
+        falha(f"{run / 'missao.md'} ausente")
+
+    contratos_ausentes = [
+        item["contrato"]
+        for item in squad
+        if not caminho_no_run(run, item["contrato"]).is_file()
+    ]
+    if contratos_ausentes:
+        falha("contrato ausente: " + ", ".join(contratos_ausentes))
+
+    sala = [core.normaliza_ia(x) for x in core.config().get("na_sala", [])]
+    fora = [item["ia"] for item in squad if item["ia"] not in sala]
+    if fora:
+        falha(f"fora da sala {sala}: {', '.join(fora)}. Adicione em {core.p_config()}.")
+
+    for subdiretorio in ("progress", "resultados", "respostas", "vereditos"):
+        (run / subdiretorio).mkdir(parents=True, exist_ok=True)
+
+    with run_travado(run):
+        registro = carregar_despacho(run)
+        atual = hash_squad(run)
+        if registro and registro.get("squad_sha256") != atual:
+            falha("squad.tsv mudou depois do primeiro despacho; use outro run-id")
+        if not registro:
+            registro = {
+                "run": str(run),
+                "de": core.normaliza_ia(args.de),
+                "iniciado_em": core.agora(),
+                "concluido_em": None,
+                "squad_sha256": atual,
+                "workers": {},
+            }
+            gravar_json(run / "despacho.json", registro)
+
+        prazo = f"\nprazo combinado: {args.prazo}. Não é timer." if args.prazo else ""
+        for item in squad:
+            anterior = registro["workers"].get(item["worker"])
+            if anterior:
+                if anterior.get("ia") != item["ia"] or not isinstance(anterior.get("msg"), int):
+                    falha(f"registro prévio inconsistente para {item['worker']}")
+                print(
+                    f"= {item['worker']:14} → @{item['ia']:8} msg #{anterior['msg']} "
+                    "(já despachado; não duplicado)"
+                )
+                continue
+
+            texto = PONTEIRO.format(
+                run_id=run.name,
+                worker=item["worker"],
+                etapas=item["etapas"],
+                ia=item["ia"],
+                run=run,
+                contrato=caminho_no_run(run, item["contrato"]),
+                progresso=run / "progress" / f"{item['worker']}.jsonl",
+                resultado=arquivo_resultado(run, item["worker"]),
+                prazo=prazo,
+            )
+            numero = post(args.de, item["ia"], texto)
+            registro["workers"][item["worker"]] = {
+                "ia": item["ia"],
+                "msg": numero,
+                "etapas": item["etapas"],
+                "bytes_ponteiro": len(texto.encode("utf-8")),
+            }
+            # Checkpoint por worker: queda de energia não apaga os despachos anteriores.
+            gravar_json(run / "despacho.json", registro)
+            print(
+                f"✔ {item['worker']:14} → @{item['ia']:8} msg #{numero} "
+                f"({len(texto.encode('utf-8'))} B na sala)"
+            )
+
+        registro["concluido_em"] = core.agora()
+        gravar_json(run / "despacho.json", registro)
+
+    total = sum(
+        item.get("bytes_ponteiro", 0) for item in registro["workers"].values()
+    )
+    print(f"\n{len(squad)} despachos registrados · {total} B · {run / 'despacho.json'}")
+    return 0
+
+
+def cmd_responder(args: argparse.Namespace) -> int:
+    run = run_dir(args.run)
+    squad = ler_squad(run)
+    item = por_worker(squad, args.worker)
+    autor = core.normaliza_ia(args.de)
+    if autor != item["ia"]:
+        falha(
+            f"{args.worker} pertence a @{item['ia']}; @{autor} não pode responder por ele"
+        )
+    despacho = carregar_despacho(run)
+    if not despacho.get("workers", {}).get(args.worker, {}).get("msg"):
+        falha(f"{args.worker} ainda não foi despachado")
+
+    estado = "aceito" if args.aceitar else "recusado"
+    motivo = (args.motivo or "").strip()
+    if estado == "recusado" and not motivo:
+        falha("recusa exige --motivo")
+
+    caminho = run / "respostas" / f"{args.worker}.json"
+    with run_travado(run):
+        if caminho.exists():
+            existente = json.loads(caminho.read_text(encoding="utf-8"))
+            if existente.get("estado") == estado and existente.get("ia") == autor:
+                print(f"= {args.worker} já havia respondido: {estado.upper()}")
+                return 0
+            falha(
+                f"{args.worker} já respondeu {existente.get('estado')}; resposta é imutável"
+            )
+        gravar_json(
+            caminho,
+            {
+                "worker": args.worker,
+                "ia": autor,
+                "estado": estado,
+                "motivo": motivo or None,
+                "em": core.agora(),
+                "despacho_msg": despacho["workers"][args.worker]["msg"],
+            },
+        )
+    complemento = f" — {motivo}" if motivo else ""
+    print(f"✔ {args.worker}: {estado.upper()}{complemento}")
+    return 0
+
+
+def ler_resposta(run: Path, worker: str) -> dict:
+    caminho = run / "respostas" / f"{worker}.json"
+    if not caminho.is_file():
+        return {}
+    try:
+        dados = json.loads(caminho.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"estado": "invalido"}
+    return dados if isinstance(dados, dict) else {"estado": "invalido"}
+
+
+def progresso(run: Path, item: dict) -> tuple[int, str, bool]:
+    caminho = run / "progress" / f"{item['worker']}.jsonl"
+    if not caminho.is_file():
+        return 0, "", False
+    maior, nota, invalido = 0, "", False
+    for linha in caminho.read_text(encoding="utf-8").splitlines():
+        if not linha.strip():
+            continue
+        try:
+            evento = json.loads(linha)
+        except json.JSONDecodeError:
+            invalido = True
+            continue
+        etapa = evento.get("etapa")
+        if not isinstance(etapa, int) or not 1 <= etapa <= item["etapas"]:
+            invalido = True
+            continue
+        maior = max(maior, etapa)
+        if evento.get("nota"):
+            nota = str(evento["nota"])
+    return maior, nota, invalido
+
+
+def final_do_veredito(corpo: str) -> str | None:
+    linhas = [linha.strip() for linha in corpo.splitlines() if linha.strip()]
+    if not linhas:
+        return None
+    casamento = VEREDITO_FINAL_RE.fullmatch(linhas[-1])
+    return casamento.group(1).upper() if casamento else None
+
+
+def auditar_veredito(run: Path, squad: list[dict], item: dict) -> str:
+    veredito = run / "vereditos" / f"{item['worker']}.md"
+    recibo = run / "vereditos" / ".recibos" / f"{item['worker']}.json"
+    if not veredito.exists() and not recibo.exists():
+        return ""
+    if not veredito.is_file() or not recibo.is_file():
+        return "VEREDITO-SEM-RECIBO"
+    try:
+        dados = json.loads(recibo.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return "VEREDITO-RECIBO-INVÁLIDO"
+    juizes_path = run / "juizes.json"
+    if not juizes_path.is_file():
+        return "VEREDITO-SEM-ATRIBUIÇÃO"
+    try:
+        registro = json.loads(juizes_path.read_text(encoding="utf-8"))
+        esperado = atribuicoes_esperadas(squad)[item["worker"]]
+        atribuido = registro["atribuicao"][item["worker"]]
+    except (OSError, json.JSONDecodeError, KeyError, TypeError):
+        return "VEREDITO-ATRIBUIÇÃO-INVÁLIDA"
+    campos = ("autor_ia", "juiz", "juiz_ia")
+    if any(atribuido.get(campo) != esperado[campo] for campo in campos):
+        return "VEREDITO-ATRIBUIÇÃO-ADULTERADA"
+    if any(dados.get(campo) != esperado[campo] for campo in campos):
+        return "VEREDITO-RECIBO-ADULTERADO"
+    if dados.get("sha256_veredito") != sha256_arquivo(veredito):
+        return "VEREDITO-ADULTERADO"
+    if dados.get("sha256_resultado") != sha256_arquivo(
+        arquivo_resultado(run, item["worker"])
+    ) or dados.get("sha256_contrato") != sha256_arquivo(
+        caminho_no_run(run, item["contrato"])
+    ):
+        return "VEREDITO-BASE-ALTERADA"
+    if dados.get("final") != final_do_veredito(veredito.read_text(encoding="utf-8")):
+        return "VEREDITO-FINAL-INVÁLIDO"
+    return f"JULGADO-{dados.get('final', '?')}"
+
+
+def estado_worker(
+    run: Path, squad: list[dict], item: dict, msg: int | None
+) -> tuple[str, str, bool]:
+    """Devolve estado, detalhe e se a peça foi efetivamente assumida."""
+    if resultado_pronto(run, item["worker"]):
+        detalhe = f"{arquivo_resultado(run, item['worker']).stat().st_size} B"
+        selo = auditar_veredito(run, squad, item)
+        return "ENTREGUE", f"{detalhe}{' · ' + selo if selo else ''}", True
+
+    feitas, nota, invalido = progresso(run, item)
+    if feitas:
+        detalhe = nota or "progresso sem nota"
+        if invalido:
+            detalhe += " · há linha inválida ignorada"
+        return f"ANDANDO {feitas}/{item['etapas']}", detalhe, True
+
+    resposta = ler_resposta(run, item["worker"])
+    if resposta.get("estado") == "recusado":
+        return "RECUSOU", resposta.get("motivo") or "sem motivo", False
+    if resposta.get("estado") == "aceito":
+        return "ACEITOU", "aguardando primeiro checkpoint", True
+    if resposta.get("estado"):
+        return "RESPOSTA-INVÁLIDA", "JSON ilegível ou estado desconhecido", False
+
+    if msg is None:
+        return "NÃO-DESPACHADO", "despacho.json não contém mensagem", False
+
+    cursor = core.cursor(item["ia"])
+    if cursor >= msg:
+        return "LEU", f"cursor em #{cursor}; ainda não aceitou nem recusou", False
+
+    sino = core.p_pendente(item["ia"])
+    if sino.is_file():
+        texto = sino.read_text(encoding="utf-8", errors="replace")
+        if re.search(rf"\*\*#{msg}\*\*", texto):
+            return "NÃO-VIU", "despacho ainda consta no sino", False
+        return "?", f"há outro sino; cursor #{cursor} atrás do despacho #{msg}", False
+    return "?", f"sem sino; cursor #{cursor} atrás do despacho #{msg}", False
+
+
+def cmd_chamada(args: argparse.Namespace) -> int:
+    run = run_dir(args.run)
+    squad = ler_squad(run)
+    despacho = carregar_despacho(run)
+    trabalhadores = despacho.get("workers", {})
+    print(f"📋 chamada · {run.name} · {datetime.now():%H:%M:%S}")
+    assumidos: list[str] = []
+    orfaos: list[str] = []
+    recusados: list[str] = []
+    for item in squad:
+        msg = trabalhadores.get(item["worker"], {}).get("msg")
+        estado, detalhe, assumiu = estado_worker(run, squad, item, msg)
+        alvo = f"#{msg}" if msg else "—"
+        print(
+            f"   {item['worker']:14} @{item['ia']:8} {alvo:5} {estado:18} {detalhe}"
+        )
+        if assumiu:
+            assumidos.append(item["worker"])
+        else:
+            orfaos.append(item["worker"])
+        if estado == "RECUSOU":
+            recusados.append(item["worker"])
+
+    if orfaos:
+        print(f"\n⚠️  ÓRFÃOS: {', '.join(orfaos)}")
+    if recusados:
+        print(f"   recusados: {', '.join(recusados)}")
+    if not assumidos:
+        print("✗ NINGUÉM PEGOU a missão até agora; despacho sem dono não fica silencioso.")
+        return 3
+    print(f"\n✔ assumidos: {', '.join(assumidos)}")
+    return 0
+
+
+def anel(squad: list[dict]) -> dict[str, str]:
+    quantidade = len(squad)
+    return {
+        squad[indice]["worker"]: squad[(indice + 1) % quantidade]["worker"]
+        for indice in range(quantidade)
+    }
+
+
+def atribuicoes_esperadas(squad: list[dict]) -> dict[str, dict]:
+    porw = {item["worker"]: item for item in squad}
+    return {
+        alvo: {
+            "autor_ia": porw[alvo]["ia"],
+            "juiz": juiz,
+            "juiz_ia": porw[juiz]["ia"],
+            "msg": None,
+        }
+        for alvo, juiz in anel(squad).items()
+    }
+
+
+def validar_registro_juizes(run: Path, squad: list[dict], registro: dict) -> dict[str, dict]:
+    if registro.get("squad_sha256") != hash_squad(run):
+        falha("squad.tsv mudou depois de fixar os juízes")
+    atual = registro.get("atribuicao")
+    if not isinstance(atual, dict):
+        falha("juizes.json não contém atribuições válidas")
+    esperado = atribuicoes_esperadas(squad)
+    campos = ("autor_ia", "juiz", "juiz_ia")
+    for alvo, dados_esperados in esperado.items():
+        dados_atuais = atual.get(alvo)
+        if not isinstance(dados_atuais, dict) or any(
+            dados_atuais.get(campo) != dados_esperados[campo] for campo in campos
+        ):
+            falha(f"atribuição de juiz adulterada ou incompleta para {alvo}")
+    if set(atual) != set(esperado):
+        falha("juizes.json contém alvos diferentes do squad.tsv")
+    return atual
+
+
+JULGAMENTO = """⚖️ **SQUAD {run_id} · julgamento** — julgue `{alvo}` (autor: @{autor_ia}).
+
+resultado: {resultado}
+contrato: {contrato}
+
+Escreva CUMPRIU / NÃO-CUMPRIU / NÃO-VERIFICÁVEL por etapa e finalize com PASS ou ITERA.
+Submeta somente pela porta validada, para bloquear autojulgamento e gerar recibo:
+`iachat-squad veredito {run} --alvo {alvo} --de {juiz_ia} --arquivo /tmp/veredito.md`
+Não edite `vereditos/{alvo}.md` diretamente: sem recibo ele é inválido."""
+
+
+def cmd_julgar(args: argparse.Namespace) -> int:
+    run = run_dir(args.run)
+    squad = ler_squad(run)
+    if len(squad) < 2:
+        falha("squad de 1: não há juiz possível; auditor ≠ autor é inegociável")
+    if len(squad) == 2:
+        print(
+            "⚠️  squad de 2: A julga B e B julga A; são motores distintos, mas formam um par."
+        )
+
+    porw = {item["worker"]: item for item in squad}
+    juizes = anel(squad)
+    for alvo, juiz in juizes.items():
+        if porw[alvo]["ia"] == porw[juiz]["ia"]:
+            falha(f"juiz de {alvo} seria a própria IA (@{porw[alvo]['ia']})")
+
+    prontos = [item for item in squad if resultado_pronto(run, item["worker"])]
+    if not prontos:
+        falha("nenhum resultado não vazio no disco; julgar o que não existe é teatro")
+
+    caminho_registro = run / "juizes.json"
+    with run_travado(run):
+        if caminho_registro.exists():
+            registro = json.loads(caminho_registro.read_text(encoding="utf-8"))
+            atribuicoes = validar_registro_juizes(run, squad, registro)
+        else:
+            atribuicoes = atribuicoes_esperadas(squad)
+            registro = {
+                "fixado_em": core.agora(),
+                "squad_sha256": hash_squad(run),
+                "atribuicao": atribuicoes,
+            }
+            # A atribuição nasce antes de qualquer mensagem ou veredito.
+            gravar_json(caminho_registro, registro)
+
+        for alvo in prontos:
+            atribuicao = atribuicoes.get(alvo["worker"])
+            if atribuicao.get("msg"):
+                print(
+                    f"= {alvo['worker']:14} já atribuído a {atribuicao['juiz']:14} "
+                    f"@{atribuicao['juiz_ia']:8} msg #{atribuicao['msg']}"
+                )
+                continue
+            texto = JULGAMENTO.format(
+                run_id=run.name,
+                alvo=alvo["worker"],
+                autor_ia=alvo["ia"],
+                resultado=arquivo_resultado(run, alvo["worker"]),
+                contrato=caminho_no_run(run, alvo["contrato"]),
+                run=run,
+                juiz_ia=atribuicao["juiz_ia"],
+            )
+            numero = post(args.de, atribuicao["juiz_ia"], texto)
+            atribuicao["msg"] = numero
+            gravar_json(caminho_registro, registro)
+            print(
+                f"⚖️  {alvo['worker']:14} julgado por {atribuicao['juiz']:14} "
+                f"@{atribuicao['juiz_ia']:8} msg #{numero}"
+            )
+
+    pulados = [item["worker"] for item in squad if item not in prontos]
+    if pulados:
+        print(f"\n= sem resultado não vazio: {', '.join(pulados)}")
+    print(f"\natribuição fixada em {caminho_registro}")
+    return 0
+
+
+def corpo_veredito(args: argparse.Namespace) -> str:
+    if args.arquivo:
+        caminho = Path(args.arquivo).expanduser().resolve()
+        if not caminho.is_file():
+            falha(f"arquivo de veredito ausente: {caminho}")
+        return caminho.read_text(encoding="utf-8")
+    if sys.stdin.isatty():
+        falha("informe --arquivo ou envie o veredito por stdin")
+    return sys.stdin.read()
+
+
+def cmd_veredito(args: argparse.Namespace) -> int:
+    run = run_dir(args.run)
+    squad = ler_squad(run)
+    alvo = por_worker(squad, args.alvo)
+    registro_path = run / "juizes.json"
+    if not registro_path.is_file():
+        falha("juizes.json ausente; rode `iachat-squad julgar` antes")
+    registro = json.loads(registro_path.read_text(encoding="utf-8"))
+    atribuicoes = validar_registro_juizes(run, squad, registro)
+    atribuicao = atribuicoes.get(args.alvo)
+    if not atribuicao:
+        falha(f"{args.alvo} não tem juiz atribuído")
+
+    remetente = core.normaliza_ia(args.de)
+    if remetente == alvo["ia"]:
+        falha(
+            f"autojulgamento bloqueado: @{remetente} é autor de {args.alvo}, não seu juiz"
+        )
+    if remetente != atribuicao.get("juiz_ia"):
+        falha(
+            f"juiz de {args.alvo} é @{atribuicao.get('juiz_ia')}; @{remetente} não pode submeter"
+        )
+    if not resultado_pronto(run, args.alvo):
+        falha(f"resultado de {args.alvo} está ausente ou vazio")
+
+    corpo = corpo_veredito(args).strip() + "\n"
+    final = final_do_veredito(corpo)
+    if final is None:
+        falha("a última linha não vazia do veredito deve ser PASS ou ITERA")
+    destino = run / "vereditos" / f"{args.alvo}.md"
+    recibo = run / "vereditos" / ".recibos" / f"{args.alvo}.json"
+
+    dados_recibo = {
+        "alvo": args.alvo,
+        "autor_ia": alvo["ia"],
+        "juiz": atribuicao["juiz"],
+        "juiz_ia": remetente,
+        "final": final,
+        "em": core.agora(),
+        "atribuicao_msg": atribuicao.get("msg"),
+        "sha256_resultado": sha256_arquivo(arquivo_resultado(run, args.alvo)),
+        "sha256_contrato": sha256_arquivo(caminho_no_run(run, alvo["contrato"])),
+        "sha256_veredito": sha256_bytes(corpo.encode("utf-8")),
+    }
+
+    def recibo_compativel(existente: dict) -> bool:
+        campos = (
+            "alvo",
+            "autor_ia",
+            "juiz",
+            "juiz_ia",
+            "final",
+            "atribuicao_msg",
+            "sha256_resultado",
+            "sha256_contrato",
+            "sha256_veredito",
+        )
+        return all(existente.get(campo) == dados_recibo[campo] for campo in campos)
+
+    with run_travado(run):
+        tem_destino, tem_recibo = destino.is_file(), recibo.is_file()
+        if tem_destino and tem_recibo:
+            anterior = json.loads(recibo.read_text(encoding="utf-8"))
+            if recibo_compativel(anterior) and sha256_arquivo(destino) == dados_recibo[
+                "sha256_veredito"
+            ]:
+                print(f"= veredito de {args.alvo} já registrado e íntegro")
+                return 0
+            falha(f"veredito ou recibo conflitante para {args.alvo}; não sobrescrito")
+
+        if tem_destino and not tem_recibo:
+            if destino.read_text(encoding="utf-8") != corpo:
+                falha(
+                    f"veredito sem recibo e diferente do submetido para {args.alvo}; "
+                    "não sobrescrito"
+                )
+            gravar_json(recibo, dados_recibo)
+            print(f"✔ recibo de {args.alvo} recuperado após escrita parcial")
+            return 0
+
+        if tem_recibo and not tem_destino:
+            anterior = json.loads(recibo.read_text(encoding="utf-8"))
+            if not recibo_compativel(anterior):
+                falha(f"recibo órfão conflitante para {args.alvo}; não sobrescrito")
+            gravar_atomico(destino, corpo)
+            print(f"✔ veredito de {args.alvo} recuperado após escrita parcial")
+            return 0
+
+        gravar_atomico(destino, corpo)
+        gravar_json(recibo, dados_recibo)
+
+    print(f"✔ veredito {final} de {args.alvo} registrado por @{remetente} com recibo")
+    return 0
+
+
+def parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(prog="iachat-squad", description=__doc__.splitlines()[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    comando = sub.add_parser("despachar", help="posta um ponteiro de contrato por worker")
+    comando.add_argument("run")
+    comando.add_argument("--de", required=True, help="quem despacha; precisa estar na sala")
+    comando.add_argument("--prazo", help="combinado escrito; não arma timer")
+    comando.set_defaults(funcao=cmd_despachar)
+
+    comando = sub.add_parser("responder", help="worker aceita ou recusa o despacho")
+    comando.add_argument("run")
+    comando.add_argument("--worker", required=True)
+    comando.add_argument("--de", required=True, help="IA atribuída ao worker")
+    escolha = comando.add_mutually_exclusive_group(required=True)
+    escolha.add_argument("--aceitar", action="store_true")
+    escolha.add_argument("--recusar", action="store_true")
+    comando.add_argument("--motivo", help="obrigatório na recusa")
+    comando.set_defaults(funcao=cmd_responder)
+
+    comando = sub.add_parser("chamada", help="mostra aceites, recusas, andamento e órfãos")
+    comando.add_argument("run")
+    comando.set_defaults(funcao=cmd_chamada)
+
+    comando = sub.add_parser("julgar", help="fixa e despacha juiz diferente do autor")
+    comando.add_argument("run")
+    comando.add_argument("--de", required=True)
+    comando.set_defaults(funcao=cmd_julgar)
+
+    comando = sub.add_parser("veredito", help="submete veredito pela porta que bloqueia o autor")
+    comando.add_argument("run")
+    comando.add_argument("--alvo", required=True, help="worker julgado")
+    comando.add_argument("--de", required=True, help="IA que julga")
+    comando.add_argument("--arquivo", help="markdown do veredito; sem ele, lê stdin")
+    comando.set_defaults(funcao=cmd_veredito)
+    return ap
+
+
+def main() -> int:
+    args = parser().parse_args()
+    return args.funcao(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

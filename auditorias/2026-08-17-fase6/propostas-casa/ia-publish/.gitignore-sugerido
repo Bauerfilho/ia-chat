@@ -1,0 +1,43 @@
+# .gitignore sugerido — substitui o atual (3 linhas) do ia-chat.
+#
+# O ATUAL JÁ FUNCIONA. Medido: `git init && git add -A` numa cópia do repo entrega
+# exatamente 19 arquivos / 2197 linhas, e o
+# bin/__pycache__/iachat_core.cpython-314.pyc que existe hoje no disco FICA DE FORA.
+# Não há nada quebrado a consertar aqui — as linhas novas abaixo são rede de
+# segurança, não correção.
+#
+# O QUE AS LINHAS NOVAS COMPRAM (medido, não suposto):
+# rodar o CLI com a sala apontada para dentro do próprio clone —
+#   `IACHAT_HOME=$PWD ./bin/iachat status && ./bin/iachat post ...` —
+# suja o repo com 5 caminhos:
+#   ?? .estado.json   ?? .lock/   ?? config.json   ?? iachat.md   ?? pendente/
+# `iachat.md` É A CONVERSA. É a coisa mais fácil de fazer sem querer ao testar
+# um clone, e a mais cara de descobrir depois de um push. `cursor/` e `arquivo/`
+# entram na lista porque aparecem no mesmo cenário assim que alguém lê ou rotaciona
+# (bin/iachat_core.py:70, :414-419).
+
+# --- o que já estava aqui, e continua certo ---
+__pycache__/
+*.pyc
+.DS_Store
+
+# --- ambiente local ---
+.venv/
+venv/
+
+# --- processo interno, não produto ---
+# `auditorias/` apareceu no repo em 2026-08-17: 19 arquivos / 1405 linhas de log de
+# frota, briefing interno e propostas de skill ainda não decididas, com 7 caminhos
+# `/Users/bauervieiracesarfilhovieira/...`. Sem credencial — varri. Descomente se a
+# sua decisão for manter a pasta no disco mas fora do repositório público.
+# auditorias/
+
+# --- rede de segurança: dados da sala nunca entram no repo do código ---
+# (o lugar deles é IACHAT_HOME, default ~/ia-chat-global — bin/iachat_core.py:52-54)
+iachat.md
+config.json
+.estado.json
+.lock/
+pendente/
+cursor/
+arquivo/

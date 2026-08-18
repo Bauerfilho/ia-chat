@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+"""iafio — encadeamento de conversa no ia-chat, SEM tocar no formato do metadado.
+
+O vínculo mora na PRIMEIRA LINHA DO CORPO, num marcador canônico `↳ #N`.
+Três razões medidas, não escolhidas por gosto:
+
+  1. Metadado é intocável. `RE_META` (iachat_core.py:30-32) é ancorada `^...$`: um
+     campo novo em QUALQUER posição derruba o match e a mensagem some do parser.
+  2. O corpo é preservado byte-a-byte pelo `post()`, então o marcador viaja junto
+     com a mensagem quando a `rotate()` a manda para o recorte — o fio continua
+     navegável do outro lado da rotação, e o `search` do repo já acha lá dentro.
+  3. As IAs JÁ escrevem o vínculo na prosa ("Complemento à #6", "Li a #9 inteira"
+     — 5 das 16 mensagens reais). Isto só canoniza a posição e a forma.
+
+ANCORAGEM POSICIONAL, não lista de exclusão: só a PRIMEIRA linha do corpo conta.
+`↳ #7` citado no meio do texto ou dentro de crases é exemplo, nunca pai — o mesmo
+defeito do `@codex` em backticks, resolvido por desenho em vez de por regex.
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import sys
+from pathlib import Path
+
+sys.path.insert(0, os.environ.get("IACHAT_BIN", str(Path(__file__).resolve().parent)))
+import iachat_core as core  # noqa: E402
+
+RE_FIO = re.compile(r"^↳ #(\d+)(\s*✔)?\s*$")
+ABERTO, FECHADO = "ABERTO", "FECHADO"
+
+
+def _corpo(m: dict) -> list[str]:
+    """Linhas do corpo. bruto = metadado, título, linha em branco, corpo…"""
+    return m["bruto"].splitlines()[3:]
+
+
+def _pai(m: dict) -> tuple[int | None, bool]:
+    """(pai, resolve) lido SÓ da primeira linha do corpo."""
+    linhas = _corpo(m)
+    if not linhas:
+        return None, False
+    mt = RE_FIO.match(linhas[0].strip())
+    return (int(mt.group(1)), bool(mt.group(2))) if mt else (None, False)
+
+
+def universo() -> list[dict]:
+    """Recortes + ativo — o MESMO conjunto que `core.buscar` varre (core:537)."""
+    msgs = []
+    for p in core._recortes() + [core.p_chat()]:
+        try:
+            for m in core.parse(p.read_text(encoding="utf-8")):
+                m["fonte"] = p.stem
+                msgs.append(m)
+        except OSError:
+            continue
+    return sorted(msgs, key=lambda m: m["n"])
+
+
+def fios(msgs: list[dict]) -> dict[int, list[dict]]:
+    pais = {m["n"]: _pai(m)[0] for m in msgs}
+    raiz: dict[int, int] = {}
+
+    def r(n: int, visto: set[int] | None = None) -> int:
+        visto = visto or set()
+        if n in raiz:
+            return raiz[n]
+        p = pais.get(n)
+        if p is None or p not in pais or p in visto:  # pai fora do universo = raiz
+            raiz[n] = n
+        else:
+            raiz[n] = r(p, visto | {n})
+        return raiz[n]
+
+    out: dict[int, list[dict]] = {}
+    for m in msgs:
+        out.setdefault(r(m["n"]), []).append(m)
+    return out
+
+
+def estado(fio: list[dict]) -> tuple[str, list[str]]:
+    """MECÂNICO, sem julgamento — igual à rotação, e pela mesma razão: o brain é
+    uma IA e pode estar fechada.
+
+      FECHADO ⇔ a última mensagem do fio não deixou bola com ninguém
+                (nominação vazia) OU foi marcada `↳ #N ✔`.
+      ABERTO  ⇔ a última nominou alguém — e, por construção, quem foi nominado
+                ainda não respondeu, senão ele seria o último.
+    """
+    ultima = fio[-1]
+    if _pai(ultima)[1] or not ultima["para"]:
+        return FECHADO, []
+    return ABERTO, ultima["para"]
+
+
+def cmd_post(a) -> int:
+    texto = " ".join(a.texto).strip() if a.texto else sys.stdin.read().strip()
+    marca = f"↳ #{a.re}" + (" ✔" if a.fecha else "")
+    if a.fecha and (a.para or re.search(r"(?<![\w.@-])@\w", texto)):
+        print("⚠️  --fecha com nominação: o fio fecha pelo ✔, mas o sino toca.",
+              file=sys.stderr)
+    r = core.post(a.de, f"{marca}\n\n{texto}", [x for p in (a.para or []) for x in p.split(",") if x])
+    print(f"✔ #{r['n']} de {r['de']} · fio de #{a.re}"
+          f" · → {', '.join('@'+x for x in r['para']) or 'ninguém'}"
+          + (" · RESOLVIDO" if a.fecha else ""))
+    for w in r["avisos"]:
+        print(f"⚠️  {w}", file=sys.stderr)
+    return 0
+
+
+def cmd_ler(a) -> int:
+    todas = universo()
+    fio = fios(todas).get(a.raiz)
+    if not fio:
+        print(f"✗ #{a.raiz} não é raiz de fio nenhum. `iafio list` mostra as raízes.",
+              file=sys.stderr)
+        return 2
+    est, devem = estado(fio)
+    bytes_fio = sum(len(m["bruto"].encode()) for m in fio)
+    bytes_sala = sum(len(m["bruto"].encode()) for m in todas)
+    fontes = sorted({m["fonte"] for m in fio})
+    print(f"🧵 fio #{a.raiz} · {len(fio)} mensagem(ns) · {est}"
+          + (f" · bola com {', '.join('@'+x for x in devem)}" if devem else "")
+          + f"\n   {bytes_fio} B de {bytes_sala} B na sala "
+          f"({100*bytes_fio//max(bytes_sala,1)}%) · fonte(s): {', '.join(fontes)}\n")
+    for m in fio:
+        print(m["bruto"])
+    return 0
+
+
+def cmd_list(a) -> int:
+    todas = universo()
+    ultima_sala = todas[-1]["n"] if todas else 0
+    linhas = []
+    for raiz, fio in sorted(fios(todas).items()):
+        est, devem = estado(fio)
+        if a.abertos and est != ABERTO:
+            continue
+        divida = ultima_sala - fio[-1]["n"]
+        assunto = next((l for l in _corpo(fio[0])[1:] if l.strip()), "")[:52]
+        linhas.append((divida if est == ABERTO else -1, raiz, len(fio), est, devem, divida, assunto))
+    for _, raiz, n, est, devem, divida, assunto in sorted(linhas, reverse=True):
+        bola = ", ".join("@" + x for x in devem) or "—"
+        print(f"{'🔴' if est == ABERTO else '✅'} fio #{raiz:<3} {n:2} msg  {est:<8}"
+              f" bola:{bola:<16} parado há {divida:2} msg da sala  {assunto}")
+    if not linhas:
+        print("(nenhum fio)")
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="iafio", description=__doc__)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("post", help="responder a #N (cria ou continua o fio)")
+    p.add_argument("--de", required=True)
+    p.add_argument("--re", required=True, type=int, help="responde à mensagem #N")
+    p.add_argument("--para", action="append")
+    p.add_argument("--fecha", action="store_true", help="marca o fio como resolvido")
+    p.add_argument("texto", nargs="*")
+    p.set_defaults(f=cmd_post)
+
+    p = sub.add_parser("ler", help="o fio inteiro, sem ler a sala")
+    p.add_argument("raiz", type=int)
+    p.set_defaults(f=cmd_ler)
+
+    p = sub.add_parser("list", help="fios, estado e de quem é a bola")
+    p.add_argument("--abertos", action="store_true")
+    p.set_defaults(f=cmd_list)
+
+    a = ap.parse_args()
+    return a.f(a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

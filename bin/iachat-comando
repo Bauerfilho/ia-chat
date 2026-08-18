@@ -1,0 +1,702 @@
+#!/usr/bin/env python3
+"""iachat-comando — os comandos do DONO. O ciclo de trabalho que ele desenhou.
+
+    /goal      ele explica o objetivo — é o enunciado
+    /plan      a frota ativa trabalha JUNTA e devolve um plano NO CHAT
+    /concluir  autorizado: pode aplicar
+
+Mais quatro que o desenho pedia:
+
+    /parar     abortar missão em andamento   (o único que ele não consegue fazer hoje)
+    /quem      quem está vivo, fazendo o quê, há quanto tempo
+    /decidi    registra decisão que todas obedecem  (delega ao `iachat-decide`)
+    /refaz     redispara worker morto, de onde parou
+
+POR QUE PLANEJAR É COLETIVO E APLICAR É SÓ DELE: planejar é barato e reversível —
+N IAs planejando em paralelo custam N logs num diretório; se o plano for ruim, joga
+fora. Aplicar não volta. Por isso `plan` dispara a frota inteira sem pedir nada, e
+`concluir` recusa enquanto não houver plano no disco para autorizar.
+
+POR QUE O `parar` CONFERE O DONO DO PID ANTES DE MATAR: PID é reciclado. Um `kill`
+num número guardado há uma hora pode acertar o processo errado — o pior desfecho
+possível deste comando, pior do que não parar nada. Então o despacho grava PID +
+`lstart` (o instante de criação daquele processo, que o SO não repete) + o caminho do
+prompt daquele worker, que aparece na linha de comando; e o `parar` só mata quando os
+TRÊS ainda batem. Divergiu um, recusa e diz qual (`iachat-comando parar` → exit 3).
+
+POR QUE MATA O GRUPO, NÃO O PID: o despacho nasce em sessão própria (`setsid`), então
+o PID do adaptador é também o líder do grupo. Matar só ele deixaria o `codex`/`agy`
+filho vivo — que foi exatamente a dor da madrugada de 18/08, quando os processos
+tiveram que ser caçados à mão com `pgrep`.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+BIN = Path(__file__).resolve().parent
+sys.path.insert(0, str(BIN))
+import iachat_core as core  # noqa: E402
+
+DESPACHO_PADRAO = BIN / "iachat-despacho.sh"
+DECIDE = BIN / "iachat-decide"
+# Papéis com que a frota planeja quando o dono não nomeia nada. Não é hierarquia: é
+# só evitar N planos idênticos, que custariam N vezes e diriam uma coisa só.
+PAPEL_PADRAO = {
+    "codex": "a implementação: arquivos, ordem, o que quebra",
+    "kimi": "o volume: o que dá para varrer, medir e listar",
+    "qwen": "o custo e o risco de cada passo",
+    "grok": "o gate: como PROVAR que ficou pronto",
+    "agy": "onde a coisa já está escrita no disco (arquivo:linha)",
+    "qwclaude": "a alternativa mais simples que resolve",
+    "dsclaude": "a segunda opinião: o que os outros vão errar",
+}
+ESTADOS_VIVOS = ("planejando", "aplicando")
+
+
+# ---------------------------------------------------------------- estado em disco
+def p_comando() -> Path:
+    return core.home() / "comando"
+
+
+def p_estado() -> Path:
+    return p_comando() / "estado.json"
+
+
+def le_estado() -> dict | None:
+    try:
+        return json.loads(p_estado().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def grava_estado(d: dict) -> None:
+    p_comando().mkdir(parents=True, exist_ok=True)
+    core._escrever_atomico(p_estado(), json.dumps(d, ensure_ascii=False, indent=2) + "\n")
+
+
+def sala() -> list[str]:
+    return [core.normaliza_ia(x) for x in core.config().get("na_sala", [])]
+
+
+def voz(de: str) -> tuple[str, str]:
+    """Quem assina o post. O dono não está em `na_sala`; ele fala pela orquestradora.
+
+    Devolve (autor, prefixo). Sem brain na sala, ninguém pode falar por ele — e
+    inventar um autor seria pôr palavra na boca de uma IA que não disse aquilo.
+    """
+    de = core.normaliza_ia(de)
+    if de in sala():
+        return de, ""
+    brain = core.normaliza_ia(core.config().get("brain", ""))
+    if brain not in sala():
+        raise ValueError(
+            f"'{de}' não está na sala {sala()} e não há brain para falar por ele. "
+            f"Ajuste `na_sala`/`brain` em {core.p_config()}."
+        )
+    return brain, f"📣 **do dono ({de}):**\n\n"
+
+
+def anuncia(de: str, texto: str, para: list[str]) -> dict | None:
+    """Posta na sala. Falha de post não derruba o comando — o disco já foi gravado."""
+    try:
+        autor, prefixo = voz(de)
+        return core.post(autor, prefixo + texto, para)
+    except ValueError as e:
+        print(f"⚠️  não anunciado na sala: {e}", file=sys.stderr)
+        return None
+
+
+# ---------------------------------------------------------------- processos
+def _ps(pid: int, campo: str) -> str:
+    """Um campo do `ps` para UM pid. Vazio = processo não existe mais."""
+    try:
+        r = subprocess.run(
+            ["ps", "-o", f"{campo}=", "-p", str(pid)],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def confere_dono(w: dict, missao: str) -> tuple[str, str]:
+    """O gate do `parar`. Devolve (veredito, motivo).
+
+    veredito ∈ {ok, morto, recusado}. `recusado` é fail-closed: na dúvida sobre a
+    identidade do processo, NÃO se mata. Um worker que sobrevive custa uma segunda
+    tentativa; um PID reciclado morto custa o processo de outra pessoa.
+    """
+    pid = w.get("pid")
+    if not isinstance(pid, int) or pid <= 1:
+        return "recusado", f"pid inválido no estado: {pid!r}"
+    if pid == os.getpid() or pid == os.getppid():
+        return "recusado", f"pid {pid} é este próprio comando"
+    lstart = _ps(pid, "lstart")
+    if not lstart:
+        return "morto", "processo já não existe"
+    if lstart != w.get("lstart"):
+        return "recusado", (
+            f"PID {pid} RECICLADO: nasceu em {lstart!r}, o worker nasceu em "
+            f"{w.get('lstart')!r} — é outro processo"
+        )
+    # A marca é o caminho ABSOLUTO do prompt daquele worker, não o id da missão: `m1`
+    # é curto o bastante para aparecer por acaso em qualquer linha de comando, e uma
+    # marca que casa por acaso não prova nada.
+    marca = w.get("prompt") or missao
+    cmd = _ps(pid, "command")
+    if marca not in cmd:
+        return "recusado", (
+            f"PID {pid} não carrega a marca do worker ({marca}) na linha de comando: {cmd[:120]!r}"
+        )
+    return "ok", cmd[:120]
+
+
+def vivo(w: dict, missao: str) -> bool:
+    return confere_dono(w, missao)[0] == "ok"
+
+
+def mata(pid: int, sig: int) -> str:
+    """Mata o GRUPO quando o pid é líder de grupo; só o pid quando não é."""
+    try:
+        if os.getpgid(pid) == pid:
+            os.killpg(pid, sig)
+            return "grupo"
+        os.kill(pid, sig)
+        return "processo"
+    except (ProcessLookupError, PermissionError, OSError) as e:
+        return f"erro: {e}"
+
+
+# ---------------------------------------------------------------- tempo
+def desde(iso: str | None) -> str:
+    if not iso:
+        return "—"
+    try:
+        t = datetime.fromisoformat(iso)
+    except ValueError:
+        return "—"
+    s = (datetime.now().astimezone() - t).total_seconds()
+    if s < 90:
+        return f"há {int(s)}s"
+    if s < 5400:
+        return f"há {int(s // 60)}min"
+    if s < 172800:
+        return f"há {s / 3600:.1f}h"
+    return f"há {int(s // 86400)}d"
+
+
+# ---------------------------------------------------------------- /goal
+def cmd_goal(a) -> int:
+    texto = " ".join(a.texto).strip()
+    if not texto:
+        print("✗ objetivo vazio. `/goal` é o enunciado — sem ele o `/plan` não tem o que pedir.",
+              file=sys.stderr)
+        return 2
+
+    velho = le_estado()
+    if velho and velho.get("estado") in ESTADOS_VIVOS and not a.novo:
+        rodando = [i for i, w in velho.get("workers", {}).items() if vivo(w, velho["id"])]
+        if rodando:
+            print(
+                f"✗ a missão {velho['id']} ainda tem {len(rodando)} worker(s) vivo(s): "
+                f"{', '.join(rodando)}.\n"
+                f"  Trocar o objetivo agora abandonaria eles rodando às cegas.\n"
+                f"  `iachat-comando parar` encerra, ou `--novo` assume o abandono.",
+                file=sys.stderr,
+            )
+            return 3
+
+    n = int(velho["id"].lstrip("m")) + 1 if velho and str(velho.get("id", "")).startswith("m") else 1
+    mid = f"m{n}"
+    d = p_comando() / mid
+    (d / "logs").mkdir(parents=True, exist_ok=True)
+    (d / "planos").mkdir(parents=True, exist_ok=True)
+    grava_estado({
+        "id": mid, "goal": texto, "de": core.normaliza_ia(a.de),
+        "criado": core.agora(), "estado": "aberta", "dir": str(d), "workers": {},
+    })
+    (d / "goal.md").write_text(f"# {mid} · objetivo\n\n{texto}\n", encoding="utf-8")
+
+    print(f"🎯 {mid} · objetivo registrado")
+    print(f"   {texto}")
+    print(f"   {d}")
+    if not a.calado:
+        r = anuncia(a.de, f"**Objetivo da missão {mid}**\n\n{texto}\n\n"
+                          f"Nada a aplicar ainda. O plano vem pelo `/plan`; aplicar, só no `/concluir`.",
+                    ["all"])
+        if r:
+            print(f"   ↪ anunciado na sala como #{r['n']}")
+    print("   próximo: `iachat-comando plan`")
+    return 0
+
+
+# ---------------------------------------------------------------- /plan
+def prompt_de(ia: str, e: dict, papel: str, retomada: str = "") -> str:
+    plano = Path(e["dir"]) / "planos" / f"{ia}.md"
+    return (
+        f"PEDIDO DE PLANO — missão {e['id']} · sala ia-chat\n\n"
+        f"O DONO da máquina definiu este objetivo:\n\n    {e['goal']}\n\n"
+        f"Você é {ia}. Seu ângulo nesta rodada: {papel}.\n"
+        f"Devolva UM PLANO. NÃO aplique nada, NÃO edite arquivo de produção: planejar é "
+        f"barato e reversível, aplicar não. Aplicar só depois que o dono autorizar.\n\n"
+        f"ESCREVA O PLANO EM: {plano}\n"
+        f"Formato: o que fazer · em que ordem · o que cada passo custa · o que pode dar "
+        f"errado · o que você NÃO consegue fazer. Cite arquivo:linha ao falar de código; "
+        f"alegação sem arquivo:linha não conta.\n\n"
+        f"A sala fica em {core.p_chat()}. Antes de propor, leia o que já foi decidido: "
+        f"`iachat-decide decisoes`.\n"
+        + (f"\nRETOMADA — você já tinha escrito isto antes de cair; continue de onde parou, "
+           f"não recomece:\n\n{retomada}\n" if retomada else "")
+    )
+
+
+def despacha(ia: str, braco: str, e: dict, papel: str, retomada: str = "") -> dict:
+    d = Path(e["dir"])
+    pr = d / "logs" / f"{ia}.prompt.txt"
+    log = d / "logs" / f"{ia}.log"
+    plano = d / "planos" / f"{ia}.md"
+    pr.write_text(prompt_de(ia, e, papel, retomada), encoding="utf-8")
+
+    despachante = os.environ.get("IACHAT_DESPACHO", str(DESPACHO_PADRAO))
+    argv = [despachante, braco, e["id"], str(pr), str(log), str(plano)]
+    # start_new_session: o filho vira líder do próprio grupo. É o que torna o /parar
+    # capaz de derrubar a árvore inteira em vez de decapitar a casca e deixar o motor.
+    p = subprocess.Popen(
+        argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL, start_new_session=True, cwd=str(d),
+    )
+    lstart = ""
+    for _ in range(20):  # o `ps` só enxerga o processo depois que ele existe de fato
+        lstart = _ps(p.pid, "lstart")
+        if lstart:
+            break
+        time.sleep(0.05)
+    return {
+        "braco": braco, "papel": papel, "pid": p.pid, "lstart": lstart,
+        "inicio": core.agora(), "estado": "rodando", "tentativas": 1,
+        "log": str(log), "plano": str(plano), "prompt": str(pr),
+    }
+
+
+def cmd_plan(a) -> int:
+    e = le_estado()
+    if not e or not e.get("goal"):
+        print("✗ não há objetivo. `iachat-comando goal \"...\"` primeiro — o `/plan` "
+              "planeja o enunciado, e sem enunciado ele planejaria o quê?", file=sys.stderr)
+        return 2
+
+    if a.colher:
+        return colher(e, a)
+
+    vivos = [i for i, w in e.get("workers", {}).items() if vivo(w, e["id"])]
+    if vivos and not a.forcar:
+        print(f"✗ {len(vivos)} worker(s) ainda planejando: {', '.join(vivos)}.\n"
+              f"  `iachat-comando quem` mostra o estado · `--forcar` dispara por cima.",
+              file=sys.stderr)
+        return 3
+
+    alvos = [core.normaliza_ia(x) for p in (a.ias or []) for x in p.split(",") if x]
+    if not alvos:
+        brain = core.normaliza_ia(core.config().get("brain", ""))
+        # A orquestradora não se despacha: ela é quem está rodando este comando.
+        alvos = [x for x in sala() if x != brain]
+    if not alvos:
+        print(f"✗ nenhuma IA para planejar (sala={sala()}, brain fora). "
+              f"Use `--ias codex,kimi`.", file=sys.stderr)
+        return 2
+
+    if a.seco:
+        print(f"🧪 seco — missão {e['id']}: {len(alvos)} IA(s) seriam despachadas")
+        for ia in alvos:
+            print(f"   {ia:10} braço={a.braco or ia:10} {PAPEL_PADRAO.get(ia, 'plano geral')}")
+        return 0
+
+    e["workers"] = e.get("workers", {})
+    print(f"📐 {e['id']} · pedindo plano a {len(alvos)} IA(s)")
+    for ia in alvos:
+        papel = PAPEL_PADRAO.get(ia, "o plano do seu ângulo")
+        w = despacha(ia, a.braco or ia, e, papel)
+        e["workers"][ia] = w
+        print(f"   {ia:10} pid {w['pid']:>6}  {w['braco']:10} {papel}")
+    e["estado"] = "planejando"
+    grava_estado(e)
+
+    if a.esperar:
+        return espera(e, a)
+    print(f"\n   colher: `iachat-comando plan --colher`   ·   parar: `iachat-comando parar`")
+    return 0
+
+
+def espera(e: dict, a) -> int:
+    fim = time.time() + a.esperar
+    while time.time() < fim:
+        e2 = le_estado() or e
+        faltam = [i for i, w in e2["workers"].items()
+                  if not Path(w["plano"]).exists() and vivo(w, e2["id"])]
+        if not faltam:
+            break
+        time.sleep(3)
+    return colher(le_estado() or e, a)
+
+
+def colher(e: dict, a) -> int:
+    """Lê os planos do disco e devolve o resultado PARA A SALA — o ponto do desenho."""
+    ws = e.get("workers", {})
+    if not ws:
+        print("✗ nada despachado nesta missão. `iachat-comando plan` primeiro.", file=sys.stderr)
+        return 2
+
+    entregues, vazios = [], []
+    for ia, w in ws.items():
+        p = Path(w["plano"])
+        if p.exists() and p.stat().st_size > 0:
+            w["estado"] = "entregue"
+            entregues.append((ia, p, p.stat().st_size))
+        else:
+            v, motivo = confere_dono(w, e["id"])
+            w["estado"] = "rodando" if v == "ok" else "morto"
+            vazios.append((ia, w["estado"], motivo))
+
+    linhas = [f"**Planos da missão {e['id']}** — objetivo: {e['goal']}", ""]
+    for ia, p, n in entregues:
+        cabeca = [ln for ln in p.read_text(encoding="utf-8", errors="replace").splitlines()
+                  if ln.strip()][:3]
+        linhas.append(f"- **{ia}** · {n} B · `{p}`")
+        linhas += [f"  > {ln[:110]}" for ln in cabeca]
+    for ia, est, motivo in vazios:
+        linhas.append(f"- **{ia}** · sem plano ({est}: {motivo})")
+    # O caminho + as 3 primeiras linhas, nunca o plano inteiro: a sala cobra de TODA
+    # IA que a lê, toda vez (iachat_core.py:54, AVISO_GRANDE).
+    linhas += ["", "Planos completos nos caminhos acima — a sala leva o resumo, não o corpo.",
+               "Autorizar: `iachat-comando concluir --para <ia>`."]
+    corpo = "\n".join(linhas)
+
+    e["estado"] = "planejada" if entregues else "planejando"
+    grava_estado(e)
+
+    print(corpo)
+    if not a.calado:
+        r = anuncia(e.get("de", "bauer"), corpo, ["all"])
+        if r:
+            print(f"\n↪ na sala como #{r['n']}")
+    if not entregues:
+        print("\n✗ nenhum plano no disco — nada a autorizar.", file=sys.stderr)
+        return 1
+    return 0
+
+
+# ---------------------------------------------------------------- /concluir
+def cmd_concluir(a) -> int:
+    e = le_estado()
+    if not e:
+        print("✗ não há missão. `iachat-comando goal \"...\"` primeiro.", file=sys.stderr)
+        return 2
+
+    prontos = [ia for ia, w in e.get("workers", {}).items()
+               if Path(w["plano"]).exists() and Path(w["plano"]).stat().st_size > 0]
+    if not prontos and not a.forcar:
+        print("✗ não há plano no disco para autorizar. Autorizar o vazio é assinar em "
+              "branco — `iachat-comando plan` primeiro (`--forcar` assume o risco).",
+              file=sys.stderr)
+        return 3
+
+    alvo = [core.normaliza_ia(x) for x in (a.para or [])] or prontos
+    texto = " ".join(a.texto).strip()
+    e["estado"] = "autorizada"
+    e["autorizado"] = {"em": core.agora(), "por": core.normaliza_ia(a.de),
+                       "para": alvo, "nota": texto}
+    grava_estado(e)
+
+    corpo = (
+        f"✅ **AUTORIZADO — missão {e['id']}**\n\n"
+        f"Objetivo: {e['goal']}\n\n"
+        f"Autorizado a aplicar: {', '.join('@' + x for x in alvo) or '(ninguém nomeado)'}\n"
+        + (f"\n{texto}\n" if texto else "")
+        + f"\nPlanos: {Path(e['dir']) / 'planos'}\n"
+        f"Isto é a única etapa que muda o mundo. O que não estiver no plano autorizado "
+        f"continua não autorizado."
+    )
+    print(corpo)
+    if not a.calado:
+        r = anuncia(a.de, corpo, alvo or ["all"])
+        if r:
+            print(f"\n↪ na sala como #{r['n']} → {', '.join(r['para']) or 'ninguém'}")
+    return 0
+
+
+# ---------------------------------------------------------------- /parar
+def cmd_parar(a) -> int:
+    e = le_estado()
+    if not e:
+        print("✗ não há missão para parar.", file=sys.stderr)
+        return 2
+    ws = e.get("workers", {})
+    if not ws:
+        print("✗ a missão não despachou ninguém — não há o que parar.", file=sys.stderr)
+        return 2
+
+    pedidos = [core.normaliza_ia(x) for p in (a.ia or []) for x in p.split(",") if x]
+    desconhecidos = [x for x in pedidos if x not in ws]
+    if desconhecidos:
+        print(f"✗ não estão nesta missão: {', '.join(desconhecidos)} "
+              f"(há: {', '.join(ws)})", file=sys.stderr)
+        return 2
+    alvos = pedidos or list(ws)
+
+    sig = signal.SIGKILL if a.forte else signal.SIGTERM
+    mortos, recusados, ja = [], [], []
+    for ia in alvos:
+        w = ws[ia]
+        veredito, motivo = confere_dono(w, e["id"])
+        if veredito == "morto":
+            w["estado"] = "morto"
+            ja.append(ia)
+            print(f"   {ia:10} já não estava rodando ({motivo})")
+            continue
+        if veredito == "recusado":
+            recusados.append((ia, motivo))
+            print(f"   {ia:10} ⛔ NÃO MATEI — {motivo}", file=sys.stderr)
+            continue
+        alvo_str = mata(w["pid"], sig)
+        if alvo_str.startswith("erro"):
+            recusados.append((ia, alvo_str))
+            print(f"   {ia:10} ⛔ {alvo_str}", file=sys.stderr)
+            continue
+        w["estado"] = "parado"
+        w["parado_em"] = core.agora()
+        mortos.append(ia)
+        print(f"   {ia:10} pid {w['pid']} ({alvo_str}) ← {sig.name}")
+
+    # SIGTERM é pedido, não ordem: confere se o processo de fato saiu.
+    if mortos and not a.forte:
+        time.sleep(a.espera)
+        teimosos = [ia for ia in mortos if _ps(ws[ia]["pid"], "lstart") == ws[ia].get("lstart")]
+        if teimosos:
+            print(f"⚠️  ainda de pé após {a.espera}s: {', '.join(teimosos)} — "
+                  f"`iachat-comando parar --forte` manda SIGKILL", file=sys.stderr)
+
+    e["estado"] = "parada" if not any(
+        vivo(w, e["id"]) for w in ws.values()) else e.get("estado", "planejando")
+    grava_estado(e)
+
+    print(f"\n🛑 {len(mortos)} parado(s) · {len(ja)} já morto(s) · {len(recusados)} recusado(s)")
+    if not a.calado and mortos:
+        anuncia(a.de, f"🛑 **Missão {e['id']} abortada pelo dono.** Parados: "
+                      f"{', '.join(mortos)}. Quem estava planejando, pare — o plano "
+                      f"incompleto no disco não vale como entrega.", ["all"])
+    if recusados:
+        print("✗ recusa é o desfecho seguro: matar PID que não é do worker é pior do "
+              "que não parar.", file=sys.stderr)
+        return 3
+    return 0
+
+
+# ---------------------------------------------------------------- /quem
+def cmd_quem(a) -> int:
+    e = le_estado()
+    cfg = core.config()
+    brain = core.normaliza_ia(cfg.get("brain", ""))
+    linhas = []
+    for ia in sala():
+        c = core.p_cursor(ia)
+        try:
+            em = json.loads(c.read_text(encoding="utf-8")).get("em")
+        except (OSError, ValueError, json.JSONDecodeError):
+            em = None
+        pend = core.p_pendente(ia)
+        n_pend = len([ln for ln in pend.read_text(encoding="utf-8").splitlines()
+                      if ln.startswith("- **#")]) if pend.exists() else 0
+        w = (e or {}).get("workers", {}).get(ia)
+        if w:
+            veredito, motivo = confere_dono(w, e["id"])
+            tem_plano = Path(w["plano"]).exists() and Path(w["plano"]).stat().st_size > 0
+            if veredito == "ok":
+                fazendo = f"planejando ({w['papel']})"
+                estado = f"🟢 pid {w['pid']}"
+            elif tem_plano:
+                fazendo = "plano entregue"
+                estado = "✅"
+            else:
+                fazendo = f"caiu sem entregar — {motivo}"
+                estado = "🔴"
+            quando = desde(w["inicio"])
+        else:
+            fazendo = "—"
+            estado = "⚪ fora da missão"
+            quando = ""
+        linhas.append({
+            "ia": ia, "brain": ia == brain, "estado": estado, "fazendo": fazendo,
+            "ha": quando, "leu": desde(em), "pendentes": n_pend,
+        })
+
+    if a.json:
+        print(json.dumps({"missao": (e or {}).get("id"), "estado": (e or {}).get("estado"),
+                          "quem": linhas}, ensure_ascii=False, indent=2))
+        return 0
+
+    if e:
+        print(f"🎯 {e['id']} · {e['estado']} · {desde(e['criado'])} · {e['goal'][:80]}")
+    else:
+        print("🎯 nenhuma missão aberta")
+    print()
+    print(f"{'ia':10} {'estado':14} {'há':>8}  {'leu a sala':>11}  o que está fazendo")
+    for L in linhas:
+        marca = "🧠" if L["brain"] else "  "
+        sino = f" · {L['pendentes']} chamado(s)" if L["pendentes"] else ""
+        print(f"{marca}{L['ia']:8} {L['estado']:14} {L['ha']:>8}  {L['leu']:>11}  "
+              f"{L['fazendo']}{sino}")
+    return 0
+
+
+# ---------------------------------------------------------------- /refaz
+def cmd_refaz(a) -> int:
+    e = le_estado()
+    if not e:
+        print("✗ não há missão.", file=sys.stderr)
+        return 2
+    ia = core.normaliza_ia(a.ia)
+    w = e.get("workers", {}).get(ia)
+    if not w:
+        print(f"✗ '{ia}' não está nesta missão (há: {', '.join(e.get('workers', {})) or 'ninguém'})",
+              file=sys.stderr)
+        return 2
+
+    veredito, motivo = confere_dono(w, e["id"])
+    if veredito == "ok" and not a.forcar:
+        print(f"✗ {ia} ainda está VIVO (pid {w['pid']}, {desde(w['inicio'])}). Redisparar "
+              f"agora daria dois workers escrevendo no mesmo plano.\n"
+              f"  `iachat-comando parar --ia {ia}` antes, ou `--forcar` (para e redispara).",
+              file=sys.stderr)
+        return 3
+    if veredito == "ok" and a.forcar:
+        r = mata(w["pid"], signal.SIGTERM)
+        print(f"   {ia} pid {w['pid']} ({r}) ← SIGTERM antes de redisparar")
+        time.sleep(2)
+
+    plano = Path(w["plano"])
+    parcial = ""
+    if plano.exists() and plano.stat().st_size > 0:
+        if not a.forcar:
+            print(f"✗ {ia} já entregou plano ({plano.stat().st_size} B em {plano}). "
+                  f"Redisparar apagaria trabalho pronto — `--forcar` se for de propósito.",
+                  file=sys.stderr)
+            return 3
+        parcial = plano.read_text(encoding="utf-8", errors="replace")[-2000:]
+        plano.rename(plano.with_suffix(f".parcial{w.get('tentativas', 1)}.md"))
+    elif Path(w["log"]).exists():
+        # Sem plano no disco, o log é o que sobrou do que ele pensou.
+        parcial = Path(w["log"]).read_text(encoding="utf-8", errors="replace")[-1500:]
+
+    novo = despacha(ia, a.braco or w["braco"], e, w["papel"], parcial)
+    novo["tentativas"] = w.get("tentativas", 1) + 1
+    e["workers"][ia] = novo
+    e["estado"] = "planejando"
+    grava_estado(e)
+    print(f"♻️  {ia} redisparado · pid {novo['pid']} · tentativa {novo['tentativas']}"
+          f"{' · retomando ' + str(len(parcial)) + ' B do parcial' if parcial else ' · do zero'}")
+    return 0
+
+
+# ---------------------------------------------------------------- /decidi
+def cmd_decidi(a) -> int:
+    """Delega ao `iachat-decide`, que já é o registro. Duplicar seria criar um segundo
+    lugar onde a mesma decisão pode estar diferente."""
+    if not DECIDE.is_file():
+        print(f"✗ {DECIDE} não existe — o registro de decisões é dele, não deste comando.",
+              file=sys.stderr)
+        return 2
+    de = core.normaliza_ia(a.de)
+    if a.anunciar and de not in sala():
+        # `iachat-decide --anunciar` chama core.post(de,...), que exige `de` na sala
+        # (iachat_core.py:258-262). Com --de bauer isso seria um traceback; barrar aqui
+        # é mais honesto do que deixar a decisão gravar e o anúncio explodir depois.
+        print(f"✗ '{de}' não está na sala {sala()}: `--anunciar` só funciona para quem "
+              f"pode postar. Grave sem `--anunciar` e anuncie pela orquestradora.",
+              file=sys.stderr)
+        return 2
+
+    argv = [sys.executable, str(DECIDE), "decidir", "--de", de]
+    for flag, val in (("--porque", a.porque), ("--sobre", a.sobre), ("--anunciar", a.anunciar)):
+        if val:
+            argv += [flag, val]
+    for r in a.revoga or []:
+        argv += ["--revoga", r]
+    argv += list(a.texto)
+    r = subprocess.run(argv, text=True)
+    return r.returncode
+
+
+# ---------------------------------------------------------------- main
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="iachat-comando", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    def dono(p):
+        p.add_argument("--de", default="bauer", help="quem comanda (padrão: bauer)")
+        p.add_argument("--calado", action="store_true", help="não postar na sala")
+        return p
+
+    p = dono(sub.add_parser("goal", help="o enunciado: o objetivo que ele explica"))
+    p.add_argument("--novo", action="store_true", help="abre missão nova mesmo com worker vivo")
+    p.add_argument("texto", nargs="*")
+    p.set_defaults(f=cmd_goal)
+
+    p = dono(sub.add_parser("plan", help="a frota ativa planeja junta e devolve na sala"))
+    p.add_argument("--ias", action="append", help="quem planeja (padrão: a sala menos o brain)")
+    p.add_argument("--braco", help="forçar um braço para todas (codex, kimi, agy…)")
+    p.add_argument("--colher", action="store_true", help="ler os planos e devolver na sala")
+    p.add_argument("--esperar", type=int, metavar="SEG", help="bloquear até entregarem, e colher")
+    p.add_argument("--seco", action="store_true", help="mostrar quem seria despachado, sem gastar")
+    p.add_argument("--forcar", action="store_true", help="despachar por cima de worker vivo")
+    p.set_defaults(f=cmd_plan)
+
+    p = dono(sub.add_parser("concluir", help="autorizado: pode aplicar"))
+    p.add_argument("--para", action="append", help="quem fica autorizado a aplicar")
+    p.add_argument("--forcar", action="store_true", help="autorizar sem plano no disco")
+    p.add_argument("texto", nargs="*", help="a nota da autorização")
+    p.set_defaults(f=cmd_concluir)
+
+    p = dono(sub.add_parser("parar", help="abortar a missão em andamento"))
+    p.add_argument("--ia", action="append", help="só esta(s) (padrão: todas da missão)")
+    p.add_argument("--forte", action="store_true", help="SIGKILL em vez de SIGTERM")
+    p.add_argument("--espera", type=float, default=2.0, help="segundos até conferir se saiu")
+    p.set_defaults(f=cmd_parar)
+
+    p = sub.add_parser("quem", help="quem está vivo, fazendo o quê, há quanto tempo")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(f=cmd_quem)
+
+    p = sub.add_parser("refaz", help="redisparar worker morto, de onde parou")
+    p.add_argument("--ia", required=True)
+    p.add_argument("--braco", help="trocar de braço na retomada")
+    p.add_argument("--forcar", action="store_true", help="mesmo vivo ou com plano entregue")
+    p.set_defaults(f=cmd_refaz)
+
+    p = sub.add_parser("decidi", help="registrar decisão que todas obedecem")
+    p.add_argument("--de", default="bauer")
+    p.add_argument("--porque", help="o motivo — obrigatório (gate do iachat-decide)")
+    p.add_argument("--sobre", help="assunto, uma palavra")
+    p.add_argument("--revoga", action="append", help="D3 (repetível)")
+    p.add_argument("--anunciar", help="também postar na sala, nomeando esta IA")
+    p.add_argument("texto", nargs="*")
+    p.set_defaults(f=cmd_decidi)
+
+    a = ap.parse_args()
+    try:
+        return a.f(a)
+    except ValueError as e:
+        print(f"✗ {e}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

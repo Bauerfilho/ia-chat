@@ -1,0 +1,347 @@
+#!/usr/bin/env python3
+"""ia-vacuum — recolhe o lixo que o ia-chat produz, sem encostar no que é dado.
+
+O plugin deixa resto em três lugares: os `.bak-iachat-*` que o instalador do hook
+cria a cada mudança de estado, os logs append-only do sino, e os `.tmp` que sobram
+quando a escrita atômica morre no meio. Nada disso tem dono — ninguém recolhe.
+
+Uso:  iachat-vacuum [--apagar] [--incluir-hoje] [--manter N] [--json]
+
+DRY-RUN É O PADRÃO. Sem `--apagar` ele só mostra o plano; o plano é o MESMO objeto
+que a execução consome, então o ensaio não pode divergir do ato.
+
+O QUE ELE NUNCA TOCA, e por quê (isto é o desenho, não cautela decorativa):
+
+  arquivo/*.md   Recorte é imutável e a numeração dele nasce da CONTAGEM de arquivos
+                 na pasta — `iachat_core.py:422 rotate()` faz `nn = len(_recortes()) + 1`
+                 e grava com `write_text` puro, sem checar existência. Apagar o
+                 recorte-01 faz a próxima rotação renumerar para 02 e SOBRESCREVER em
+                 silêncio o recorte-02 do mesmo dia. Fora isso, cada recorte tem uma
+                 marca viva no ativo apontando `arquivo/<nome>`: apagar o alvo deixa o
+                 ponteiro pendurado e quebra o `iachat search`. Histórico não é lixo.
+
+  pendente/<ia>  Flag de pendente é MENSAGEM NÃO LIDA, não resto. `post()` grava uma
+                 por nominado e `marca_lida()` apaga ao ler (`iachat_core.py:308-315`).
+                 É limitada a uma por IA na sala — não acumula. Só vira órfã quando a
+                 IA sai de `config.json:na_sala`: aí `post()` nunca mais a reescreve
+                 (destinos são filtrados por `x in sala`) e nenhum `read` a consome —
+                 fica estruturalmente morta. E mesmo essa é copiada inteira para o
+                 registro antes de sumir: o recado não se perde, muda de lugar.
+
+  *.bak sem      Os `.bak-iachat-*` dividem diretório com backups de outras ferramentas
+  `-iachat-`     da casa. Medido em 17/08: 17 arquivos `.bak*` em ~/.claude + ~/.kimi-code,
+                 e só 2 são do ia-chat. Um glob `*.bak*` levaria junto o
+                 `config.toml.bak-antes-oauth-20260813`. O glob aqui é estrito, sempre.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import sys
+from datetime import datetime
+from pathlib import Path
+
+# ── Política de retenção ─────────────────────────────────────────────────────
+# 8 backups é o número da casa: `~/.claude/scripts/backup-claude.sh:17 KEEP_LOCAL=8`
+# (e o backup.sh guarda 10). Contagem, não idade — porque a idade de um backup do
+# ia-chat mente: `ia-bell-install-hook.py:61` usa `shutil.copy2`, que PRESERVA o mtime
+# do original. Medido no disco: o backup chamado `...bak-iachat-20260817-204719` tem
+# mtime de 16/08 18:44. Ordenar por `ls -t`, como os scripts da casa fazem, ordenaria
+# errado. Aqui a ordem sai do carimbo NO NOME, que é a hora real do backup.
+MANTER_BACKUPS = 8
+LOG_MANTER_LINHAS = 200   # cauda que sobra do .log; o resto é ruído já entregue
+TMP_IDADE_MIN = 60        # .tmp mais novo que isto pode ser escrita em curso
+OUTERR_TETO_BYTES = 65536 # .out/.err só recebem atenção acima disto
+
+MARCA_VAC = "# ia-vacuum recortou em "  # cabeçalho do log; não conta como linha
+RE_BAK = re.compile(r"^(?P<base>.+)\.bak-iachat-(?P<ts>\d{8}-\d{6})$")
+ALVOS_BAK = (
+    (Path.home() / ".claude", "settings.json"),
+    (Path.home() / ".kimi-code", "config.toml"),
+)
+
+
+def home() -> Path:
+    """Mesma raiz do core (`iachat_core.py:52`) — IACHAT_HOME manda, se existir."""
+    return Path(os.environ.get("IACHAT_HOME", "~/ia-chat-global")).expanduser()
+
+
+class Acao:
+    """Uma decisão sobre um arquivo. O dry-run e a execução consomem a MESMA lista."""
+
+    def __init__(self, zona: str, alvo: Path, verbo: str, motivo: str, bytes_: int):
+        self.zona, self.alvo, self.verbo = zona, alvo, verbo
+        self.motivo, self.bytes = motivo, bytes_
+
+    def __repr__(self) -> str:
+        return f"{self.verbo:9} {self.alvo}  ({self.motivo})"
+
+
+# ── Planejamento: uma função por zona, nenhuma delas escreve nada ────────────
+
+def _plano_backups(incluir_hoje: bool, manter: int) -> tuple[list[Acao], list[str]]:
+    acoes, notas = [], []
+    hoje = datetime.now().strftime("%Y%m%d")
+    for pasta, base in ALVOS_BAK:
+        if not pasta.is_dir():
+            continue
+        familia = []
+        for p in pasta.glob(f"{base}.bak-iachat-*"):
+            m = RE_BAK.match(p.name)
+            if m and m.group("base") == base:  # glob estrito + nome conferido
+                familia.append((m.group("ts"), p))
+        if not familia:
+            continue
+        familia.sort(reverse=True)  # carimbo do NOME, não mtime — ver nota da política
+        notas.append(f"{pasta}/{base}: {len(familia)} backup(s)")
+
+        for i, (ts, p) in enumerate(familia):
+            if i == 0:
+                continue  # o mais recente da família nunca sai. Regra dura.
+            if i < manter:
+                continue  # dentro da cota de retenção
+            if ts[:8] == hoje and not incluir_hoje:
+                notas.append(
+                    f"  ↷ {p.name} passou da cota mas é de HOJE — preservado "
+                    f"(use --incluir-hoje para recolher)"
+                )
+                continue
+            acoes.append(
+                Acao("backup", p, "apagar",
+                     f"#{i+1} da família, cota é {manter}, carimbo {ts}",
+                     p.stat().st_size)
+            )
+    return acoes, notas
+
+
+def _plano_logs() -> tuple[list[Acao], list[str]]:
+    acoes, notas = [], []
+    h = home()
+    for p in sorted(h.glob("ia-bell-*.log")):
+        # A própria marca do vacuum não entra na conta. Sem isso o cabeçalho que ele
+        # escreve empurra o arquivo para 201 linhas e a rodada seguinte recorta de novo,
+        # eternamente — foi o que o teste de 17/08 pegou na 2ª rodada.
+        linhas = [l for l in p.read_text(encoding="utf-8", errors="replace").splitlines()
+                  if not l.startswith(MARCA_VAC)]
+        if len(linhas) <= LOG_MANTER_LINHAS:
+            notas.append(f"{p.name}: {len(linhas)} linhas ≤ {LOG_MANTER_LINHAS}, intacto")
+            continue
+        sobra = sum(len(l.encode()) + 1 for l in linhas[:-LOG_MANTER_LINHAS])
+        acoes.append(
+            Acao("log", p, "recortar",
+                 f"{len(linhas)} linhas → guarda as últimas {LOG_MANTER_LINHAS}", sobra)
+        )
+
+    # .out/.err são de OUTRO dono: o launchd abre e SEGURA o descritor
+    # (`ia-bell-install-daemon.sh:38-39` põe StandardOutPath/StandardErrorPath, e o
+    # `lsof` de 17/08 mostrou `bash 49797` com fd 1u e 2u nesses inodes). Apagar não
+    # libera espaço nenhum: o inode fica vivo preso ao fd e o arquivo só reaparece no
+    # próximo restart. Por isso o verbo aqui é zerar, nunca apagar.
+    for p in sorted(list(h.glob("ia-bell-*.out")) + list(h.glob("ia-bell-*.err"))):
+        tam = p.stat().st_size
+        if tam <= OUTERR_TETO_BYTES:
+            notas.append(f"{p.name}: {tam} B ≤ {OUTERR_TETO_BYTES}, intacto")
+            continue
+        acoes.append(
+            Acao("log", p, "zerar",
+                 f"{tam} B acima do teto; launchd segura o fd, então trunca (não apaga)",
+                 tam)
+        )
+    return acoes, notas
+
+
+def _plano_tmp() -> tuple[list[Acao], list[str]]:
+    """Resto de `_escrever_atomico` (`iachat_core.py:140-148`) que morreu antes do replace.
+
+    Só é órfão se o alvo final existe (o replace de outra rodada já completou) e se o
+    .tmp é velho o bastante para não ser escrita em curso.
+    """
+    acoes, notas, agora = [], [], datetime.now().timestamp()
+    for p in sorted(home().rglob("*.tmp")):
+        if p.parent.name == "arquivo":
+            continue  # zona proibida, sem exceção
+        idade_min = (agora - p.stat().st_mtime) / 60
+        final = p.with_suffix("")  # tira só o ".tmp"
+        if idade_min < TMP_IDADE_MIN:
+            notas.append(f"{p.name}: {idade_min:.0f} min — pode ser escrita em curso, intacto")
+        elif not final.exists():
+            notas.append(f"{p.name}: alvo {final.name} NÃO existe — pode ser o único dado, intacto")
+        else:
+            acoes.append(
+                Acao("tmp", p, "apagar",
+                     f"órfão há {idade_min:.0f} min; alvo {final.name} existe",
+                     p.stat().st_size)
+            )
+    return acoes, notas
+
+
+def _plano_pendente() -> tuple[list[Acao], list[str]]:
+    acoes, notas = [], []
+    cfg_p = home() / "config.json"
+    try:
+        sala = {str(x).strip().lstrip("@").lower()
+                for x in json.loads(cfg_p.read_text(encoding="utf-8")).get("na_sala", [])}
+    except (OSError, json.JSONDecodeError) as e:
+        # Sem saber quem está na sala, TODA flag é potencialmente recado vivo.
+        return [], [f"não li {cfg_p} ({e}) — não julgo nenhuma flag sem a lista da sala"]
+
+    for p in sorted((home() / "pendente").glob("*.md")):
+        ia = p.stem.lower()
+        if ia in sala:
+            notas.append(f"pendente/{p.name}: '{ia}' está na sala — é RECADO NÃO LIDO, intacto")
+        else:
+            acoes.append(
+                Acao("pendente", p, "apagar",
+                     f"'{ia}' não está em na_sala={sorted(sala)}; nenhum post reescreve "
+                     f"nem read consome — conteúdo copiado para o registro",
+                     p.stat().st_size)
+            )
+    return acoes, notas
+
+
+def planejar(incluir_hoje: bool, manter: int) -> tuple[list[Acao], list[str]]:
+    acoes, notas = [], []
+    for f in (lambda: _plano_backups(incluir_hoje, manter), _plano_logs,
+              _plano_tmp, _plano_pendente):
+        a, n = f()
+        acoes += a
+        notas += n
+    # A zona proibida aparece no relatório de propósito: um leitor precisa VER que ela
+    # foi considerada e deixada em paz. Proteção que não se enxerga não se audita.
+    n_rec = len(list((home() / "arquivo").glob("*.md")))
+    notas.append(f"arquivo/: {n_rec} recorte(s) — zona proibida, nunca entra no plano")
+    return acoes, notas
+
+
+# ── Execução ─────────────────────────────────────────────────────────────────
+
+def _registrar(linhas: list[str]) -> Path:
+    """Append-only. Nada sai do disco sem uma linha aqui dizendo o quê e por quê."""
+    reg = home() / ".vacuum.log"
+    with reg.open("a", encoding="utf-8") as f:
+        f.writelines(l + "\n" for l in linhas)
+        f.flush()
+        os.fsync(f.fileno())
+    return reg
+
+
+def executar(acoes: list[Acao]) -> list[str]:
+    ts = datetime.now().astimezone().isoformat(timespec="seconds")
+    linhas, feitas = [], []
+    for a in acoes:
+        try:
+            if a.verbo == "apagar":
+                if a.zona == "pendente":  # o recado vira registro antes de sumir
+                    corpo = a.alvo.read_text(encoding="utf-8", errors="replace")
+                    linhas += [f"[{ts}] conteúdo de {a.alvo}:"]
+                    linhas += [f"[{ts}]   | {l}" for l in corpo.splitlines()]
+                a.alvo.unlink()
+            elif a.verbo == "recortar":
+                txt = [l for l in a.alvo.read_text(encoding="utf-8",
+                                                   errors="replace").splitlines()
+                       if not l.startswith(MARCA_VAC)]  # marca antiga não se acumula
+                cauda = txt[-LOG_MANTER_LINHAS:]
+                # tmp + replace: o daemon reabre o log a cada `echo >>`
+                # (`ia-bell-daemon.sh:69`), então ele passa a escrever no inode novo.
+                # Janela de corrida: uma linha escrita entre o read e o replace se perde.
+                # É aceito — a perda máxima é uma linha de aviso já entregue por
+                # notificação, e o alvo nunca é o chat, só o log do sino.
+                tmp = a.alvo.with_suffix(a.alvo.suffix + ".vac")
+                tmp.write_text(
+                    f"{MARCA_VAC}{ts}: guardadas as últimas "
+                    f"{len(cauda)} de {len(txt)} linhas\n" + "\n".join(cauda) + "\n",
+                    encoding="utf-8",
+                )
+                os.replace(tmp, a.alvo)
+            elif a.verbo == "zerar":
+                with a.alvo.open("r+b") as f:  # trunca mantendo o inode do launchd
+                    f.truncate(0)
+            else:
+                raise ValueError(f"verbo desconhecido: {a.verbo}")
+        except OSError as e:
+            linhas.append(f"[{ts}] FALHOU {a.verbo} {a.alvo} — {e}")
+            continue
+        feitas.append(a)
+        linhas.append(f"[{ts}] {a.verbo} {a.alvo} · {a.bytes} B · {a.motivo}")
+
+    if linhas:
+        _registrar(linhas)
+    (home() / ".vacuum.json").write_text(
+        json.dumps({"em": ts, "acoes": len(feitas),
+                    "bytes": sum(a.bytes for a in feitas)}, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    return [f"{a.verbo} {a.alvo}" for a in feitas]
+
+
+def _ultima_rodada() -> str | None:
+    try:
+        d = json.loads((home() / ".vacuum.json").read_text(encoding="utf-8"))
+        return f"{d['em']} ({d['acoes']} ação(ões), {d['bytes']} B)"
+    except (OSError, KeyError, json.JSONDecodeError):
+        return None
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    if "-h" in args or "--help" in args:
+        print(__doc__)
+        return 0
+    apagar = "--apagar" in args
+    incluir_hoje = "--incluir-hoje" in args
+    como_json = "--json" in args
+    manter = int(args[args.index("--manter") + 1]) if "--manter" in args else MANTER_BACKUPS
+
+    if not home().is_dir():
+        print(f"✗ não achei a sala em {home()}", file=sys.stderr)
+        return 2
+
+    acoes, notas = planejar(incluir_hoje, manter)
+    total = sum(a.bytes for a in acoes)
+
+    if como_json:
+        print(json.dumps({
+            "rodou": bool(acoes) and apagar,
+            "modo": "apagar" if apagar else "dry-run",
+            "acoes": [{"zona": a.zona, "alvo": str(a.alvo), "verbo": a.verbo,
+                       "motivo": a.motivo, "bytes": a.bytes} for a in acoes],
+            "bytes": total, "ultima_rodada": _ultima_rodada(),
+        }, ensure_ascii=False, indent=2))
+        if apagar and acoes:
+            executar(acoes)
+        return 0
+
+    print(f"🧹 ia-vacuum · sala {home()} · modo "
+          f"{'APAGAR' if apagar else 'dry-run (nada será tocado)'}")
+    if notas:
+        print("\n── o que fica, e por quê ──")
+        for n in notas:
+            print(f"  · {n}")
+
+    if not acoes:
+        # Idempotência: a segunda rodada do dia não encontra nada porque a primeira
+        # já recolheu — e ela DIZ isso, com a data da anterior. Mesmo contrato do
+        # `rotate()` (`iachat_core.py:422`), que devolve {"rodou": False, "motivo": ...}.
+        antes = _ultima_rodada()
+        print("\n= nada elegível: o lixo recolhível já foi recolhido.")
+        print(f"  última rodada com efeito: {antes}" if antes
+              else "  nunca rodou com --apagar nesta sala.")
+        return 0
+
+    print(f"\n── plano: {len(acoes)} ação(ões), {total} B ──")
+    for a in acoes:
+        print(f"  [{a.zona}] {a.verbo.upper():9} {a.alvo}")
+        print(f"            └─ {a.motivo} · {a.bytes} B")
+
+    if not apagar:
+        print(f"\nDry-run. Para executar exatamente este plano: iachat-vacuum --apagar")
+        return 0
+
+    feitas = executar(acoes)
+    print(f"\n✔ {len(feitas)} de {len(acoes)} executada(s) · registro em {home()}/.vacuum.log")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

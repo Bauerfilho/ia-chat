@@ -1,0 +1,238 @@
+#!/usr/bin/env python3
+"""ia-budget — quem gasta quanto da janela alheia na sala das IAs.
+
+POR QUE ISTO NÃO É UM LEDGER:
+a sala já registra tudo o que a conta precisa. O metadado de cada mensagem
+(`<!-- iachat msg=N de=X para=Y ts=Z -->`, iachat_core.py:30) diz o autor, os
+destinatários e a hora; o `bruto` diz o tamanho. Orçamento aqui é uma LEITURA
+derivada, não um registro paralelo — nada é escrito, nada desincroniza, e o
+relatório de ontem continua correto depois de uma rotação porque a varredura
+cobre os recortes imutáveis igual ao `buscar` (iachat_core.py:545).
+
+A UNIDADE É BYTE-DE-JANELA, NÃO BYTE ESCRITO:
+a leitura é dirigida (iachat_core.py:317) — cada IA recebe só o que a nomina.
+Então o custo que uma mensagem IMPÕE é `len(bruto) × len(para)`: 4 KB para três
+IAs custam 12 KB de janela alheia. Medido na sala real em 17/08, essa unidade é
+mais severa que o volume bruto para quem faz multicast, e é a que dói. O volume
+escrito continua na tabela como coluna auxiliar, porque as duas contam histórias
+diferentes e esconder uma seria escolher o número que convém.
+
+O FREIO NUNCA BLOQUEIA. Ver `check`.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from collections import defaultdict
+from datetime import datetime, timedelta
+from pathlib import Path
+
+# O destino desta peça é `bin/` do ia-chat, ao lado do núcleo. O segundo path deixa
+# o protótipo rodar de fora do repositório sem duplicar o parser.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(1, str(Path.home() / "Projetos" / "ia-chat" / "bin"))
+import iachat_core as core  # noqa: E402
+
+# Fração do teto da sala que UMA IA pode impor por dia, quando o config não diz outra
+# coisa. Não é número mágico: é `teto_bytes / nº de IAs na sala` — a divisão igual do
+# espaço que a sala aguenta antes da rotação cortar (iachat_core.py:430). Quem estoura
+# está consumindo a cota das outras, e é exatamente isso que a conta mostra.
+COTA_CHAVE = "cota_diaria_bytes"
+
+
+def _cota_diaria(cfg: dict) -> tuple[int, str]:
+    """Devolve (bytes, origem) — a origem entra no relatório para o número ser auditável."""
+    if cfg.get(COTA_CHAVE):
+        return int(cfg[COTA_CHAVE]), f"config.json:{COTA_CHAVE}"
+    teto = int(cfg.get("teto_bytes", 204800))
+    n = max(1, len(cfg.get("na_sala", [])))
+    return teto // n, f"teto_bytes({teto}) ÷ {n} IAs"
+
+
+def coletar(dias: int | None = None, dia: str | None = None) -> list[dict]:
+    """Todas as mensagens do ativo E dos recortes, opcionalmente filtradas por data.
+
+    Varre os recortes porque o histórico não deixa de ter custado quando foi arquivado.
+    Sem lock: leitura pura, e o pior caso de uma corrida é perder a última mensagem de
+    uma conta que é estatística — travar a sala para tirar extrato seria pior.
+    """
+    corte = None
+    if dias is not None:
+        corte = (datetime.now().astimezone() - timedelta(days=dias)).isoformat()[:10]
+    fontes = core._recortes()
+    if dia or corte:
+        # O nome do recorte carrega a data em que a rotação RODOU (iachat_core.py:455).
+        # Um recorte fechado ANTES do dia pedido não pode conter mensagem daquele dia,
+        # porque a rotação corta sempre as mais antigas. Descartar esses pelo NOME evita
+        # ler o histórico inteiro a cada `check` — que é chamado a cada post.
+        limite = dia or corte
+        fontes = [p for p in fontes if p.stem[7:17] >= limite]
+    msgs = []
+    for p in fontes + [core.p_chat()]:
+        try:
+            txt = p.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for m in core.parse(txt):
+            d = m["ts"][:10]
+            if dia and d != dia:
+                continue
+            if corte and d < corte:
+                continue
+            msgs.append(
+                {
+                    "n": m["n"],
+                    "de": m["de"],
+                    "para": m["para"],
+                    "dia": d,
+                    "ts": m["ts"][:16],
+                    "escrito": len(m["bruto"].encode()),
+                    # O custo imposto: um byte por destinatário que vai carregá-lo.
+                    # Sem nominação ninguém é obrigado a ler — custa 0 de janela alheia,
+                    # e o `post` já avisa que a mensagem não chamou ninguém
+                    # (iachat_core.py:261).
+                    "imposto": len(m["bruto"].encode()) * len(m["para"]),
+                }
+            )
+    return msgs
+
+
+def contas(msgs: list[dict], sala: list[str]) -> dict:
+    """Escrito, imposto e recebido por IA. Saldo = o que impôs menos o que carregou."""
+    z = lambda: {"msgs": 0, "escrito": 0, "imposto": 0, "recebido": 0}  # noqa: E731
+    por = defaultdict(z)
+    for m in msgs:
+        a = por[m["de"]]
+        a["msgs"] += 1
+        a["escrito"] += m["escrito"]
+        a["imposto"] += m["imposto"]
+        for d in m["para"]:
+            por[d]["recebido"] += m["escrito"]
+    for ia in sala:
+        por[ia]  # garante linha para quem não falou — silêncio também é informação
+    for a in por.values():
+        a["saldo"] = a["imposto"] - a["recebido"]
+        a["media"] = a["escrito"] // a["msgs"] if a["msgs"] else 0
+    return dict(por)
+
+
+def _barra(frac: float, largura: int = 20) -> str:
+    cheio = max(0, min(largura, round(frac * largura)))
+    return "█" * cheio + "·" * (largura - cheio)
+
+
+def cmd_report(a) -> int:
+    cfg = core.config()
+    sala = [core.normaliza_ia(x) for x in cfg.get("na_sala", [])]
+    msgs = coletar(dias=a.dias, dia=a.dia)
+    if not msgs:
+        print("(nenhuma mensagem no período)")
+        return 0
+    por = contas(msgs, sala)
+    cota, origem = _cota_diaria(cfg)
+    total_e = sum(x["escrito"] for x in por.values())
+    total_i = sum(x["imposto"] for x in por.values())
+    dias_vistos = sorted({m["dia"] for m in msgs})
+
+    if a.json:
+        print(json.dumps(
+            {"periodo": dias_vistos, "cota_diaria": cota, "origem_cota": origem,
+             "total_escrito": total_e, "total_imposto": total_i, "por_ia": por},
+            ensure_ascii=False, indent=2))
+        return 0
+
+    periodo = dias_vistos[0] if len(dias_vistos) == 1 else f"{dias_vistos[0]}…{dias_vistos[-1]}"
+    print(f"📊 ia-chat · orçamento · {periodo} · {len(msgs)} mensagens")
+    print(f"   cota diária por IA: {cota} B  ({origem})")
+    print()
+    print("   IA        msgs   escrito     média    IMPOSTO   recebido      saldo")
+    print("   ───────────────────────────────────────────────────────────────────")
+    for ia, x in sorted(por.items(), key=lambda kv: -kv[1]["imposto"]):
+        pct_i = 100 * x["imposto"] / total_i if total_i else 0
+        print(f"   {ia:<9}{x['msgs']:>5}{x['escrito']:>10}{x['media']:>10}"
+              f"{x['imposto']:>11}{x['recebido']:>11}{x['saldo']:>+11}"
+              f"   {pct_i:>4.0f}% da janela imposta")
+    print("   ───────────────────────────────────────────────────────────────────")
+    print(f"   {'TOTAL':<9}{len(msgs):>5}{total_e:>10}{'':>10}{total_i:>11}")
+    print()
+
+    # Cota: por IA e por DIA, porque um teto de período esconde o dia em que estourou.
+    print("   cota diária (imposto/dia · o freio avisa, nunca bloqueia)")
+    por_dia = defaultdict(lambda: defaultdict(int))
+    for m in msgs:
+        por_dia[m["dia"]][m["de"]] += m["imposto"]
+    for d in dias_vistos:
+        for ia, v in sorted(por_dia[d].items(), key=lambda kv: -kv[1]):
+            frac = v / cota if cota else 0
+            sinal = "🟢" if frac < 0.8 else ("🟡" if frac < 1.0 else "🔴")
+            print(f"   {d}  {ia:<8} {_barra(frac)} {v:>7} B  {100*frac:>5.1f}%  {sinal}")
+    print()
+
+    caras = sorted(msgs, key=lambda m: -m["imposto"])[: a.top]
+    print("   a mensagem mais cara em janela alheia" if len(caras) == 1
+          else f"   as {len(caras)} mensagens mais caras em janela alheia")
+    for m in caras:
+        alvo = ",".join(m["para"]) or "—"
+        print(f"   #{m['n']:<4}{m['de']:<8}→ {alvo:<14}{m['escrito']:>6} B ×{len(m['para'])}"
+              f" = {m['imposto']:>7} B   {m['ts']}")
+    return 0
+
+
+def cmd_check(a) -> int:
+    """O freio. Diz o estado da cota e SEMPRE devolve 0 — nunca impede uma mensagem.
+
+    A escolha é assimétrica e o desenho do produto a impõe: a sala é o ÚNICO canal
+    entre janelas cegas (BRIEFING). Uma IA barrada aqui não tem por onde pedir para
+    ser liberada — o pedido teria que passar por este mesmo canal. Bloquear troca um
+    gasto de tokens, que é contável e recuperável, por um deadlock de comunicação,
+    que não é nenhum dos dois. Então o freio é informação: quem estourou fica sabendo,
+    e a próxima linha do relatório mostra para o dono quem não corrigiu.
+    """
+    cfg = core.config()
+    ia = core.normaliza_ia(a.de)
+    cota, origem = _cota_diaria(cfg)
+    hoje = datetime.now().astimezone().isoformat()[:10]
+    gasto = sum(m["imposto"] for m in coletar(dia=hoje) if m["de"] == ia)
+    # O que a mensagem em curso vai somar, quando o chamador informa.
+    projetado = gasto + (a.tamanho or 0) * max(1, a.destinos)
+    frac = projetado / cota if cota else 0
+    if a.json:
+        print(json.dumps({"ia": ia, "dia": hoje, "gasto": gasto, "projetado": projetado,
+                          "cota": cota, "origem": origem, "fracao": round(frac, 3)},
+                         ensure_ascii=False))
+        return 0
+    if frac >= 1.0:
+        print(f"🔴 {ia} passou a cota do dia: {projetado} B de {cota} B "
+              f"({100*frac:.0f}%) de janela alheia. Grave o detalhe num arquivo e poste "
+              f"o RESUMO + o caminho absoluto — a mensagem vai assim mesmo.", file=sys.stderr)
+    elif frac >= 0.8:
+        print(f"🟡 {ia}: {projetado} B de {cota} B ({100*frac:.0f}%) da cota do dia.",
+              file=sys.stderr)
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="ia-budget", description=__doc__)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("report", help="quem gastou quanto de janela alheia")
+    p.add_argument("--dias", type=int, help="últimos N dias (padrão: tudo)")
+    p.add_argument("--dia", help="um dia só, ISO: 2026-08-17")
+    p.add_argument("--top", type=int, default=3, help="quantas mensagens caras listar")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(f=cmd_report)
+
+    p = sub.add_parser("check", help="estado da cota de uma IA (nunca bloqueia)")
+    p.add_argument("--de", required=True)
+    p.add_argument("--tamanho", type=int, default=0, help="bytes da mensagem em curso")
+    p.add_argument("--destinos", type=int, default=1, help="quantas IAs vão carregá-la")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(f=cmd_check)
+
+    a = ap.parse_args()
+    return a.f(a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

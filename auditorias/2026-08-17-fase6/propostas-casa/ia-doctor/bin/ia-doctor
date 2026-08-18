@@ -1,0 +1,765 @@
+#!/usr/bin/env python3
+"""ia-doctor — diagnóstico da instalação do ia-chat em todas as cascas.
+
+Read-only por natureza: só lê disco, `ps` e `launchctl list`. Não instala, não
+conserta, não escreve na sala. Diagnóstico sem conserto é reclamação, então cada
+✗ vem com o passo que corrige — mas quem corrige é o dono, não este script.
+
+TRÊS DESFECHOS, nunca dois:
+
+    ok   ✓  medi e está certo
+    ✗       medi e está errado
+    ?   ⚠   NÃO CONSEGUI MEDIR
+
+Fundir o terceiro nos outros é a mentira que gerou os três defeitos que este
+programa existe para pegar:
+
+  1. skill no disco e no `extra_skill_dirs`, ausente do catálogo da sessão aberta
+     (config é lido no boot) — duas medições discordaram e ninguém disse "não sei";
+  2. hook instalado que não disparava (config mudou DEPOIS da sessão abrir);
+  3. `launchctl list | grep -q` sob `pipefail`: o grep sai no 1º casamento, o pipe
+     fecha, o launchctl morre de SIGPIPE (141), o pipeline vira falha e o instalador
+     NEGA um daemon que subiu.
+
+Por isso, aqui: nenhum `grep -q`, nenhum pipe. Toda saída de comando externo é
+capturada INTEIRA e só depois julgada — e o que não deu para medir sai como `?`.
+
+Uso:
+    ia-doctor                 # as cascas declaradas em config.json:na_sala
+    ia-doctor --todas         # + as cascas conhecidas presentes no disco
+    ia-doctor --casca kimi    # uma só
+    ia-doctor --json          # laudo machine-parseable
+    ia-doctor --repo CAMINHO  # compara o instalado com o repositório-fonte
+
+Saída: 0 se não houver nenhum ✗ (⚠ não reprova — ignorância não é defeito);
+1 se houver ✗; 2 se o próprio diagnóstico não pôde começar.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+# ─── contrato do plugin ──────────────────────────────────────────────────────
+SKILLS = (
+    "ia-chat-activate",
+    "ia-bell",
+    "ia-nomination",
+    "ia-storage",
+    "ia-brain",
+    "ia-search",
+    "ia-chat-consult",
+)
+BINARIOS = (
+    "iachat",
+    "iachat_core.py",
+    "ia-bell-daemon.sh",
+    "ia-bell-hook.sh",
+    "ia-bell-install-daemon.sh",
+    "ia-bell-install-hook.py",
+)
+EVENTOS = ("SessionStart", "UserPromptSubmit")
+HOOK = "ia-bell-hook.sh"
+RE_MSG = re.compile(rb"<!-- iachat msg=(\d+) ")
+
+# ─── registro de cascas ──────────────────────────────────────────────────────
+# Cada campo foi VERIFICADO nesta máquina em 2026-08-17; a fonte está no comentário.
+# `skills`: ("dir", caminho)   — a casca lê o diretório direto
+#           ("extra", arquivo) — a casca lê os caminhos de `extra_skill_dirs` do TOML
+# `hooks` : ("json", arquivo) | ("toml", arquivo) | None
+# `trust` : arquivo onde a casca guarda a aprovação do hook, ou None
+CASCAS = {
+    "claude": {
+        "raiz": "~/.claude",
+        "skills": ("dir", "~/.claude/skills"),          # install.sh:10
+        "hooks": ("json", "~/.claude/settings.json"),   # ia-bell-install-hook.py: alvo padrão
+        "trust": None,
+        "proc": "claude",
+    },
+    "kimi": {
+        "raiz": "~/.kimi-code",
+        "skills": ("extra", "~/.kimi-code/config.toml"),  # config.toml:6 extra_skill_dirs
+        "hooks": ("toml", "~/.kimi-code/config.toml"),    # config.toml:1119 [[hooks]]
+        "trust": None,                                    # instala_kimi(): "NÃO tem trust"
+        "proc": "kimi",
+    },
+    "codex": {
+        "raiz": "~/.codex",
+        "skills": ("dir", "~/.codex/skills"),        # ia-* são symlinks p/ ~/.claude/skills
+        "hooks": ("json", "~/.codex/hooks.json"),
+        "trust": "~/.codex/config.toml",             # [hooks.state."<arq>:<evento>:<g>:<h>"]
+        "proc": "codex",
+    },
+    "grok": {
+        "raiz": "~/.grok",
+        "skills": ("extra", "~/.grok/config.toml"),  # config.toml:111 extra_skill_dirs
+        "hooks": None,                               # nenhum [[hooks]] no config.toml
+        "trust": None,
+        "proc": "grok",
+    },
+    "qwen": {
+        "raiz": "~/.qwen",
+        "skills": ("dir", "~/.qwen/skills"),
+        "hooks": ("json", "~/.qwen/settings.json"),  # settings.json: chave "hooks"
+        "trust": None,
+        "proc": "qwen",
+    },
+}
+
+OK, FALHA, DUVIDA = "ok", "falhou", "?"
+SIMBOLO = {OK: "✓", FALHA: "✗", DUVIDA: "⚠"}
+
+
+class Laudo:
+    """Acumula vereditos. Um item = um desfecho de três + como foi medido."""
+
+    def __init__(self) -> None:
+        self.itens: list[dict] = []
+
+    def add(self, escopo, nome, estado, detalhe, como, passo=None) -> None:
+        self.itens.append(
+            {
+                "escopo": escopo,
+                "item": nome,
+                "estado": estado,
+                "detalhe": detalhe,
+                "como": como,
+                "passo": passo,
+            }
+        )
+
+    def placar(self) -> dict:
+        c = {OK: 0, FALHA: 0, DUVIDA: 0}
+        for i in self.itens:
+            c[i["estado"]] += 1
+        return c
+
+
+# ─── utilidades que NÃO mentem ───────────────────────────────────────────────
+def rodar(argv: list[str], timeout: int = 10) -> tuple[int | None, str, str]:
+    """Executa e devolve (rc, stdout, stderr) com a saída INTEIRA.
+
+    Sem pipe e sem shell — é exatamente a armadilha que derrubou o instalador do
+    daemon: `launchctl list | grep -q LABEL` mata o launchctl com SIGPIPE e, sob
+    `pipefail`, o pipeline reporta falha para um daemon que subiu. Aqui a saída
+    inteira vem para a memória e só depois é julgada.
+    rc=None significa "não consegui executar" → vira `?`, nunca `✗`.
+    """
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout, p.stderr
+    except (OSError, subprocess.SubprocessError) as e:
+        return None, "", str(e)
+
+
+def exp(p: str) -> Path:
+    return Path(os.path.expanduser(p))
+
+
+def mtime(p: Path) -> float | None:
+    try:
+        return p.stat().st_mtime
+    except OSError:
+        return None
+
+
+def hhmm(ts: float | None) -> str:
+    return "?" if ts is None else time.strftime("%d/%m %H:%M:%S", time.localtime(ts))
+
+
+def _etime_seg(s: str) -> int | None:
+    """`[[dd-]hh:]mm:ss` → segundos. `ps -o etimes` não existe no macOS e `lstart`
+    sai no locale do usuário (pt-BR aqui) — etime é numérico e não depende de locale."""
+    s = s.strip()
+    if not s:
+        return None
+    dias = 0
+    if "-" in s:
+        d, s = s.split("-", 1)
+        dias = int(d)
+    partes = [int(x) for x in s.split(":")]
+    while len(partes) < 3:
+        partes.insert(0, 0)
+    h, m, seg = partes[-3:]
+    return dias * 86400 + h * 3600 + m * 60 + seg
+
+
+def processos(nome: str) -> list[dict]:
+    """Processos vivos cujo executável se chama `nome`, com a hora em que abriram.
+
+    É o que permite separar "está certo no disco" de "vale para a sessão ABERTA":
+    Codex e Kimi leem config e catálogo de skills no boot.
+    """
+    rc, out, _ = rodar(["ps", "-Ao", "pid,etime,comm,args"])
+    if rc is None or rc != 0:
+        return []
+    agora = time.time()
+    achados = []
+    for linha in out.splitlines()[1:]:
+        campos = linha.split(None, 3)
+        if len(campos) < 3:
+            continue
+        pid, etime, comm = campos[0], campos[1], campos[2]
+        args = campos[3] if len(campos) > 3 else ""
+        if os.path.basename(comm) != nome:
+            continue
+        seg = _etime_seg(etime)
+        if seg is None:
+            continue
+        achados.append(
+            {"pid": int(pid), "inicio": agora - seg, "idade": seg, "args": args[:90]}
+        )
+    return sorted(achados, key=lambda x: x["inicio"])
+
+
+def frontmatter(p: Path) -> tuple[dict | None, str]:
+    """`name` e `description` do cabeçalho YAML — sem depender de biblioteca.
+
+    O contrato do plugin é frontmatter mínimo (`name` + `description`): é o que
+    funciona em toda casca. Aqui basta lê-lo, não interpretá-lo.
+    """
+    try:
+        txt = p.read_text(encoding="utf-8")
+    except OSError as e:
+        return None, f"ilegível: {e}"
+    if not txt.startswith("---"):
+        return None, "sem frontmatter (não começa com ---)"
+    fim = txt.find("\n---", 3)
+    if fim < 0:
+        return None, "frontmatter não fecha"
+    campos = {}
+    for linha in txt[3:fim].splitlines():
+        if ":" in linha and not linha.startswith((" ", "\t", "#")):
+            k, v = linha.split(":", 1)
+            campos[k.strip()] = v.strip()
+    return campos, ""
+
+
+def toml_carrega(p: Path) -> tuple[dict | None, str]:
+    try:
+        import tomllib
+    except ModuleNotFoundError:
+        return None, "sem tomllib (Python < 3.11)"
+    try:
+        return tomllib.loads(p.read_text(encoding="utf-8")), ""
+    except (OSError, Exception) as e:  # noqa: BLE001 — TOMLDecodeError herda de Exception
+        return None, f"{type(e).__name__}: {e}"
+
+
+def json_carrega(p: Path) -> tuple[dict | None, str]:
+    try:
+        return json.loads(p.read_text(encoding="utf-8")), ""
+    except OSError as e:
+        return None, f"ilegível: {e}"
+    except json.JSONDecodeError as e:
+        return None, f"JSON inválido: {e}"
+
+
+def comandos_de_hook(cfg: dict, formato: str) -> dict[str, list[str]]:
+    """Achata a config de hooks em {evento: [comandos]}, nos dois formatos vivos."""
+    saida: dict[str, list[str]] = {}
+    if formato == "json":
+        for ev, grupos in (cfg.get("hooks") or {}).items():
+            for g in grupos or []:
+                for h in g.get("hooks", []) or []:
+                    saida.setdefault(ev, []).append(h.get("command", ""))
+    else:  # toml: array de tabelas de topo `[[hooks]]` com `event` + `command`
+        for h in cfg.get("hooks", []) or []:
+            if isinstance(h, dict):
+                saida.setdefault(h.get("event", "?"), []).append(h.get("command", ""))
+    return saida
+
+
+# ─── bloco 1: a sala e o CLI ─────────────────────────────────────────────────
+def checa_sala(L: Laudo, sala: Path, scripts: Path, repo: Path | None) -> dict:
+    e = "sala"
+
+    # CLI no PATH — quem não acha o `iachat` não posta, e o hook cai fora em silêncio.
+    alvo = shutil.which("iachat")
+    if alvo:
+        L.add(e, "cli-no-path", OK, f"{alvo} → {os.path.realpath(alvo)}", "command -v iachat")
+    else:
+        L.add(e, "cli-no-path", FALHA, "`iachat` não resolve no PATH", "command -v iachat",
+              f"ln -sf {scripts}/iachat ~/.local/bin/iachat  (e ~/.local/bin no PATH)")
+
+    # O CLI responde de fato — arquivo existir não é o mesmo que executar.
+    # `status` não tem saída estruturada, então este item prova só uma coisa: o
+    # caminho que a IA usa de verdade roda e sai 0. Os NÚMEROS vêm de leitura direta
+    # do disco logo abaixo — medir duas vezes pela mesma boca não é medir duas vezes.
+    #
+    # E só rodo se a sala JÁ existir: `status` chama `garantir_estrutura()`, que CRIA
+    # diretórios e config. Um diagnóstico que fabrica o que deveria diagnosticar mente
+    # duas vezes — inventa o ok e apaga o defeito. Sala ausente ⇒ `?`, não `ok`.
+    exe = alvo or str(scripts / "iachat")
+    amb = dict(os.environ, IACHAT_HOME=str(sala))
+    if not (sala / "iachat.md").is_file():
+        rc, out, err = None, "", ("sala ainda não existe; não rodei o CLI porque "
+                                  "`status` a criaria, e este programa não escreve")
+    else:
+        try:
+            p = subprocess.run([exe, "status"], capture_output=True, text=True,
+                               timeout=20, env=amb)
+            rc, out, err = p.returncode, p.stdout, p.stderr
+        except (OSError, subprocess.SubprocessError) as ex:
+            rc, out, err = None, "", str(ex)
+
+    if rc is None:
+        L.add(e, "cli-responde", DUVIDA, f"não consegui executar: {err}", f"{exe} status")
+    elif rc != 0:
+        L.add(e, "cli-responde", FALHA, f"rc={rc} · {(err or out).strip()[:160]}",
+              f"{exe} status", "rode o comando à mão e leia o traceback")
+    elif not out.strip():
+        L.add(e, "cli-responde", DUVIDA, "saiu 0 mas não imprimiu nada", f"{exe} status")
+    else:
+        L.add(e, "cli-responde", OK, out.strip().splitlines()[1] if len(out.splitlines()) > 1
+              else "rc=0", f"{exe} status")
+
+    # Estrutura da sala.
+    faltando = [d for d in (".lock", "cursor", "pendente", "arquivo")
+                if not (sala / d).is_dir()]
+    faltando += [f for f in ("iachat.md", "config.json") if not (sala / f).is_file()]
+    if faltando:
+        L.add(e, "sala-estrutura", FALHA, "faltam: " + ", ".join(faltando),
+              f"test -d/-f em {sala}", f"IACHAT_HOME={sala} iachat status  (recria o que falta)")
+    else:
+        L.add(e, "sala-estrutura", OK, f"{sala} completa", f"test -d/-f em {sala}")
+
+    # Integridade: o contador rápido bate com o documento?
+    # `.estado.json` é a fonte barata do último número; se ele mentir, `post` numera
+    # em cima de mensagem existente. Comparar com a cauda do chat custa 16 KB.
+    est, erro_est = json_carrega(sala / ".estado.json")
+    ultimo_chat = None
+    try:
+        with (sala / "iachat.md").open("rb") as f:
+            f.seek(0, os.SEEK_END)
+            tam = f.tell()
+            f.seek(max(0, tam - 16384))
+            achados = RE_MSG.findall(f.read())
+        ultimo_chat = max((int(x) for x in achados), default=0)
+    except OSError as ex:
+        L.add(e, "sala-integra", DUVIDA, f"não li a cauda do chat: {ex}",
+              "tail -c 16384 iachat.md + regex <!-- iachat msg=N")
+    if ultimo_chat is not None:
+        if est is None and not (sala / ".estado.json").exists():
+            # Ausência não é corrupção: `_ultimo_numero()` recalcula pela cauda do chat.
+            # Numa sala nova isto é o estado correto, e chamar de ✗ seria alarme falso.
+            L.add(e, "sala-integra", DUVIDA,
+                  f".estado.json ainda não existe (chat termina em #{ultimo_chat}) — "
+                  "o número será recalculado pela cauda no próximo post",
+                  "json.loads(.estado.json) vs regex na cauda de iachat.md")
+        elif est is None:
+            L.add(e, "sala-integra", FALHA, f".estado.json {erro_est}; chat termina em #{ultimo_chat}",
+                  "json.loads(.estado.json) vs regex na cauda de iachat.md",
+                  "apague .estado.json — `_ultimo_numero()` o recalcula pela cauda")
+        elif int(est.get("ultima", -1)) != ultimo_chat:
+            L.add(e, "sala-integra", FALHA,
+                  f".estado.json diz #{est.get('ultima')}, o chat termina em #{ultimo_chat}",
+                  "json.loads(.estado.json) vs regex na cauda de iachat.md",
+                  "apague .estado.json (é cache, recalculado pela cauda no próximo post)")
+        else:
+            L.add(e, "sala-integra", OK, f"contador e documento em #{ultimo_chat}",
+                  "json.loads(.estado.json) vs regex na cauda de iachat.md")
+
+    # Config da sala: se ele não parseia, `config()` cai no padrão em silêncio e a
+    # sala passa a rodar com um teto que ninguém escolheu.
+    cfg, erro_cfg = json_carrega(sala / "config.json")
+    if cfg is None:
+        L.add(e, "sala-config", FALHA, erro_cfg, f"json.loads({sala}/config.json)",
+              f"IACHAT_HOME={sala} iachat status  (grava o padrão)"
+              if not (sala / "config.json").exists()
+              else "conserte o JSON à mão — `config()` cai no padrão e esconde o erro")
+    else:
+        # Chave ausente não é inofensiva: cada ponto do core cai num default DIFERENTE.
+        # `iachat_core.py:42` grava 204800, `:384` (status) assume 40960 e `:430` (rotate)
+        # assume 102400 — sem `teto_bytes` explícito, o status mede contra um teto e a
+        # rotação corta contra outro. Falta de chave é ✗, não detalhe.
+        faltam = [k for k in ("na_sala", "brain", "teto_bytes", "notificar_operador")
+                  if k not in cfg]
+        resumo = (f"brain={cfg.get('brain')} · teto={cfg.get('teto_bytes')} · "
+                  f"na_sala={', '.join(cfg.get('na_sala', []))} · "
+                  f"notificar_operador={cfg.get('notificar_operador')}")
+        if faltam:
+            L.add(e, "sala-config", FALHA,
+                  "chaves ausentes: " + ", ".join(faltam) + f" · {resumo}",
+                  f"json.loads({sala}/config.json)",
+                  "grave as chaves explicitamente — sem teto_bytes, status mede contra "
+                  "40960 (iachat_core.py:384) e rotate corta contra 102400 (:430)")
+        else:
+            L.add(e, "sala-config", OK, resumo, f"json.loads({sala}/config.json)")
+
+    # Teto: rotação é mecânica, mas ninguém a dispara sozinho.
+    tam = (sala / "iachat.md").stat().st_size if (sala / "iachat.md").is_file() else None
+    teto = (cfg or {}).get("teto_bytes")
+    if tam is None or not teto:
+        L.add(e, "sala-teto", DUVIDA, "sem tamanho do chat ou sem teto na config",
+              f"stat -f %z {sala}/iachat.md vs config.json:teto_bytes")
+    else:
+        pct = 100 * tam / teto
+        estado = OK if pct < 90 else FALHA
+        L.add(e, "sala-teto", estado, f"{tam} B = {pct:.0f}% do teto {teto} B",
+              f"stat -f %z {sala}/iachat.md vs config.json:teto_bytes",
+              "iachat rotate" if estado == FALHA else None)
+
+    # Instalado == repositório? Sem o repo à mão isto é `?`, não `ok`.
+    if repo is None:
+        L.add(e, "codigo-sincronizado", DUVIDA,
+              "repositório-fonte não informado (--repo) — não dá para comparar",
+              "sha256 de bin/* do repo vs " + str(scripts))
+    else:
+        difs, ausentes = [], []
+        for nome in BINARIOS:
+            a, b = repo / "bin" / nome, scripts / nome
+            if not a.is_file() or not b.is_file():
+                ausentes.append(nome)
+                continue
+            if hashlib.sha256(a.read_bytes()).hexdigest() != \
+               hashlib.sha256(b.read_bytes()).hexdigest():
+                difs.append(nome)
+        como = f"sha256 de {repo}/bin/* vs {scripts}/*"
+        if ausentes:
+            L.add(e, "codigo-sincronizado", DUVIDA, "sem par para comparar: " + ", ".join(ausentes), como)
+        elif difs:
+            L.add(e, "codigo-sincronizado", FALHA, "divergem: " + ", ".join(difs), como,
+                  f"{repo}/install.sh")
+        else:
+            L.add(e, "codigo-sincronizado", OK, f"{len(BINARIOS)}/{len(BINARIOS)} idênticos", como)
+
+    return cfg or {}
+
+
+# ─── bloco 2: cada casca ─────────────────────────────────────────────────────
+def dirs_de_skill(spec: tuple[str, str]) -> tuple[list[Path], str, str]:
+    """Devolve (diretórios, como_medi, erro). Erro não-vazio ⇒ desfecho `?`."""
+    tipo, caminho = spec
+    p = exp(caminho)
+    if tipo == "dir":
+        return ([p], f"ls {p}", "" if p.is_dir() else f"{p} não existe")
+    cfg, erro = toml_carrega(p)
+    como = f"tomllib.loads({p}) → extra_skill_dirs"
+    if cfg is None:
+        return ([], como, erro)
+    ds = cfg.get("extra_skill_dirs")
+    if not isinstance(ds, list) or not ds:
+        return ([], como, "`extra_skill_dirs` ausente ou vazio")
+    return ([exp(str(d)) for d in ds], como, "")
+
+
+def checa_casca(L: Laudo, ia: str, sala: Path, scripts: Path, na_sala: bool) -> None:
+    e = f"casca:{ia}"
+    reg = CASCAS[ia]
+    procs = processos(reg["proc"])
+    sessao = procs[0]["inicio"] if procs else None
+
+    if procs:
+        # Mostro os args do mais antigo porque nem todo processo com esse nome é uma
+        # sessão interativa (o Codex, por exemplo, dispara `codex exec --ephemeral`).
+        # Quem decide se aquilo é uma sessão é o dono, olhando a linha de comando.
+        L.add(e, "sessao-aberta", OK,
+              f"{len(procs)} processo(s) `{reg['proc']}`; o mais antigo é pid "
+              f"{procs[0]['pid']}, aberto {hhmm(sessao)} · {procs[0]['args']}",
+              "ps -Ao pid,etime,comm,args (etime → segundos; lstart depende de locale)")
+    else:
+        L.add(e, "sessao-aberta", DUVIDA,
+              f"nenhum processo `{reg['proc']}` vivo — nada a comparar com a sessão; "
+              "a próxima abertura já nasce com a config atual",
+              "ps -Ao pid,etime,comm,args")
+
+    # ── skill no disco ──
+    dirs, como, erro = dirs_de_skill(reg["skills"])
+    if erro:
+        L.add(e, "skill-no-disco", DUVIDA, erro, como)
+        L.add(e, "skill-na-sessao", DUVIDA, "sem diretório resolvido, não há mtime a comparar", como)
+    else:
+        achadas, quebradas, ausentes, ts_max = [], [], [], 0.0
+        usados: list[Path] = []   # onde as skills REALMENTE estão, não onde foram procuradas
+        for s in SKILLS:
+            for d in dirs:
+                alvo = d / s / "SKILL.md"
+                if alvo.is_file():
+                    if d not in usados:
+                        usados.append(d)
+                    fm, err = frontmatter(alvo)
+                    if fm is None:
+                        quebradas.append(f"{s} ({err})")
+                    elif not fm.get("name") or not fm.get("description"):
+                        quebradas.append(f"{s} (frontmatter sem name/description)")
+                    elif fm["name"] != s:
+                        quebradas.append(f"{s} (name={fm['name']!r} ≠ diretório)")
+                    else:
+                        achadas.append(s)
+                    ts_max = max(ts_max, mtime(alvo) or 0, mtime(d / s) or 0)
+                    break
+            else:
+                ausentes.append(s)
+
+        onde = ", ".join(str(d) for d in (usados or dirs))
+        procurei = ", ".join(str(d) for d in dirs)
+        como_fm = f"cabeçalho YAML de <dir>/<skill>/SKILL.md; procurei em: {procurei}"
+        if ausentes or quebradas:
+            det = []
+            if ausentes:
+                det.append("ausentes: " + ", ".join(ausentes))
+            if quebradas:
+                det.append("inválidas: " + "; ".join(quebradas))
+            if not ausentes:
+                passo = "conserte o frontmatter (name + description; name igual ao diretório)"
+            elif reg["skills"][0] == "extra":
+                passo = (f'acrescente "{exp("~/.claude/skills")}" em extra_skill_dirs de '
+                         f'{exp(reg["skills"][1])} e reabra a casca')
+            else:
+                passo = (f'./install.sh do ia-chat com IACHAT_SKILLS={dirs[0]} — ou faça '
+                         f'symlink de cada ia-* de {exp("~/.claude/skills")} para lá')
+            L.add(e, "skill-no-disco", FALHA, " · ".join(det), como_fm, passo)
+        else:
+            L.add(e, "skill-no-disco", OK, f"{len(achadas)}/{len(SKILLS)} em {onde}", como_fm)
+
+        # ── skill no CATÁLOGO DA SESSÃO: o limite honesto deste programa ──
+        # Nenhuma casca expõe de fora o catálogo que carregou no boot. O que dá para
+        # medir é a única coisa que decide: a skill mudou depois que a sessão abriu?
+        como_ts = f"stat mtime de <skill>/SKILL.md em {onde} vs início do processo (ps)"
+        if sessao is None:
+            L.add(e, "skill-na-sessao", DUVIDA,
+                  "casca fechada — não há catálogo de sessão a inspecionar", como_ts)
+        elif ts_max == 0:
+            L.add(e, "skill-na-sessao", DUVIDA, "não obtive mtime de nenhuma skill", como_ts)
+        elif ts_max > sessao:
+            L.add(e, "skill-na-sessao", DUVIDA,
+                  f"skill mudou {hhmm(ts_max)}, sessão mais antiga abriu {hhmm(sessao)} — "
+                  "o catálogo dela é anterior; NÃO consigo ler o catálogo de dentro",
+                  como_ts, f"abra uma sessão nova de {ia} (catálogo é lido no boot)")
+        else:
+            L.add(e, "skill-na-sessao", DUVIDA,
+                  f"skill não mudou desde {hhmm(sessao)}, então PROVAVELMENTE está no "
+                  "catálogo — mas provável não é medido: o catálogo não é legível de fora",
+                  como_ts, f"para provar: peça na sessão de {ia} `/ia-chat-activate`")
+
+    # ── hook ──
+    hk = reg["hooks"]
+    if hk is None:
+        L.add(e, "hook-ativo", DUVIDA,
+              f"{ia} não expõe mecanismo de hook conhecido — a perna de dentro do sino "
+              "não existe aqui; só o daemon (que avisa o humano) alcança esta casca",
+              f"grep por [[hooks]]/\"hooks\" em {exp(reg['raiz'])}")
+    else:
+        formato, arq = hk[0], exp(hk[1])
+        cfg, erro = (json_carrega(arq) if formato == "json" else toml_carrega(arq))
+        como_h = f"{'json' if formato == 'json' else 'tomllib'}.loads({arq}) → hooks[*].command"
+        if cfg is None:
+            L.add(e, "hook-ativo", DUVIDA, f"não li {arq}: {erro}", como_h)
+        else:
+            mapa = comandos_de_hook(cfg, formato)
+            tem = {ev: [c for c in cmds if HOOK in c] for ev, cmds in mapa.items()}
+            eventos_com = [ev for ev, cs in tem.items() if cs]
+            faltam = [ev for ev in EVENTOS if ev not in eventos_com]
+            instalador = f"{scripts}/ia-bell-install-hook.py {ia}"
+            if not eventos_com:
+                L.add(e, "hook-ativo", FALHA, f"nenhum `{HOOK}` em {arq.name}", como_h,
+                      f"python3 {instalador}")
+            elif faltam:
+                L.add(e, "hook-ativo", FALHA,
+                      f"presente em {', '.join(eventos_com)}; falta {', '.join(faltam)}",
+                      como_h, f"python3 {instalador}")
+            else:
+                L.add(e, "hook-ativo", OK, f"em {', '.join(sorted(eventos_com))}", como_h)
+
+            # O comando declarado aponta para um executável que existe?
+            # Hook que aponta para caminho morto falha em silêncio a cada evento.
+            alvos = {c for cs in tem.values() for c in cs}
+            mortos = []
+            for c in alvos:
+                m = re.search(r"(/\S*ia-bell-hook\.sh)", c)
+                if not m:
+                    mortos.append(f"{c[:60]} (sem caminho absoluto)")
+                elif not os.access(m.group(1), os.X_OK):
+                    mortos.append(f"{m.group(1)} não é executável")
+            if alvos:
+                if mortos:
+                    L.add(e, "hook-executavel", FALHA, "; ".join(mortos),
+                          "os.access(caminho, X_OK) sobre o command declarado",
+                          f"chmod +x {scripts}/{HOOK}  (ou reinstale com install.sh)")
+                else:
+                    L.add(e, "hook-executavel", OK, f"{len(alvos)} comando(s) apontam para binário -x",
+                          "os.access(caminho, X_OK) sobre o command declarado")
+
+            # ── hook VÁLIDO PARA A SESSÃO ABERTA: o defeito nº 2 ──
+            ts = mtime(arq)
+            como_s = f"stat mtime de {arq} vs início do processo (ps)"
+            if sessao is None:
+                L.add(e, "hook-na-sessao", DUVIDA,
+                      "casca fechada — a próxima abertura lê a config atual", como_s)
+            elif ts is None:
+                L.add(e, "hook-na-sessao", DUVIDA, "sem mtime do config", como_s)
+            elif ts > sessao:
+                L.add(e, "hook-na-sessao", DUVIDA,
+                      f"config mudou {hhmm(ts)}, sessão mais antiga abriu {hhmm(sessao)} — "
+                      "essa sessão roda a config ANTERIOR e o hook não dispara nela",
+                      como_s, f"reabra {ia}: config de hook é lida no boot")
+            else:
+                L.add(e, "hook-na-sessao", OK,
+                      f"config de {hhmm(ts)} é anterior à sessão de {hhmm(sessao)}", como_s)
+
+    # ── trust (Codex): hook declarado mas não aprovado é hook PULADO EM SILÊNCIO ──
+    if reg["trust"]:
+        arq_trust = exp(reg["trust"])
+        arq_hooks = exp(reg["hooks"][1])
+        cfg_t, erro_t = toml_carrega(arq_trust)
+        cfg_h, erro_h = json_carrega(arq_hooks)
+        como_t = (f"tomllib.loads({arq_trust}) → [hooks.state] vs "
+                  f"json.loads({arq_hooks}) → hooks[evento][g].hooks[h]")
+        if cfg_t is None or cfg_h is None:
+            L.add(e, "hook-confiado", DUVIDA, erro_t or erro_h, como_t)
+        else:
+            estado = (cfg_t.get("hooks", {}) or {}).get("state", {}) or {}
+            chaves = {k for k in estado}
+            sem_trust = []
+            for ev, grupos in (cfg_h.get("hooks") or {}).items():
+                ev_snake = re.sub(r"(?<!^)(?=[A-Z])", "_", ev).lower()
+                for gi, g in enumerate(grupos or []):
+                    for hi, _h in enumerate(g.get("hooks", []) or []):
+                        chave = f"{arq_hooks}:{ev_snake}:{gi}:{hi}"
+                        if chave not in chaves:
+                            sem_trust.append(f"{ev}[{gi}][{hi}]")
+            if sem_trust:
+                L.add(e, "hook-confiado", FALHA,
+                      f"{len(sem_trust)} hook(s) sem entrada em [hooks.state]: "
+                      + ", ".join(sem_trust[:6]),
+                      como_t,
+                      f"abra o {ia} e APROVE o hook quando ele perguntar — enquanto não "
+                      "aprovar, ele pula o hook sem dizer nada")
+            else:
+                L.add(e, "hook-confiado", OK,
+                      f"todos os hooks de {arq_hooks.name} têm entrada em [hooks.state]", como_t)
+            # O hash em si não é reproduzível de fora: testei sha256 do command, do
+            # hook serializado (4 formas) e do script apontado — nenhum bate com o
+            # trusted_hash gravado. Presença ≠ validade, e dizer o contrário seria
+            # exatamente o tipo de mentira que este programa existe para não contar.
+            L.add(e, "hook-hash-confere", DUVIDA,
+                  "o algoritmo do `trusted_hash` não é reproduzível por fora do Codex — "
+                  "verifico a PRESENÇA da aprovação, não o valor do hash",
+                  "sha256 testado sobre command/JSON/script: nenhum bateu")
+
+    # ── daemon ──
+    label = f"com.bauer.ia-bell-{ia}"
+    plist = exp(f"~/Library/LaunchAgents/{label}.plist")
+    rc, out, err = rodar(["launchctl", "list"])
+    como_d = f"launchctl list (saída INTEIRA capturada; sem `| grep -q`) + procura de {label}"
+    if rc is None or rc != 0:
+        L.add(e, "daemon-vivo", DUVIDA, f"launchctl não respondeu (rc={rc}) {err.strip()[:80]}", como_d)
+    else:
+        linha = next((l for l in out.splitlines() if label in l), None)
+        if linha is None:
+            estado = FALHA if na_sala else DUVIDA
+            det = f"{label} não está carregado" + ("" if na_sala else " (casca fora de na_sala)")
+            L.add(e, "daemon-vivo", estado, det, como_d,
+                  f"{scripts}/ia-bell-install-daemon.sh {ia}" if na_sala else None)
+        else:
+            pid = linha.split()[0]
+            if pid == "-":
+                L.add(e, "daemon-vivo", FALHA, f"{label} carregado mas SEM pid (não está rodando)",
+                      como_d, f"ver {sala}/ia-bell-{ia}.err e recarregar o LaunchAgent")
+            else:
+                idade = mtime(sala / f"ia-bell-{ia}.log")
+                L.add(e, "daemon-vivo", OK,
+                      f"pid {pid} · plist {'presente' if plist.is_file() else 'AUSENTE'} · "
+                      f"log tocado {hhmm(idade)}", como_d)
+
+    # ── caixa da IA: cursor e flag pendente ──
+    cur = sala / "cursor" / f"{ia}.json"
+    pend = sala / "pendente" / f"{ia}.md"
+    dados, erro_c = json_carrega(cur) if cur.is_file() else (None, "sem cursor ainda")
+    if dados is None and cur.is_file():
+        L.add(e, "caixa", FALHA, f"cursor ilegível: {erro_c}", f"json.loads({cur})",
+              f"apague {cur} — a IA relê a sala do começo")
+    else:
+        lida = dados.get("ultima_lida") if dados else 0
+        if pend.is_file():
+            espera = time.time() - (mtime(pend) or time.time())
+            L.add(e, "caixa", DUVIDA,
+                  f"flag pendente há {espera / 60:.0f} min (cursor em #{lida}) — o sino tocou "
+                  "e ninguém leu; não sei se a casca está fechada ou surda",
+                  f"test -f {pend} + json.loads({cur})",
+                  f"na sessão de {ia}: iachat read --de {ia} --novas")
+        else:
+            L.add(e, "caixa", OK, f"sem pendência · cursor em #{lida}",
+                  f"test -f {pend} + json.loads({cur})")
+
+
+# ─── relatório ───────────────────────────────────────────────────────────────
+def imprime(L: Laudo, sala: Path) -> None:
+    print(f"ia-doctor · sala {sala} · {time.strftime('%d/%m/%Y %H:%M:%S')}")
+    escopo_atual = None
+    for i in L.itens:
+        if i["escopo"] != escopo_atual:
+            escopo_atual = i["escopo"]
+            print(f"\n{escopo_atual.upper()}")
+        print(f"  {SIMBOLO[i['estado']]} {i['item']:<20} {i['detalhe']}")
+        print(f"    como:  {i['como']}")
+        if i["passo"]:
+            print(f"    passo: {i['passo']}")
+    c = L.placar()
+    print(f"\nPLACAR  ✓ ok {c[OK]} · ✗ falhou {c[FALHA]} · ⚠ não-consegui-verificar {c[DUVIDA]}")
+    if c[DUVIDA]:
+        print("        ⚠ não é ✗: é o que este programa admite não saber. Ler os `passo:` dos ⚠")
+        print("        é o que transforma dúvida em medida.")
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="diagnóstico do ia-chat em todas as cascas")
+    ap.add_argument("--casca", action="append", help="diagnosticar só esta casca (repetível)")
+    ap.add_argument("--todas", action="store_true",
+                    help="além de na_sala, toda casca conhecida presente no disco")
+    ap.add_argument("--json", action="store_true", help="laudo machine-parseable")
+    ap.add_argument("--repo", help="repositório-fonte do ia-chat, para comparar com o instalado")
+    a = ap.parse_args()
+
+    sala = exp(os.environ.get("IACHAT_HOME", "~/ia-chat-global"))
+    scripts = exp(os.environ.get("IACHAT_SCRIPTS", "~/.claude/scripts/ia-chat"))
+    repo = exp(a.repo) if a.repo else None
+    if repo and not (repo / "bin").is_dir():
+        print(f"✗ --repo {repo} não tem bin/", file=sys.stderr)
+        return 2
+
+    L = Laudo()
+    st = checa_sala(L, sala, scripts, repo)
+
+    na_sala = st.get("na_sala") or []
+    if a.casca:
+        alvos = [c for c in a.casca]
+    elif a.todas:
+        alvos = list(dict.fromkeys(list(na_sala) + list(CASCAS)))
+    else:
+        alvos = list(na_sala)
+
+    for ia in alvos:
+        if ia not in CASCAS:
+            L.add(f"casca:{ia}", "registro", DUVIDA,
+                  "casca fora do registro do ia-doctor — não sei onde ela guarda "
+                  "skills e hooks, então não meço nada dela",
+                  "CASCAS[] em ia-doctor",
+                  "acrescente a casca ao registro (skills/hooks/trust/proc) e remeça")
+            continue
+        if not exp(CASCAS[ia]["raiz"]).is_dir():
+            L.add(f"casca:{ia}", "registro", DUVIDA,
+                  f"{exp(CASCAS[ia]['raiz'])} não existe — casca não instalada nesta máquina",
+                  f"test -d {exp(CASCAS[ia]['raiz'])}")
+            continue
+        checa_casca(L, ia, sala, scripts, na_sala=ia in na_sala)
+
+    if a.json:
+        print(json.dumps({"sala": str(sala), "placar": L.placar(), "itens": L.itens},
+                         ensure_ascii=False, indent=2))
+    else:
+        imprime(L, sala)
+    return 1 if L.placar()[FALHA] else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

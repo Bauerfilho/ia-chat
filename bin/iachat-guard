@@ -1,0 +1,287 @@
+#!/usr/bin/env python3
+"""iachat-guard — ensaio da mensagem ANTES de postar.
+
+Confere o que se confere contra o disco e contra a sala. Diz em voz alta o
+que NÃO se verifica. Nunca posta, nunca cria a sala, nunca barra o canal.
+
+    iachat-guard --texto "sua mensagem"
+    echo "$RASCUNHO" | iachat-guard
+
+exit 0 = limpo ou só P2 · exit 1 = tem P1 (achado verificado) · exit 2 = vazio
+
+Tamanho é DADO, não veredito. Medido na sala real de 17/08: AVISO_GRANDE=2048
+disparou 3× (#4, #9, #15) e as três são as mensagens mais úteis — 3/3 falsos
+positivos. Densidade de âncora é reportada na mesma linha; não reprova.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+RE_CODIGO = re.compile(r"```.*?```|~~~.*?~~~|`[^`\n]+`", re.S)
+RE_PATH = re.compile(r"(?<![\w])(?:~|\.{1,2})?/[A-Za-z0-9._@~+-]+(?:/[A-Za-z0-9._@~+-]+)*")
+RE_NUM = re.compile(r"(?<![\w#])\d[\d.,:]*")
+RE_REF = re.compile(r"#(\d+)")
+RE_LINHA = re.compile(
+    r"((?:~|\.{1,2})?/[A-Za-z0-9._@~+-]+(?:/[A-Za-z0-9._@~+-]+)*):(\d+)"
+)
+# Só a COLOCAÇÃO vaga. `aquilo` sozinho quase sempre tem antecedente local
+# (sala real #9 usa assim, corretamente).
+RE_VAGO = re.compile(
+    r"\b(?:aquel[ae]s? (?:problema|coisa|assunto|bug|erro|neg[óo]cio|caso|lance"
+    r"|hist[óo]ria|quest[ãa]o|parte|arquivo|script)"
+    r"|isso que (?:a gente|n[óo]s|voc[êe]s?) (?:viu|vimos|viram|falou|falamos"
+    r"|combinou|combinamos|discutiu|discutimos)"
+    r"|como (?:eu )?(?:j[áa] )?(?:disse|falei|expliquei|combinamos|conversamos"
+    r"|mencionei) (?:antes|acima|ontem|mais cedo|l[áa] atr[áa]s)"
+    r"|conforme (?:conversado|combinado|falado)"
+    r"|(?:o|a) (?:de|da|do) ontem"
+    r"|voc[êe] (?:se )?lembra"
+    r"|do jeito que (?:ficou|deixamos|estava)"
+    r"|de novo aquel[ae])\b",
+    re.I,
+)
+RE_AFERE = re.compile(
+    r"\b(?:medi|medimos|conferi|conferimos|validei|validamos|testei|testamos"
+    r"|provei|verifiquei|verificamos|comprovei|contei|apurei|aferi)\b",
+    re.I,
+)
+RE_PEDIDO = re.compile(
+    r"\b(?:preciso (?:de voc[êe]|que voc[êe])|tarefa sua|sua tarefa"
+    r"|o que preciso de voc[êe]|rode|execute|instale"
+    r"|poste (?:aqui|no canal|a resposta))\b",
+    re.I,
+)
+
+GRAU = {"V1": "P1", "V2": "P1", "V3": "P1", "L1": "P2", "L2": "P2", "L3": "P2"}
+ORDEM = {"P1": 0, "P2": 1}
+# stat em /net/<host> dispara autofs no macOS e pode pendurar o processo.
+PREFIXO_PROIBIDO = ("/net/", "/Volumes/")
+MAX_CAMINHOS = 40
+
+
+def _frases(texto: str) -> list[str]:
+    """Fatia por `.!?` e quebra de linha. NÃO fatia em `:` nem `;`.
+
+    A primeira versão fatiava em `:`, e isso separava "Medi:" dos números
+    que vinham logo depois — 6 dos 9 falsos positivos de L2 na calibração.
+    """
+    return [p for p in re.split(r"(?<=[.!?])\s+|\n", texto) if p.strip()]
+
+
+def _tem_evidencia(trecho: str) -> bool:
+    return bool(
+        RE_NUM.search(trecho)
+        or RE_REF.search(trecho)
+        or RE_PATH.search(trecho)
+        or RE_CODIGO.search(trecho)
+    )
+
+
+def _limpa(p: str) -> str:
+    return p.rstrip(".,;:)]}`'\"")
+
+
+def metricas(texto: str) -> dict:
+    """Densidade de âncora por KB: caminhos + números + comandos + refs `#N`.
+
+    É um NÚMERO REPORTADO, não um limiar. Na sala real de 17/08 a faixa das
+    mensagens boas vai de 6,8 a 19,8 — larga demais para virar corte.
+    """
+    b = len(texto.encode())
+    sem_codigo = RE_CODIGO.sub(" ", texto)
+    anc = (
+        len(RE_PATH.findall(sem_codigo))
+        + len(RE_NUM.findall(sem_codigo))
+        + len(RE_REF.findall(sem_codigo))
+        + len(RE_CODIGO.findall(texto))
+    )
+    return {
+        "bytes": b,
+        "ancoras": anc,
+        "densidade": round(anc / max(b / 1024, 1e-3), 1),
+    }
+
+
+def avaliar(
+    texto: str,
+    *,
+    ultima_msg: int | None = None,
+    checar_disco: bool = True,
+) -> dict:
+    """Devolve `{achados, metricas, pior}`. NUNCA levanta e NUNCA decide postar.
+
+    `ultima_msg` liga V3. `checar_disco=False` desliga V1/V2.
+    A régua só pune afirmação mal ancorada — nunca exige presença de nada.
+    Mensagem curta (ping) passa limpa de propósito.
+    """
+    texto = texto.strip()
+    achados: list[dict] = []
+
+    def add(id_: str, trecho: str, msg: str) -> None:
+        achados.append({"id": id_, "grau": GRAU[id_], "trecho": trecho, "msg": msg})
+
+    if checar_disco:
+        vistos: set[str] = set()
+        for bruto in RE_PATH.findall(texto):
+            p = _limpa(bruto)
+            if p in vistos or not p.startswith(("/", "~/")):
+                continue
+            # 1 segmento só é slash-command (`/reload`) ou resto de brace
+            # (`{a,b}/SKILL.md`): 4/4 falsos positivos de V1 na calibração.
+            if p.startswith("/") and p.count("/") < 2:
+                continue
+            if p.startswith(PREFIXO_PROIBIDO):
+                continue
+            vistos.add(p)
+            if len(vistos) > MAX_CAMINHOS:
+                break
+            if not Path(os.path.expanduser(p)).exists():
+                add(
+                    "V1",
+                    p,
+                    f"`{p}` não existe nesta máquina. Caminho digitado de "
+                    f"memória manda a outra IA para o vazio.",
+                )
+        for arq, lin in RE_LINHA.findall(texto):
+            alvo = Path(os.path.expanduser(_limpa(arq)))
+            if not alvo.is_file():
+                continue
+            try:
+                with alvo.open("rb") as f:
+                    n = sum(1 for _ in f)
+            except OSError:
+                continue
+            if int(lin) > n:
+                add("V2", f"{arq}:{lin}", f"`{arq}` tem {n} linhas; você citou a {lin}.")
+
+    if ultima_msg is not None:
+        for r in dict.fromkeys(RE_REF.findall(texto)):
+            if int(r) > ultima_msg:
+                add("V3", f"#{r}", f"`#{r}` não existe: a sala vai até #{ultima_msg}.")
+
+    for f in _frases(texto):
+        for hit in RE_VAGO.finditer(f):
+            if not _tem_evidencia(f):
+                add(
+                    "L1",
+                    hit.group(0),
+                    f"'{hit.group(0)}' sem âncora na frase — quem lê não viu isso. "
+                    f"Diga `#N`, o caminho absoluto ou o nome do artefato.",
+                )
+    # L2 olha o PARÁGRAFO, não a frase: o padrão real é cabeçalho
+    # ("verifiquei tudo:") seguido dos itens medidos na linha de baixo.
+    for par in re.split(r"\n\s*\n", texto):
+        a = RE_AFERE.search(par)
+        if a and not _tem_evidencia(par):
+            add(
+                "L2",
+                a.group(0),
+                "aferição sem a medida no parágrafo: número, comando ou caminho "
+                "— senão é opinião com cara de dado.",
+            )
+    p = RE_PEDIDO.search(texto)
+    if p and not RE_CODIGO.search(texto):
+        add(
+            "L3",
+            p.group(0),
+            "pediu ação sem o comando literal. Quem lê está em outra casca: "
+            "o comando exato poupa uma rodada inteira do canal.",
+        )
+
+    pior = min((a["grau"] for a in achados), key=lambda g: ORDEM[g], default="OK")
+    return {"achados": achados, "metricas": metricas(texto), "pior": pior}
+
+
+def linhas_para_o_autor(r: dict) -> list[str]:
+    """O que um `post` integraria. Silêncio total quando limpo."""
+    out = [f"{a['id']} · {a['msg']}" for a in r["achados"] if a["grau"] == "P1"]
+    p2 = [a for a in r["achados"] if a["grau"] == "P2"]
+    if p2:
+        ids = ", ".join(dict.fromkeys(f"{a['id']}:{a['trecho']}" for a in p2))
+        out.append(f"leitura (P2, pode ser ruído): {ids} — `iachat-guard` explica.")
+    return out
+
+
+def _ultima_da_sala() -> int | None:
+    """Lê o contador SEM criar a sala. Ensaio não pode ter efeito colateral.
+
+    A proposta da casa chamava `core.config()`/`garantir_estrutura()` em alguns
+    caminhos — recusado: `iachat_core.py:124` cria chat+config se não existem.
+    """
+    try:
+        import iachat_core as core
+
+        return core._ultimo_numero()
+    except Exception:
+        return None
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="iachat-guard", description=__doc__)
+    ap.add_argument("--texto", nargs="*", help="mensagem inline (default: stdin)")
+    ap.add_argument(
+        "--sem-disco",
+        action="store_true",
+        help="não confere caminho no disco (V1/V2 desligados)",
+    )
+    ap.add_argument(
+        "--ultima",
+        type=int,
+        default=None,
+        help="último nº da sala (liga V3 sem ler o disco)",
+    )
+    ap.add_argument("--json", action="store_true")
+    a = ap.parse_args()
+
+    texto = " ".join(a.texto) if a.texto else sys.stdin.read()
+    if not texto.strip():
+        print("✗ mensagem vazia", file=sys.stderr)
+        return 2
+
+    if a.ultima is not None:
+        ultima: int | None = a.ultima
+    elif a.sem_disco:
+        ultima = None
+    else:
+        ultima = _ultima_da_sala()
+
+    r = avaliar(texto, ultima_msg=ultima, checar_disco=not a.sem_disco)
+
+    if a.json:
+        print(json.dumps(r, ensure_ascii=False, indent=2))
+        return 1 if r["pior"] == "P1" else 0
+
+    m = r["metricas"]
+    print(
+        f"{m['bytes']} B · {m['ancoras']} âncoras · {m['densidade']}/KB · "
+        f"veredito {r['pior']}"
+    )
+    for x in r["achados"]:
+        print(f"  {x['grau']} {x['id']} · {x['trecho']}")
+        print(f"       {x['msg']}")
+    if not r["achados"]:
+        print("  nada a apontar mecanicamente.")
+    # Sai SEMPRE, inclusive no verde. Porteiro que só diz "passou" ensina a
+    # sala a tratar o carimbo como prova — e ele não é prova de verdade.
+    print(
+        "  ⓘ não verificado por esta régua: se o número é verdadeiro, se a "
+        "mensagem era necessária, se o texto é vago.",
+        file=sys.stderr,
+    )
+    if ultima is None and not a.sem_disco and a.ultima is None:
+        print(
+            "  ⓘ sala não encontrada: as referências `#N` não foram checadas.",
+            file=sys.stderr,
+        )
+    return 1 if r["pior"] == "P1" else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

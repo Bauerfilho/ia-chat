@@ -1,0 +1,244 @@
+#!/usr/bin/env python3
+"""iachat — a porta única de entrada da sala das IAs.
+
+Uma IA nunca escreve no chat com `>>` nem com editor: sem o lock daqui, duas
+postando junto perdem mensagem (PIPE_BUF=512 no macOS, e `flock(1)` não existe).
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import iachat_core as core  # noqa: E402
+
+
+def cmd_post(a) -> int:
+    texto = " ".join(a.texto).strip() if a.texto else sys.stdin.read()
+    para = [x for p in (a.para or []) for x in p.split(",") if x]
+    try:
+        r = core.post(a.de, texto, para)
+    except ValueError as e:
+        print(f"✗ {e}", file=sys.stderr)
+        return 2
+    alvo = ", ".join(f"@{x}" for x in r["para"]) or "ninguém"
+    print(f"✔ #{r['n']} postada por {r['de']} → {alvo}")
+    for w in r["avisos"]:
+        print(f"⚠️  {w}", file=sys.stderr)
+    return 0
+
+
+def cmd_read(a) -> int:
+    escopo = "tudo" if a.tudo else ("todas" if a.todas else "meu")
+    r = core.ler(a.de, escopo=escopo, avancar=not a.sem_avancar)
+    if not r["msgs"]:
+        print(f"(nada para {a.de} — cursor em #{r['desde']} de {r['total']} na sala)")
+        return 0
+    print(f"📬 {len(r['msgs'])} mensagem(ns) para {a.de} · {r['bytes']} B "
+          f"de {r['bytes_sala']} B na sala\n")
+    for m in r["msgs"]:
+        print(m["bruto"])
+    if r["ocultas"]:
+        print(f"— {r['ocultas']} mensagem(ns) entre outras IAs ficaram ocultas. "
+              f"`iachat read --de {a.de} --tudo` abre a sala; `iachat search \"termo\"` procura.")
+    return 0
+
+
+def cmd_entregar(a) -> int:
+    """Saída para HOOK: entrega a mensagem no contexto da IA, sem ela pedir.
+
+    Com teto: acima dele, entrega só os cabeçalhos e NÃO consome o cursor nem o flag —
+    entregar 40 KB de uma vez na janela de quem está no meio de outra coisa seria
+    trocar um problema por outro.
+    """
+    r = core.ler(a.de, escopo="meu", avancar=False)
+    if not r["msgs"]:
+        return 0
+    if r["bytes"] <= a.teto:
+        print(f"📬 [ia-chat] {len(r['msgs'])} mensagem(ns) para você ({r['bytes']} B). "
+              f"Já entregues abaixo — não precisa rodar nada.\n")
+        for m in r["msgs"]:
+            print(m["bruto"])
+        core.marca_lida(a.de, max(m["n"] for m in r["msgs"]))
+    else:
+        print(f"📬 [ia-chat] {len(r['msgs'])} mensagem(ns) para você, {r['bytes']//1024} KB "
+              f"— grande demais para entregar aqui. Cabeçalhos:")
+        for m in r["msgs"]:
+            print(f"   #{m['n']} de {m['de']}: {m['bruto'].splitlines()[2][:90]}")
+        print(f"   Ler: `iachat read --de {a.de}`")
+    return 0
+
+
+def cmd_status(a) -> int:
+    s = core.status()
+    pct = 100 * s["bytes"] / s["teto_bytes"] if s["teto_bytes"] else 0
+    print(f"chat      {s['chat']}")
+    print(f"tamanho   {s['bytes']} B / {s['teto_bytes']} B ({pct:.0f}% do teto)")
+    print(f"mensagens {s['mensagens']} (última #{s['ultima']})")
+    print(f"na sala   {', '.join(s['na_sala'])}   brain: {s['brain']}")
+    print(f"cursores  " + "  ".join(f"{k}:#{v}" for k, v in s["cursores"].items()))
+    print(f"sino ativo{'  ' + ', '.join(s['pendentes']) if s['pendentes'] else '  (nenhum)'}")
+    return 0
+
+
+def cmd_sino(a) -> int:
+    """Liga/desliga a notificação do OPERADOR (a das IAs nunca desliga por aqui)."""
+    cfg = core.config()
+    if a.estado:
+        cfg["notificar_operador"] = a.estado == "on"
+        core.p_config().write_text(
+            __import__("json").dumps(cfg, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    ligado = cfg.get("notificar_operador", True)
+    print(f"sino do operador: {'🔔 ligado' if ligado else '🔕 mudo'}")
+    if a.estado:
+        print("  (vale no próximo ciclo do daemon, ~15s — não precisa reiniciar nada)")
+    return 0
+
+
+def cmd_reparar(a) -> int:
+    """Reconstrói os flags do sino a partir do estado real. Idempotente."""
+    r = core.reconstruir_flags()
+    for ia, d in r.items():
+        faixa = f" (#{d['faixa'][0]}…#{d['faixa'][1]})" if "faixa" in d else ""
+        print(f"  {ia:8} {d['pendentes']} pendente(s){faixa} — {d['acao']}")
+    print("\n(o flag é derivado do cursor × mensagens: reconstruir não inventa nada)")
+    return 0
+
+
+def cmd_assuntos(a) -> int:
+    """Preenche o `Assuntos:` da marca de um recorte — a tarefa do brain."""
+    try:
+        r = core.marcar_assuntos(a.recorte, " ".join(a.texto))
+    except ValueError as e:
+        print(f"✗ {e}", file=sys.stderr)
+        return 2
+    if not r.get("ok"):
+        print(f"✗ {r['erro']}", file=sys.stderr)
+        return 2
+    print(f"✔ {r['recorte']} · Assuntos: {r['assuntos']}")
+    return 0
+
+
+def cmd_rotate(a) -> int:
+    r = core.rotate(forcar=a.forcar)
+    if not r["rodou"]:
+        print(f"= sem rotação: {r['motivo']}")
+        return 0
+    print(f"✔ {r['recorte']} — {r['cortadas']} mensagens (#{r['faixa'][0]}–#{r['faixa'][1]})")
+    print(f"  ativo: {r['antes']} B → {r['depois']} B")
+    print("  a marca ficou no ativo; o recorte é imutável e paginável")
+    if r.get("aviso"):
+        print(f"⚠️  {r['aviso']}", file=sys.stderr)
+    return 0
+
+
+def _rodape(r) -> str:
+    ant = f"↑ pág {r['pagina']-1}" if r["pagina"] > 1 else "— início"
+    prox = f"↓ pág {r['pagina']+1}" if r["pagina"] < r["total"] else "fim —"
+    return (
+        f"\n📄 {r['fonte']} · página {r['pagina']}/{r['total']} · "
+        f"linhas {r['linhas'][0]}-{r['linhas'][1]} · {ant} · {prox}\n"
+        f"   vizinha: iachat page {r['fonte']} <n>   (não relê o documento)"
+    )
+
+
+def cmd_page(a) -> int:
+    r = core.paginar(a.fonte, a.pagina)
+    if "erro" in r:
+        print(f"✗ {r['erro']}", file=sys.stderr)
+        return 2
+    print(r["texto"])
+    print(_rodape(r))
+    return 0
+
+
+def cmd_search(a) -> int:
+    r = core.buscar(" ".join(a.termo), de=a.de, data=a.data)
+    ac = r["achados"]
+    if not ac:
+        print("(nada encontrado)")
+        return 0
+    filtro = " ".join(x for x in [f"de={r['de']}" if r["de"] else "", f"data={r['data']}" if r["data"] else ""] if x)
+    print(f"🔎 {len(ac)} mensagem(ns) casam com '{r['termo']}' {filtro}".rstrip())
+    for x in ac[:12]:
+        print(f"   {x['fonte']:34} #{x['n']:<3} {x['de']:7} {x['ts']}  → página {x['pagina']}")
+    if len(ac) > 12:
+        print(f"   … e mais {len(ac)-12}")
+    if not a.abrir:
+        # O índice sozinho responde "onde está?" por ~84 tokens. Abrir a página junto
+        # custava ~1.097 — 13× mais — para quem só queria localizar. Medido em 17/08
+        # (achado do grok): o comando que existe para economizar contexto desperdiçava
+        # por padrão. Agora abrir é escolha de quem pergunta.
+        print(f"\n   abrir: iachat page {ac[0]['fonte']} {ac[0]['pagina']}"
+              f"   (ou repita a busca com --abrir)")
+        return 0
+    p = core.paginar(ac[0]["fonte"], ac[0]["pagina"])
+    print(f"\n─── primeira ocorrência ───\n")
+    print(p["texto"])
+    print(_rodape(p))
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="iachat", description=__doc__)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("post", help="postar mensagem (toca o sino dos nominados)")
+    p.add_argument("--de", required=True, help="quem está postando")
+    p.add_argument("--para", action="append", help="destinos: codex,kimi ou @all")
+    p.add_argument("texto", nargs="*", help="corpo (vazio = lê do stdin)")
+    p.set_defaults(f=cmd_post)
+
+    p = sub.add_parser("read", help="ler a sala")
+    p.add_argument("--de", required=True, help="quem está lendo")
+    p.add_argument("--todas", action="store_true", help="+ conversa entre terceiros")
+    p.add_argument("--tudo", action="store_true", help="a sala inteira (caro, explícito)")
+    p.add_argument("--novas", action="store_true", help="(compat: já é o padrão)")
+    p.add_argument("--sem-avancar", action="store_true", help="não mexer no cursor")
+    p.set_defaults(f=cmd_read)
+
+    p = sub.add_parser("entregar", help="saída para hook: injeta a mensagem no contexto")
+    p.add_argument("--de", required=True)
+    p.add_argument("--teto", type=int, default=6144, help="bytes; acima disso só cabeçalhos")
+    p.set_defaults(f=cmd_entregar)
+
+    p = sub.add_parser("status", help="estado da sala")
+    p.set_defaults(f=cmd_status)
+
+    p = sub.add_parser("sino", help="notificação do operador: ligar, desligar, ver")
+    p.add_argument("estado", nargs="?", choices=["on", "off"], help="vazio = só mostra")
+    p.set_defaults(f=cmd_sino)
+
+    p = sub.add_parser("assuntos", help="preencher os Assuntos da marca de um recorte")
+    p.add_argument("recorte", help="recorte-01, ou o nome do arquivo")
+    p.add_argument("texto", nargs="+", help="os assuntos, separados por ·")
+    p.set_defaults(f=cmd_assuntos)
+
+    p = sub.add_parser("reparar", help="reconstrói os flags do sino a partir do estado real")
+    p.set_defaults(f=cmd_reparar)
+
+    p = sub.add_parser("rotate", help="corta o ativo de cima e arquiva num recorte")
+    p.add_argument("--forcar", action="store_true", help="rodar mesmo abaixo do teto")
+    p.set_defaults(f=cmd_rotate)
+
+    p = sub.add_parser("page", help="uma página de um recorte (paginação estável)")
+    p.add_argument("fonte", help="recorte-01, o nome do arquivo, ou 'ativo'")
+    p.add_argument("pagina", type=int, nargs="?", default=1)
+    p.set_defaults(f=cmd_page)
+
+    p = sub.add_parser("search", help="achar sem pagar o arquivo inteiro")
+    p.add_argument("termo", nargs="*", help="texto a procurar")
+    p.add_argument("--de", help="só mensagens desta IA")
+    p.add_argument("--data", help="prefixo ISO, ex: 2026-08-17")
+    p.add_argument("--abrir", action="store_true", help="também trazer a 1ª ocorrência")
+    p.set_defaults(f=cmd_search)
+
+    a = ap.parse_args()
+    return a.f(a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

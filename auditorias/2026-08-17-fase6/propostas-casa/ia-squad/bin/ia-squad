@@ -1,0 +1,318 @@
+#!/usr/bin/env python3
+"""ia-squad — despacha uma missão para várias IAs PELA PRÓPRIA SALA do ia-chat.
+
+Não cria processo nenhum. As IAs já estão abertas nas janelas delas; o que falta é
+o despacho chegar lá dentro. O sino do ia-chat já faz isso — o `ia-squad` só põe
+contrato, rastreio e juiz em cima do canal que já existe.
+
+Três decisões, todas medidas (números em NOTA.md):
+
+  1. O CONTRATO É ARQUIVO; a sala leva um PONTEIRO de ~400 B.
+     `iachat entregar` tem teto de 6144 B (bin/iachat:171). Acima dele a entrega
+     degrada para cabeçalhos e NÃO consome o cursor — ou seja, o contrato não
+     entra na janela de ninguém. Contrato inteiro na sala (~1,8 KB) estoura o teto
+     no 4º despacho ao mesmo destinatário; ponteiro cabe 15.
+
+  2. PROGRESSO NÃO VOLTA PARA A SALA. Vai para `progress/<w>.jsonl`, no disco.
+     A sala é cara e é de todos; "estou trabalhando" não é informação para outra
+     IA agir. Quem quer saber roda `ia-squad chamada`, que não escreve nada.
+
+  3. AUDITOR ≠ AUTOR é estrutural, não confiança. O juiz de cada worker é fixado
+     por anel (+1) ANTES de existir veredito, e o despacho do julgamento fica
+     no registro público da sala — dá para auditar depois quem foi mandado julgar
+     o quê. `julgar` recusa fail-closed se algum juiz cair sobre o próprio autor.
+
+Escrita na sala: SEMPRE por `iachat post` (subprocess). Nunca por append direto —
+é a regra do plugin e o motivo dele existir. Leitura de sino/cursor: direta, dos
+arquivos que o núcleo publica (read-only, sem lock — o lock é para quem escreve).
+"""
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+
+# O núcleo do ia-chat, só para os caminhos de sino/cursor (leitura).
+for cand in (
+    Path(__file__).resolve().parent,
+    Path.home() / ".claude/scripts/ia-chat",
+    Path.home() / "Projetos/ia-chat/bin",
+):
+    if (cand / "iachat_core.py").exists():
+        sys.path.insert(0, str(cand))
+        break
+import iachat_core as core  # noqa: E402
+
+
+def iachat_bin() -> str:
+    for c in (
+        os.environ.get("IACHAT_BIN"),
+        shutil.which("iachat"),
+        str(Path.home() / ".local/bin/iachat"),
+        str(Path(__file__).resolve().parent / "iachat"),
+        str(Path.home() / "Projetos/ia-chat/bin/iachat"),
+    ):
+        if c and os.access(c, os.X_OK):
+            return c
+    sys.exit("✗ não achei o executável `iachat`. Defina IACHAT_BIN.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# O run-dir
+# ─────────────────────────────────────────────────────────────────────────────
+
+def ler_squad(run: Path) -> list[dict]:
+    """squad.tsv: worker <TAB> ia-na-sala <TAB> n_etapas <TAB> contrato"""
+    tsv = run / "squad.tsv"
+    if not tsv.exists():
+        sys.exit(f"✗ {tsv} ausente")
+    linhas = []
+    for ln in tsv.read_text(encoding="utf-8").splitlines():
+        ln = ln.strip()
+        if not ln or ln.startswith("#"):
+            continue
+        c = ln.split("\t")
+        if len(c) < 4:
+            sys.exit(f"✗ linha malformada em squad.tsv: {ln!r}")
+        linhas.append(
+            {"worker": c[0], "ia": core.normaliza_ia(c[1]), "etapas": int(c[2]), "contrato": c[3]}
+        )
+    if not linhas:
+        sys.exit("✗ squad.tsv vazio")
+    # Uma IA, um worker: o sino e o cursor são POR IA. Dois contratos para o mesmo
+    # destinatário chegam na mesma entrega e a chamada não sabe mais qual andou.
+    vistos = [w["ia"] for w in linhas]
+    dup = {x for x in vistos if vistos.count(x) > 1}
+    if dup:
+        sys.exit(f"✗ mesma IA em dois workers: {', '.join(sorted(dup))}. Um worker por IA.")
+    return linhas
+
+
+def post(de: str, para: str, texto: str) -> int:
+    """Posta pela porta única e devolve o número da mensagem."""
+    r = subprocess.run(
+        [iachat_bin(), "post", "--de", de, "--para", para, texto],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        sys.exit(f"✗ iachat post falhou: {r.stderr.strip()}")
+    # "✔ #12 postada por claude → @codex"
+    try:
+        return int(r.stdout.split("#", 1)[1].split()[0])
+    except (IndexError, ValueError):
+        sys.exit(f"✗ não consegui ler o número da mensagem em: {r.stdout!r}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# despachar
+# ─────────────────────────────────────────────────────────────────────────────
+
+PONTEIRO = """🎯 **SQUAD {run_id}** — você é `{worker}`, {etapas} etapas.
+
+contrato:  {contrato}
+progresso: {progresso}
+resultado: {resultado}
+
+Leia o contrato e cumpra até o fim, sem perguntar. Após CADA etapa, appenda 1 linha
+JSON no progresso: `{{"etapa":K,"de":{etapas},"estado":"rodando","nota":"3-8 palavras"}}`.
+Não relate andamento aqui na sala — o progresso é o arquivo. Volte à sala só no fim,
+ou se estiver BLOQUEADO por algo que só outra IA resolve.{prazo}"""
+
+
+def cmd_despachar(a) -> int:
+    run = Path(a.run).resolve()
+    squad = ler_squad(run)
+    for sub in ("progress", "resultados", "vereditos"):
+        (run / sub).mkdir(parents=True, exist_ok=True)
+
+    faltando = [w for w in squad if not (run / w["contrato"]).exists()]
+    if faltando:
+        sys.exit("✗ contrato ausente: " + ", ".join(w["contrato"] for w in faltando))
+
+    sala = [core.normaliza_ia(x) for x in core.config().get("na_sala", [])]
+    fora = [w["ia"] for w in squad if w["ia"] not in sala]
+    if fora:
+        sys.exit(f"✗ fora da sala {sala}: {', '.join(fora)}. Adicione em {core.p_config()}.")
+
+    prazo = f"\nprazo: {a.prazo}." if a.prazo else ""
+    despacho = {"run": str(run), "de": a.de, "em": core.agora(), "workers": {}}
+    for w in squad:
+        texto = PONTEIRO.format(
+            run_id=run.name, worker=w["worker"], etapas=w["etapas"],
+            contrato=run / w["contrato"],
+            progresso=run / "progress" / f"{w['worker']}.jsonl",
+            resultado=run / "resultados" / f"{w['worker']}.md",
+            prazo=prazo,
+        )
+        n = post(a.de, w["ia"], texto)
+        despacho["workers"][w["worker"]] = {
+            "ia": w["ia"], "msg": n, "etapas": w["etapas"], "bytes_ponteiro": len(texto.encode())
+        }
+        print(f"✔ {w['worker']:14} → @{w['ia']:8} msg #{n}  ({len(texto.encode())} B na sala)")
+
+    (run / "despacho.json").write_text(
+        json.dumps(despacho, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    total = sum(v["bytes_ponteiro"] for v in despacho["workers"].values())
+    print(f"\n{len(squad)} despachos · {total} B na sala · registro em {run/'despacho.json'}")
+    return 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# chamada — a escada de 4 estados, sem escrever nada
+# ─────────────────────────────────────────────────────────────────────────────
+
+def estado(run: Path, w: dict, msg: int | None) -> tuple[str, str]:
+    """Onde o worker está, lido só do disco. (estado, detalhe)
+
+    A escada usa o que a sala JÁ publica — sino e cursor — e só um arquivo novo:
+      sino ainda pendurado           → NÃO-VIU     (sessão fechada, hook mudo)
+      cursor passou do despacho      → PEGOU       (leu, ainda não marcou etapa)
+      progress com etapa K           → ANDANDO K/N
+      resultados/<w>.md com conteúdo → ENTREGUE
+    """
+    res = run / "resultados" / f"{w['worker']}.md"
+    if res.exists() and res.stat().st_size > 0:
+        return "ENTREGUE", f"{res.stat().st_size} B"
+
+    feitas, nota = 0, ""
+    pj = run / "progress" / f"{w['worker']}.jsonl"
+    if pj.exists():
+        for ln in pj.read_text(encoding="utf-8").splitlines():
+            ln = ln.strip()
+            if not ln:
+                continue
+            try:
+                ev = json.loads(ln)
+            except ValueError:
+                continue
+            nota = ev.get("nota", nota) or nota
+            if isinstance(ev.get("etapa"), int):
+                feitas = max(feitas, min(ev["etapa"], w["etapas"]))
+    if feitas:
+        return f"ANDANDO {feitas}/{w['etapas']}", nota
+
+    if core.p_pendente(w["ia"]).exists():
+        return "NÃO-VIU", "sino ainda pendurado"
+    if msg is not None and core.cursor(w["ia"]) >= msg:
+        return "PEGOU", f"cursor em #{core.cursor(w['ia'])}"
+    return "?", f"sino sumiu e cursor em #{core.cursor(w['ia'])}, atrás de #{msg} — leu outra coisa"
+
+
+def cmd_chamada(a) -> int:
+    run = Path(a.run).resolve()
+    squad = ler_squad(run)
+    d = {}
+    if (run / "despacho.json").exists():
+        d = json.loads((run / "despacho.json").read_text(encoding="utf-8")).get("workers", {})
+    print(f"📋 chamada · {run.name} · {datetime.now():%H:%M:%S}")
+    pend = []
+    for w in squad:
+        msg = d.get(w["worker"], {}).get("msg")
+        e, det = estado(run, w, msg)
+        alvo = f"#{msg}" if msg else "—"
+        print(f"   {w['worker']:14} @{w['ia']:8} {alvo:5} {e:14} {det}")
+        if e in ("NÃO-VIU", "?"):
+            pend.append(w["ia"])
+    if pend:
+        print(f"\n⚠️  sem sinal: {', '.join(pend)} — sino pendurado é sessão fechada ou hook mudo,")
+        print("   não é worker preguiçoso. Re-despacho/fallback NÃO é desta peça (ver NOTA.md).")
+    return 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# julgar — auditor ≠ autor por anel, fail-closed
+# ─────────────────────────────────────────────────────────────────────────────
+
+JULGAMENTO = """⚖️ **SQUAD {run_id} · julgamento** — você julga `{alvo}` (autor: @{autor_ia}).
+
+resultado a julgar: {resultado}
+contrato que ele tinha: {contrato}
+seu veredito:       {veredito}
+
+Confira etapa por etapa: o contrato pedia N, o resultado entregou o quê. Veredito por
+etapa (CUMPRIU / NÃO-CUMPRIU / NÃO-VERIFICÁVEL) + veredito final PASS ou ITERA com o
+defeito específico. Você não é o autor — não conserte o trabalho dele, julgue."""
+
+
+def anel(squad: list[dict]) -> dict[str, str]:
+    """juiz(i) = worker(i+1). Garante juiz≠autor com N≥2; com N≥3 ninguém julga o
+    próprio juiz, que é o que quebra o par-que-se-aprova."""
+    n = len(squad)
+    return {squad[i]["worker"]: squad[(i + 1) % n]["worker"] for i in range(n)}
+
+
+def cmd_julgar(a) -> int:
+    run = Path(a.run).resolve()
+    squad = ler_squad(run)
+    if len(squad) < 2:
+        sys.exit("✗ squad de 1: não há juiz possível. auditor≠autor é inegociável.")
+    if len(squad) == 2:
+        print("⚠️  squad de 2: A julga B e B julga A. É auditor≠autor, mas é um par —")
+        print("   com 3+ o anel impede que alguém julgue quem o julga.")
+    (run / "vereditos").mkdir(parents=True, exist_ok=True)
+    porw = {w["worker"]: w for w in squad}
+    juizes = anel(squad)
+
+    # fail-closed antes de postar qualquer coisa
+    for alvo, juiz in juizes.items():
+        if porw[juiz]["ia"] == porw[alvo]["ia"]:
+            sys.exit(f"✗ juiz de {alvo} seria a própria IA (@{porw[alvo]['ia']}). Abortado.")
+    prontos = [w for w in squad if (run / "resultados" / f"{w['worker']}.md").exists()]
+    if not prontos:
+        sys.exit("✗ nenhum resultado no disco. Julgar o que não existe é teatro.")
+
+    registro = {}
+    for alvo in prontos:
+        juiz = porw[juizes[alvo["worker"]]]
+        texto = JULGAMENTO.format(
+            run_id=run.name, alvo=alvo["worker"], autor_ia=alvo["ia"],
+            resultado=run / "resultados" / f"{alvo['worker']}.md",
+            contrato=run / alvo["contrato"],
+            veredito=run / "vereditos" / f"{alvo['worker']}.md",
+        )
+        n = post(a.de, juiz["ia"], texto)
+        registro[alvo["worker"]] = {"juiz": juiz["worker"], "juiz_ia": juiz["ia"], "msg": n}
+        print(f"⚖️  {alvo['worker']:14} julgado por {juiz['worker']:14} @{juiz['ia']:8} msg #{n}")
+
+    (run / "juizes.json").write_text(
+        json.dumps({"em": core.agora(), "atribuicao": registro}, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    pulados = [w["worker"] for w in squad if w not in prontos]
+    if pulados:
+        print(f"\n= sem resultado, não julgados: {', '.join(pulados)}")
+    print(f"\natribuição no registro público da sala + {run/'juizes.json'}")
+    return 0
+
+
+def main() -> int:
+    import argparse
+    ap = argparse.ArgumentParser(prog="ia-squad", description=__doc__.splitlines()[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("despachar", help="posta 1 ponteiro de contrato por worker")
+    p.add_argument("run")
+    p.add_argument("--de", required=True, help="quem despacha (tem que estar na sala)")
+    p.add_argument("--prazo", help="ex: 23:40 — vai no ponteiro, não arma timer")
+    p.set_defaults(f=cmd_despachar)
+
+    p = sub.add_parser("chamada", help="onde cada worker está (não escreve nada)")
+    p.add_argument("run")
+    p.set_defaults(f=cmd_chamada)
+
+    p = sub.add_parser("julgar", help="despacha o julgamento com juiz≠autor por anel")
+    p.add_argument("run")
+    p.add_argument("--de", required=True)
+    p.set_defaults(f=cmd_julgar)
+
+    a = ap.parse_args()
+    return a.f(a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

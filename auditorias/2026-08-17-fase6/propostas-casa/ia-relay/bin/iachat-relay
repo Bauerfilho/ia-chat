@@ -1,0 +1,402 @@
+#!/usr/bin/env python3
+"""iachat-relay — a mensagem nominada não fica parada para sempre.
+
+O buraco que isto fecha, medido na sala real em 17/08: das 17 nominações, 5 nunca
+tiveram resposta — todas para a mesma IA (codex, sino nunca instalado). A mais antiga
+ficou 74 min parada. Quem chamou só descobriu quando o dono foi olhar.
+
+A doutrina da casa já resolve isso em outro lugar: **rotação de executor — nunca
+insistir no motor que falhou; vai para o braço irmão** (`~/.claude/skills/iaswarm/
+SKILL.md:44-45`). O relay traz essa regra para dentro do ia-chat.
+
+TRÊS DECISÕES, cada uma medida:
+
+1. O RELÓGIO É O `ts` DA MENSAGEM, não o flag nem o cursor.
+   Medido nesta sala, no mesmo instante, para a mesma mensagem parada:
+     mtime de `pendente/codex.md` ....... 0,0 min  (mente: foi reescrito pela nominação nova)
+     `em` de `cursor/codex.json` ........ 80,8 min (mente ao contrário: cursor parado
+                                          também acontece em IA que só POSTA, porque
+                                          `post` não avança o cursor do autor — de
+                                          propósito, `iachat_core.py` dentro de `post`)
+     `ts` da #4, a não lida mais antiga . 74,2 min ← o único que não mente
+   O flag é pior que impreciso: ele RESETA a cada nova nominação (`post` faz
+   `p_pendente(d).write_text(...)`), então quanto mais o remetente insiste, mais tarde
+   o socorro chega. Insistência atrasando o resgate é inversão perversa.
+
+2. SILÊNCIO DE CANAL ≠ SILÊNCIO DE RESPOSTA.
+   Se a IA postou qualquer coisa DEPOIS da nominação, ela está viva e escolhendo a
+   ordem do próprio trabalho — repassar aí seria atropelar. O relay só age quando a
+   mensagem não chegou: sem leitura E sem sinal de vida.
+
+3. REPASSE É TRANSFERÊNCIA DECLARADA, NUNCA CÓPIA SILENCIOSA.
+   A mensagem de repasse nomina a irmã E a original, e diz em uma linha quem assume.
+   Quem acordar depois lê o repasse na mesma leitura em que lê o pedido original —
+   antes de gastar. É o que evita as duas fazerem o mesmo.
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+from datetime import datetime, timedelta
+from pathlib import Path
+
+# No plugin, este arquivo vive em `bin/` ao lado do core. Fora dele (protótipo), acha
+# o core no repositório — sem cópia, para não haver duas verdades do mesmo módulo.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.append(str(Path.home() / "Projetos/ia-chat/bin"))
+import iachat_core as core  # noqa: E402
+
+# 2,4× a pior resposta legítima já observada nesta sala (373 s, #13→#15). Um prazo
+# menor atropelaria trabalho em andamento; um maior não valeria a peça.
+PRAZO_PADRAO_MIN = 15
+
+# Fallback quando `config.json` não declara nada: a cascata de vocação da casa
+# (`~/.claude/skills/iaswarm/SKILL.md:16-19`). Existe para o relay funcionar no
+# primeiro dia, NÃO para virar a fonte da verdade — `check` reclama do que faltar.
+VOCACAO_PADRAO = {
+    "codigo": ["codex", "qwen", "copilot"],
+    "construcao": ["kimi", "grok"],
+    "visual": ["agy"],
+    "cerebro": ["claude"],
+}
+
+
+def p_ledger() -> Path:
+    return core.home() / "relay.json"
+
+
+def ledger() -> dict:
+    try:
+        return json.loads(p_ledger().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"repassadas": {}}
+
+
+_CFG: dict | None = None
+
+
+def cfg() -> dict:
+    """Uma leitura de config por processo. Medido: sem isto, o `config.json` era 82%
+    dos 1.209 B do ciclo ocioso — e o ocioso é o que roda 1.440×/dia."""
+    global _CFG
+    if _CFG is None:
+        _CFG = core.config()
+    return _CFG
+
+
+def cfg_relay() -> dict:
+    r = dict(cfg().get("relay", {}))
+    r.setdefault("prazo_min", PRAZO_PADRAO_MIN)
+    r.setdefault("vocacao", {})
+    r.setdefault("irmas", VOCACAO_PADRAO)
+    return r
+
+
+def irma_de(ia: str, remetente: str, sala: list[str], r: dict) -> tuple[str | None, str]:
+    """Quem assume no lugar de `ia`. Devolve (irmã, motivo) — motivo explica o vazio."""
+    voc = r["vocacao"].get(ia)
+    if not voc:
+        return None, f"'{ia}' não tem vocação declarada em config.json → relay.vocacao"
+    fila = r["irmas"].get(voc)
+    if not fila:
+        return None, f"vocação '{voc}' não tem fila em config.json → relay.irmas"
+    for cand in fila:
+        cand = core.normaliza_ia(cand)
+        if cand != ia and cand != remetente and cand in sala:
+            return cand, ""
+    return None, f"fila de '{voc}' ({', '.join(fila)}) não tem ninguém disponível na sala"
+
+
+def varrer(agora: datetime | None = None) -> dict:
+    """Read-only. Devolve o que está em silêncio e o que o `run` faria."""
+    r = cfg_relay()
+    agora = agora or datetime.now().astimezone()
+    prazo = timedelta(minutes=r["prazo_min"])
+    sala = [core.normaliza_ia(x) for x in cfg().get("na_sala", [])]
+    led_full = ledger()
+    led = led_full["repassadas"]
+
+    # Curto-circuito barato: sem cursor atrasado não há silêncio possível, e não se
+    # toca no chat. Custo do ciclo ocioso = config + .estado.json + 1 cursor por IA.
+    ultima = core._ultimo_numero()
+    cursores = {x: core.cursor(x) for x in sala}
+    atrasadas = [x for x in sala if cursores[x] < ultima]
+    if not atrasadas:
+        return {"ocioso": True, "lido_bytes": 0, "achados": [], "avisos": _avisos(sala, r)}
+
+    # Enquanto NADA mudou (nenhuma mensagem nova, nenhum cursor andou), o resultado da
+    # varredura anterior continua valendo: só a idade muda, e idade é aritmética sobre
+    # o `ts` que já está guardado. Sem isto, uma IA fechada por horas obriga a reler o
+    # chat inteiro a cada ciclo — medido: 26.238 B por ciclo, 1.440 ciclos/dia.
+    chave = {"ultima": ultima, "cursores": cursores}
+    cache = led_full.get("varredura")
+    if cache and cache.get("chave") == chave:
+        achados = [dict(a) for a in cache["achados"]]
+        lido = 0
+    else:
+        # Só aqui o chat é lido — pela cauda, quando o cursor mais atrasado cabe nela.
+        desde = min(cursores[x] for x in atrasadas)
+        with core.travado():
+            msgs = core._msgs_desde(desde)
+        lido = sum(len(m["bruto"].encode()) for m in msgs)
+        achados = []
+        for ia in sala:
+            pendentes = [m for m in msgs if m["n"] > cursores[ia] and ia in m["para"]]
+            if not pendentes:
+                continue
+            m0 = min(pendentes, key=lambda m: m["n"])
+            achados.append(
+                {
+                    "ia": ia,
+                    "n": m0["n"],
+                    "de": m0["de"],
+                    "ts": m0["ts"],
+                    "ns": [m["n"] for m in pendentes],
+                    # Vivacidade: postou depois da nominação ⇒ está trabalhando, não sumida.
+                    "viva": any(m["de"] == ia and m["n"] > m0["n"] for m in msgs),
+                }
+            )
+        # Sem o corpo da mensagem: guardá-lo aqui fazia o ledger inchar 2,7 KB e ser
+        # relido em TODO ciclo — o cache saía mais caro que o que economizava (medido:
+        # ciclo ocioso subiu de 1.209 B para 3.666 B). O corpo é lido uma vez só, na
+        # hora de repassar, que acontece no máximo uma vez por mensagem.
+        led_full["varredura"] = {"chave": chave, "achados": achados}
+        core._escrever_atomico(
+            p_ledger(), json.dumps(led_full, ensure_ascii=False, indent=2) + "\n"
+        )
+
+    for a in achados:
+        idade = agora - datetime.fromisoformat(a["ts"])
+        reg = led.get(str(a["n"]), {})
+        a["idade_min"] = round(idade.total_seconds() / 60, 1)
+        a["repassada"] = bool(reg)
+        a["e_repasse_de"] = reg.get("e_repasse_de")
+        a["vence"] = idade >= prazo and not a["viva"] and not a["repassada"]
+        # A irmã também não leu: a cadeia para aqui, e o operador é chamado.
+        a["irma_muda"] = bool(a["e_repasse_de"]) and not a["viva"] and idade >= 2 * prazo
+    for a in achados:
+        if a["vence"]:
+            a["irma"], a["sem_irma"] = irma_de(a["ia"], a["de"], sala, r)
+    return {
+        "ocioso": False,
+        "lido_bytes": lido,
+        "prazo_min": r["prazo_min"],
+        "achados": achados,
+        "avisos": _avisos(sala, r),
+    }
+
+
+def _avisos(sala: list[str], r: dict) -> list[str]:
+    """A tabela reclama sozinha — é isto que a impede de virar configuração morta."""
+    av = []
+    for ia in sala:
+        if ia not in r["vocacao"]:
+            av.append(f"'{ia}' está na sala e não tem vocação em relay.vocacao")
+    for voc, fila in r["irmas"].items():
+        fora = [x for x in fila if core.normaliza_ia(x) not in sala]
+        if len(fora) == len(fila):
+            av.append(f"vocação '{voc}': nenhum braço da fila está na sala ({', '.join(fila)})")
+    return av
+
+
+def repassar(a: dict) -> dict:
+    """Posta o repasse EM NOME DO REMETENTE original — quem tem o problema é quem esperou.
+
+    Não inventa identidade nova na sala (o `post` recusaria) e não fala como se fosse a
+    IA silenciosa. Nomina as duas: a irmã, que assume; e a original, que precisa saber
+    que a bola passou ANTES de gastar contexto refazendo.
+    """
+    resto = len(a["ns"]) - 1
+    fila = f" (e mais {resto} minha(s) na fila dele: {_lista(a['ns'][1:])})" if resto else ""
+    corpo = (
+        f"[relay] A minha #{a['n']}{fila} está com @{a['ia']} há {a['idade_min']:.0f} min "
+        f"sem leitura. Rotação de executor: @{a['irma']} assume.\n\n"
+        f"@{a['irma']}: o pedido é o da #{a['n']}, abaixo. Se você já estiver com o "
+        f"contexto, toque; senão diga que não é sua praia e devolve.\n"
+        f"@{a['ia']}: se você acordar depois, **não refaça** — pergunte a @{a['irma']} "
+        f"onde parou e complemente. Quem postar primeiro fica com a tarefa.\n\n"
+        f"{_pedido(a)}"
+    )
+    res = core.post(a["de"], corpo, para=[a["irma"], a["ia"]])
+    for w in res.get("avisos", []):
+        print(f"⚠️  {w}", file=sys.stderr)
+    led = ledger()
+    # Todo o backlog daquela IA, não só a mais antiga: quem assume assume a fila.
+    # Sem isto, 5 nominações represadas (o caso real do codex hoje) virariam 5 repasses
+    # em 5 ciclos — enxurrada na sala que TODA IA paga para ler.
+    for n in a["ns"]:
+        led["repassadas"][str(n)] = {
+            "para": a["irma"],
+            "de_origem": a["ia"],
+            "em": core.agora(),
+            "repasse_n": res["n"],
+            "idade_min": a["idade_min"] if n == a["n"] else None,
+        }
+    # UM salto por mensagem, e o próprio repasse já nasce marcado como tratado.
+    # Sem isto, o relay repassa o repasse: medido nesta bateria, a #2 (claude→kimi)
+    # vencia 40 min depois e a fila de 'construcao' devolvia a tarefa para @codex —
+    # exatamente quem estava mudo. Duas IAs mudas para a mesma tarefa não é escolha
+    # de braço errada, é infra quebrada (sino não instalado, casca fechada), e infra
+    # quebrada o operador precisa VER, não o relay contornar em círculo.
+    led["repassadas"][str(res["n"])] = {"e_repasse_de": a["n"], "em": core.agora()}
+    core._escrever_atomico(p_ledger(), json.dumps(led, ensure_ascii=False, indent=2) + "\n")
+    return res
+
+
+def sem_destino(a: dict) -> bool:
+    """Fail-closed: sem irmã declarada o relay NÃO adivinha destino — chama o dono.
+
+    Inventar para quem mandar seria pior que a mensagem parada: mandaria trabalho para
+    um braço sem vocação para ele, e resposta errada custa mais que silêncio. Também
+    não posta no chat: o `post` tira o próprio autor dos destinos, então uma mensagem
+    "em nome do remetente para o remetente" não chamaria ninguém — só engordaria a sala
+    que toda IA paga para ler. Quem decide aqui é o operador, e o canal dele é a
+    notificação do Mac.
+
+    Devolve True se notificou. Re-notifica no máximo 1×/h para o alerta não virar spam
+    (spam a gente aprende a ignorar — a mesma razão do `notificar_operador`).
+    """
+    led = ledger()
+    av = led.setdefault("sem_destino", {})
+    antes = av.get(str(a["n"]), {}).get("em")
+    if antes:
+        idade = (datetime.now().astimezone() - datetime.fromisoformat(antes)).total_seconds()
+        if idade < 3600:
+            return False
+    av[str(a["n"])] = {"em": core.agora(), "ia": a["ia"], "motivo": a["sem_irma"]}
+    core._escrever_atomico(p_ledger(), json.dumps(led, ensure_ascii=False, indent=2) + "\n")
+    os.system(
+        'osascript -e \'display notification "#{n} parada com {ia} há {t:.0f} min · sem irmã declarada"'
+        ' with title "⏱ ia-chat relay" sound name "Ping"\' 2>/dev/null'.format(
+            n=a["n"], ia=a["ia"], t=a["idade_min"]
+        )
+    )
+    return True
+
+
+def _lista(ns: list[int]) -> str:
+    return ", ".join(f"#{n}" for n in ns)
+
+
+def _bruto(n: int) -> str:
+    """O corpo da #n, lido na hora do repasse. O ativo pode ter rotacionado desde a
+    varredura; se a mensagem não estiver mais nele, o repasse vai por referência."""
+    with core.travado():
+        msgs = core.parse(core.p_chat().read_text(encoding="utf-8"))
+    m = next((x for x in msgs if x["n"] == n), None)
+    return m["bruto"] if m else ""
+
+
+def _pedido(a: dict) -> str:
+    """O pedido original, com teto de custo.
+
+    Repassar copiando a íntegra é o certo enquanto a íntegra é pequena. Acima do
+    `AVISO_GRANDE` que o próprio core define (2 KB ≈ 500 tokens por leitura), a cópia
+    passa a ser paga por TODA IA que ler a sala, para sempre — e o original continua
+    no chat, a um `iachat search` de distância. Medido na #4 da sala real (corpo de
+    2.415 B): repasse por íntegra saiu com 2.985 B; por referência, 905 B — 70% menos,
+    e a irmã ainda alcança a íntegra pelo ponteiro (provado: o `search` cai na #4).
+    """
+    bruto = _bruto(a["n"])
+    if not bruto:
+        return (
+            f"--- a #{a['n']} saiu do ativo na rotação. Íntegra: "
+            f"`iachat search \"\" --de {a['de']}` nos recortes. ---\n"
+        )
+    linhas = bruto.splitlines()
+    corte = next((i + 1 for i, l in enumerate(linhas) if l.startswith("### ")), 0)
+    corpo = "\n".join(linhas[corte:]).strip()
+    if len(corpo.encode()) <= core.AVISO_GRANDE:
+        return f"--- íntegra da #{a['n']} ({a['de']}, {a['ts']}) ---\n{corpo}\n"
+    primeiras = "\n".join(corpo.splitlines()[:4]).strip()
+    return (
+        f"--- #{a['n']} ({a['de']}, {a['ts']}) tem {len(corpo.encode())//1024} KB; "
+        f"não copio para a sala não pagar duas vezes. Começo dela: ---\n{primeiras}\n\n"
+        f"Íntegra: `iachat search \"{_gancho(corpo)}\"` — devolve a mensagem inteira paginada.\n"
+    )
+
+
+def _gancho(corpo: str) -> str:
+    """Um trecho literal e raro da mensagem, para o `search` cair nela e não em outra."""
+    for l in corpo.splitlines():
+        l = l.strip().strip("*#> `").split("**")[0].strip()
+        if 12 <= len(l) <= 48 and " " in l and '"' not in l:
+            return l
+    return corpo.strip()[:40]
+
+
+def cmd_check(_a) -> int:
+    r = varrer()
+    for w in r["avisos"]:
+        print(f"⚠️  {w}", file=sys.stderr)
+    if r["ocioso"]:
+        print("= sala em dia: nenhum cursor atrasado (chat não foi lido, 0 B)")
+        return 0
+    print(f"prazo {r['prazo_min']} min · {r['lido_bytes']} B de chat lidos nesta varredura")
+    if not r["achados"]:
+        print("= nenhuma nominação pendente")
+        return 0
+    for a in r["achados"]:
+        if a["repassada"]:
+            marca, obs = "↷", "já repassada"
+        elif a["viva"]:
+            marca, obs = "·", "postou depois — viva, não é silêncio de canal"
+        elif a["vence"]:
+            alvo = a.get("irma")
+            marca = "⏱"
+            obs = f"VENCIDA → @{alvo}" if alvo else f"VENCIDA, sem destino: {a.get('sem_irma')}"
+        else:
+            marca, obs = "·", f"dentro do prazo ({r['prazo_min']} min)"
+        print(f" {marca} #{a['n']} {a['de']}→{a['ia']}  {a['idade_min']:6.1f} min  "
+              f"({len(a['ns'])} pendente(s))  {obs}")
+    return 0
+
+
+def cmd_run(_a) -> int:
+    r = varrer()
+    for w in r["avisos"]:
+        print(f"⚠️  {w}", file=sys.stderr)
+    if r["ocioso"]:
+        return 0
+    feitos = 0
+    for a in r["achados"]:
+        if a.get("irma_muda"):
+            a = dict(a, sem_irma=f"@{a['ia']} recebeu a #{a['e_repasse_de']} por repasse "
+                                 f"e também não leu em {a['idade_min']:.0f} min")
+            novo = sem_destino(a)
+            print(f"⚠️ #{a['e_repasse_de']} parada nas duas pontas ({a['sem_irma']})"
+                  f"{' — operador notificado' if novo else ''}")
+            feitos += 1
+            continue
+        if not a["vence"]:
+            continue
+        if a.get("irma"):
+            res = repassar(a)
+            print(f"↷ #{a['n']} ({a['de']}→{a['ia']}, {a['idade_min']:.0f} min) "
+                  f"repassada a @{a['irma']} na #{res['n']}")
+        else:
+            novo = sem_destino(a)
+            print(f"⚠️ #{a['n']} vencida sem irmã ({a['sem_irma']})"
+                  f"{' — operador notificado' if novo else ' — já notificado nesta hora'}")
+        feitos += 1
+    if not feitos:
+        print("= nada vencido")
+    return 0
+
+
+def main() -> int:
+    import argparse
+
+    ap = argparse.ArgumentParser(prog="iachat-relay", description=__doc__)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("check", help="quem está em silêncio (read-only, não posta)")
+    p.set_defaults(f=cmd_check)
+    p = sub.add_parser("run", help="repassa o que venceu o prazo (idempotente)")
+    p.set_defaults(f=cmd_run)
+    a = ap.parse_args()
+    return a.f(a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

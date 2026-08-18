@@ -1,0 +1,381 @@
+#!/usr/bin/env python3
+"""Reserva cooperativa de caminhos entre IAs que compartilham o mesmo disco.
+
+O estado vive em ``$IACHAT_HOME/claims``. A aquisição reutiliza o lock global do
+ia-chat para que "consultar reservas vivas" e "gravar a minha" sejam uma única
+operação. O mecanismo é cooperativo: ele informa conflitos, mas não intercepta
+as ferramentas de escrita das diferentes cascas.
+
+Comandos:
+  iachat-claim take CAMINHO --de IA --para-que MOTIVO [--min 60]
+  iachat-claim check CAMINHO --de IA
+  iachat-claim renew CAMINHO --de IA [--min 60]
+  iachat-claim free CAMINHO --de IA
+  iachat-claim list [--todas]
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import re
+import sys
+from datetime import datetime, timedelta
+from pathlib import Path
+
+# O executável mora ao lado do núcleo existente; a inserção torna a resolução
+# independente do diretório em que a IA chamou a CLI.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import iachat_core as core  # noqa: E402
+
+
+MINUTOS_PADRAO = 60
+MINUTOS_TETO = 240
+VERSAO_REGISTRO = 1
+
+
+def agora() -> datetime:
+    """Relógio de parede local com fuso explícito, serializável em ISO 8601."""
+    return datetime.now().astimezone()
+
+
+def iso(instante: datetime) -> str:
+    return instante.isoformat(timespec="seconds")
+
+
+def resolver(caminho: str) -> str:
+    """Canoniza ``~``, pontos e symlinks para um alvo ter uma identidade só."""
+    return str(Path(caminho).expanduser().resolve())
+
+
+def pasta_claims() -> Path:
+    """Estado operacional separado da conversa em ``iachat.md``."""
+    return core.home() / "claims"
+
+
+def slug(caminho: str) -> str:
+    """Hash dá unicidade; a cauda legível permite inspecionar a pasta a olho."""
+    digest = hashlib.sha256(caminho.encode("utf-8")).hexdigest()[:16]
+    cauda = re.sub(r"[^A-Za-z0-9._-]+", "-", caminho.strip("/"))
+    cauda = cauda[-48:].strip("-") or "raiz"
+    return f"{digest}-{cauda}.json"
+
+
+def arquivo_claim(caminho: str) -> Path:
+    """Resolve sempre: caminho bruto e caminho canônico jamais viram duas reservas."""
+    canonico = resolver(caminho)
+    return pasta_claims() / slug(canonico)
+
+
+def colidem(a: str, b: str) -> bool:
+    """Mesmo caminho ou contenção por componente; ``/a/b`` não contém ``/a/bc``."""
+    if a == b:
+        return True
+    a_com_barra = a.rstrip("/") + "/"
+    b_com_barra = b.rstrip("/") + "/"
+    return a_com_barra.startswith(b_com_barra) or b_com_barra.startswith(a_com_barra)
+
+
+def ler_claim(caminho: Path) -> dict | None:
+    """Lê um registro completo; arquivo parcial nunca existe por causa do replace."""
+    try:
+        registro = json.loads(caminho.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    obrigatorios = {"caminho", "de", "desde", "ate", "para_que"}
+    if not obrigatorios.issubset(registro):
+        return None
+    registro["_arquivo"] = str(caminho)
+    return registro
+
+
+def viva(registro: dict, instante: datetime | None = None) -> bool:
+    """Toda reserva tem ``ate``; inválida ou vencida nunca bloqueia."""
+    try:
+        vencimento = datetime.fromisoformat(registro["ate"])
+        return vencimento > (instante or agora())
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def restante_min(registro: dict) -> float:
+    vencimento = datetime.fromisoformat(registro["ate"])
+    return (vencimento - agora()).total_seconds() / 60
+
+
+def listar(incluir_vencidas: bool = False) -> list[dict]:
+    """Lista reservas válidas; vencidas continuam auditáveis com ``--todas``."""
+    pasta_claims().mkdir(parents=True, exist_ok=True)
+    instante = agora()
+    registros: list[dict] = []
+    for caminho in sorted(pasta_claims().glob("*.json")):
+        registro = ler_claim(caminho)
+        if registro is None:
+            continue
+        registro["viva"] = viva(registro, instante)
+        if registro["viva"] or incluir_vencidas:
+            registros.append(registro)
+    return registros
+
+
+def minutos_validos(valor: int) -> int:
+    """Impõe expiração positiva e teto; nunca existe reserva infinita."""
+    return max(1, min(int(valor), MINUTOS_TETO))
+
+
+def gravar(registro: dict) -> Path:
+    """Escreve via tmp + fsync + replace do núcleo já provado."""
+    destino = arquivo_claim(registro["caminho"])
+    persistido = {k: v for k, v in registro.items() if not k.startswith("_")}
+    core._escrever_atomico(
+        destino,
+        json.dumps(persistido, ensure_ascii=False, indent=2) + "\n",
+    )
+    return destino
+
+
+def tomar(de: str, caminho: str, para_que: str, minutos: int) -> dict:
+    """Adquire uma reserva sem janela TOCTOU; idempotente para o mesmo dono."""
+    dono = core.normaliza_ia(de)
+    alvo = resolver(caminho)
+    motivo = para_que.strip()
+    if not motivo:
+        raise ValueError("--para-que é obrigatório")
+    prazo = minutos_validos(minutos)
+
+    # A decisão inteira fica sob o flock existente: dois processos que chegam
+    # juntos nunca podem observar o mesmo caminho como livre e ambos vencerem.
+    with core.travado():
+        pasta_claims().mkdir(parents=True, exist_ok=True)
+        for existente in listar():
+            if colidem(alvo, existente["caminho"]) and existente["de"] != dono:
+                return {
+                    "ok": False,
+                    "motivo": "reservado",
+                    "conflito": existente,
+                    "restante_min": restante_min(existente),
+                }
+
+        instante = agora()
+        destino = arquivo_claim(alvo)
+        anterior = ler_claim(destino) if destino.exists() else None
+        mesmo_dono = anterior is not None and anterior.get("de") == dono
+        registro = {
+            "versao": VERSAO_REGISTRO,
+            "caminho": alvo,
+            "de": dono,
+            "para_que": motivo,
+            "desde": anterior["desde"] if mesmo_dono and viva(anterior) else iso(instante),
+            "ate": iso(instante + timedelta(minutes=prazo)),
+            "minutos": prazo,
+            "renovacoes": int(anterior.get("renovacoes", 0)) if mesmo_dono and viva(anterior) else 0,
+        }
+        destino = gravar(registro)
+    return {"ok": True, "claim": registro, "arquivo": str(destino)}
+
+
+def checar(de: str, caminho: str) -> dict:
+    """Consulta advisory sem lock; replace atômico impede leitura pela metade."""
+    dono = core.normaliza_ia(de)
+    alvo = resolver(caminho)
+    for registro in listar():
+        if not colidem(alvo, registro["caminho"]):
+            continue
+        estado = "minha" if registro["de"] == dono else "reservado"
+        return {
+            "estado": estado,
+            "claim": registro,
+            "restante_min": restante_min(registro),
+        }
+    return {"estado": "livre", "caminho": alvo}
+
+
+def renovar(de: str, caminho: str, minutos: int) -> dict:
+    """Renova a partir de agora; reserva já vencida precisa passar por ``take``."""
+    dono = core.normaliza_ia(de)
+    alvo = resolver(caminho)
+    prazo = minutos_validos(minutos)
+
+    with core.travado():
+        registro = ler_claim(arquivo_claim(alvo))
+        if registro is None:
+            return {"ok": False, "motivo": "não existe reserva para este caminho"}
+        if not viva(registro):
+            return {"ok": False, "motivo": "a reserva venceu; use take para disputar novamente"}
+        if registro["de"] != dono:
+            return {
+                "ok": False,
+                "motivo": f"a reserva é de {registro['de']}, não sua",
+                "conflito": registro,
+            }
+
+        # Protege contra estado legado/manual inconsistente: uma renovação não
+        # reativa um pai sobre uma reserva viva de terceiro criada depois.
+        for existente in listar():
+            if existente["_arquivo"] == registro["_arquivo"]:
+                continue
+            if colidem(alvo, existente["caminho"]) and existente["de"] != dono:
+                return {
+                    "ok": False,
+                    "motivo": f"há reserva sobreposta de {existente['de']}",
+                    "conflito": existente,
+                }
+
+        registro["ate"] = iso(agora() + timedelta(minutes=prazo))
+        registro["minutos"] = prazo
+        registro["renovacoes"] = int(registro.get("renovacoes", 0)) + 1
+        gravar(registro)
+    return {"ok": True, "claim": registro}
+
+
+def liberar(de: str, caminho: str) -> dict:
+    """Liberação é explícita e restrita ao dono da reserva exata."""
+    dono = core.normaliza_ia(de)
+    alvo = resolver(caminho)
+    with core.travado():
+        destino = arquivo_claim(alvo)
+        registro = ler_claim(destino)
+        if registro is None:
+            return {"ok": True, "motivo": "não havia reserva (já livre)"}
+        if registro["de"] != dono:
+            return {
+                "ok": False,
+                "motivo": f"a reserva é de {registro['de']}, não sua",
+                "conflito": registro,
+            }
+        destino.unlink(missing_ok=True)
+    return {"ok": True, "liberado": alvo, "era_de": dono}
+
+
+def linha(registro: dict) -> str:
+    restante = restante_min(registro)
+    prazo = f"{restante:+.0f} min" if restante > 0 else f"VENCIDA {abs(restante):.0f} min"
+    return (
+        f"{registro['caminho']}\n"
+        f"   {registro['de']:10} {prazo:>18}   {registro.get('para_que', '—')}"
+    )
+
+
+def cmd_take(args: argparse.Namespace) -> int:
+    try:
+        resultado = tomar(args.de, args.caminho, args.para_que, args.minutos)
+    except ValueError as erro:
+        print(f"✗ {erro}", file=sys.stderr)
+        return 2
+    if not resultado["ok"]:
+        conflito = resultado["conflito"]
+        print(
+            f"✗ reservado por {conflito['de']} — "
+            f"{resultado['restante_min']:.0f} min restantes",
+            file=sys.stderr,
+        )
+        print(f"  {conflito['caminho']} — {conflito['para_que']}", file=sys.stderr)
+        return 1
+    registro = resultado["claim"]
+    print(f"🔒 {registro['caminho']}")
+    print(
+        f"   {registro['de']} por {registro['minutos']} min "
+        f"(até {registro['ate']}) — {registro['para_que']}"
+    )
+    return 0
+
+
+def cmd_check(args: argparse.Namespace) -> int:
+    resultado = checar(args.de, args.caminho)
+    if resultado["estado"] == "livre":
+        print(f"✔ livre: {resultado['caminho']}")
+        return 0
+    if resultado["estado"] == "minha":
+        print(f"✔ sua: {resultado['restante_min']:.0f} min restantes")
+        return 0
+    registro = resultado["claim"]
+    print(
+        f"🔒 reservado por {registro['de']} — "
+        f"{resultado['restante_min']:.0f} min — {registro['para_que']}"
+    )
+    return 1
+
+
+def cmd_renew(args: argparse.Namespace) -> int:
+    resultado = renovar(args.de, args.caminho, args.minutos)
+    if not resultado["ok"]:
+        print(f"✗ {resultado['motivo']}", file=sys.stderr)
+        return 1
+    registro = resultado["claim"]
+    print(
+        f"🔁 {registro['caminho']} até {registro['ate']} "
+        f"(renovação #{registro['renovacoes']})"
+    )
+    return 0
+
+
+def cmd_free(args: argparse.Namespace) -> int:
+    resultado = liberar(args.de, args.caminho)
+    if not resultado["ok"]:
+        print(f"✗ {resultado['motivo']}", file=sys.stderr)
+        return 1
+    if "liberado" in resultado:
+        print(f"🔓 {resultado['liberado']}")
+    else:
+        print(f"= {resultado['motivo']}")
+    return 0
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    registros = listar(incluir_vencidas=args.todas)
+    if not registros:
+        print("(nenhuma reserva viva)")
+        return 0
+    for registro in registros:
+        print(linha(registro))
+    print(
+        f"\n{len(registros)} reserva(s) · padrão {MINUTOS_PADRAO} min · "
+        f"teto {MINUTOS_TETO} min"
+    )
+    return 0
+
+
+def parser() -> argparse.ArgumentParser:
+    cli = argparse.ArgumentParser(prog="iachat-claim", description=__doc__)
+    comandos = cli.add_subparsers(dest="comando", required=True)
+
+    def com_caminho(nome: str, ajuda: str) -> argparse.ArgumentParser:
+        comando = comandos.add_parser(nome, help=ajuda)
+        comando.add_argument("caminho")
+        comando.add_argument("--de", required=True, help="IA dona ou consulente")
+        return comando
+
+    take = com_caminho("take", "reservar caminho")
+    take.add_argument("--para-que", required=True, dest="para_que")
+    take.add_argument(
+        "--min",
+        type=int,
+        default=MINUTOS_PADRAO,
+        dest="minutos",
+        help=f"prazo em minutos (padrão {MINUTOS_PADRAO}, teto {MINUTOS_TETO})",
+    )
+    take.set_defaults(funcao=cmd_take)
+
+    check = com_caminho("check", "consultar; exit 1 quando for de outra IA")
+    check.set_defaults(funcao=cmd_check)
+
+    renew = com_caminho("renew", "renovar explicitamente a partir de agora")
+    renew.add_argument("--min", type=int, default=MINUTOS_PADRAO, dest="minutos")
+    renew.set_defaults(funcao=cmd_renew)
+
+    free = com_caminho("free", "liberar explicitamente; só o dono")
+    free.set_defaults(funcao=cmd_free)
+
+    listar_cmd = comandos.add_parser("list", help="listar reservas vivas")
+    listar_cmd.add_argument("--todas", action="store_true", help="incluir vencidas")
+    listar_cmd.set_defaults(funcao=cmd_list)
+    return cli
+
+
+def main() -> int:
+    args = parser().parse_args()
+    return args.funcao(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

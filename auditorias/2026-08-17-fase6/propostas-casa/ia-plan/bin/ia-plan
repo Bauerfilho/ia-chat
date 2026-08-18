@@ -1,0 +1,203 @@
+#!/bin/bash
+# ia-plan — aciona OUTRA IA em modo plano e traz de volta um PLANO, nunca uma execução.
+#
+# A sala (ia-chat) resolve "uma IA PEDE, a outra responde quando ler". Esta peça resolve
+# o outro lado: ACIONAR uma IA agora, com uma tarefa, e receber um documento que o dono
+# aprova antes de qualquer byte mudar.
+#
+# O gate NÃO é o prompt. O gate é o disco: fotografa antes, refotografa depois, e um único
+# byte alterado manda o plano para quarentena. Prompt convence; medição prova.
+#
+# Uso:
+#   ia-plan <casca> "<tarefa>" [--repo DIR] [--de QUEM] [--gastar]
+#
+# Sem --gastar não dispara nada: imprime o comando exato, a trava e de quem é a assinatura
+# que seria queimada. Padrão fail-closed em CUSTO — a peça nunca gasta o plano de outra IA
+# por acidente.
+set -euo pipefail
+
+TETO_SEG="${IA_PLAN_TETO:-600}"                       # watchdog: 10 min por disparo
+SALA="${IACHAT_HOME:-$HOME/ia-chat-global}"
+IACHAT="${IA_PLAN_IACHAT:-$HOME/Projetos/ia-chat/bin/iachat}"
+DIR_PLANOS="$SALA/planos"
+
+morre() { echo "✗ $*" >&2; exit 2; }
+
+# Posta o ponteiro em nome de quem PRODUZIU o texto — não de quem rodou o processo. É o que
+# faz o sino tocar em quem pediu sem disparar o anti-eco. Se a casca não estiver registrada
+# na sala, o iachat recusa: o aviso nunca some, ele cai para stderr com o conserto ao lado.
+avisa_sala() { # de para texto
+  local de="$1" para="$2" texto="$3" saida
+  if [ ! -x "$IACHAT" ]; then echo "→ (sem iachat em $IACHAT) $texto" >&2; return 0; fi
+  if saida=$("$IACHAT" post --de "$de" --para "$para" "$texto" 2>&1); then
+    echo "$saida"
+  else
+    echo "⚠️  ponteiro NÃO postado — $saida" >&2
+    echo "→ $texto" >&2
+  fi
+  return 0
+}
+
+# ---------------- argumentos ----------------
+[ $# -ge 2 ] || morre "uso: ia-plan <casca> \"<tarefa>\" [--repo DIR] [--de QUEM] [--gastar]"
+CASCA="$1"; TAREFA="$2"; shift 2
+REPO="$PWD"; DE="${IA_PLAN_DE:-$(basename "${SHELL:-operador}")}"; GASTAR=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --repo)   REPO="$(cd "$2" && pwd)"; shift 2 ;;
+    --de)     DE="$2"; shift 2 ;;
+    --gastar) GASTAR=1; shift ;;
+    *) morre "flag desconhecida: $1" ;;
+  esac
+done
+
+# ---------------- tabela casca → disparo ----------------
+# trava=nativa  : a casca tem modo plano de fábrica (o motor recusa a ferramenta de escrita)
+# trava=sandbox : não tem modo plano; o sandbox do harness recusa a escrita
+# trava=gate    : não tem nem uma nem outra; só a medição do disco separa plano de execução
+case "$CASCA" in
+  kimi)   TRAVA=nativa;  PLANO_FLAG="--plan" ;;
+  grok)   TRAVA=nativa;  PLANO_FLAG="--permission-mode plan" ;;
+  agy)    TRAVA=nativa;  PLANO_FLAG="--mode plan" ;;
+  claude) TRAVA=nativa;  PLANO_FLAG="--permission-mode plan" ;;
+  codex)  TRAVA=sandbox; PLANO_FLAG="-s read-only -a never" ;;
+  qwen)   TRAVA=gate;    PLANO_FLAG="" ;;
+  *) morre "casca sem adaptador: $CASCA (kimi codex qwen grok agy claude)" ;;
+esac
+
+# ---------------- o preâmbulo ----------------
+preambulo() {
+cat <<EOF
+MODO PLANO — ia-plan. Você foi acionada para PLANEJAR, não para executar.
+
+REGRAS, verificadas depois por medição do disco e não pela sua palavra:
+1. NÃO crie, edite ou apague arquivo nenhum. Ler é permitido e esperado.
+2. NÃO rode comando que altere estado (commit, install, mkdir, redirecionamento).
+3. Devolva o plano por texto, aqui mesmo. Quem grava o arquivo sou eu, não você.
+
+O disco de $REPO foi fotografado antes deste disparo e será refotografado depois.
+Um único byte alterado invalida o plano inteiro: ele vai para quarentena e não chega a
+quem pediu. Planejar é barato e reversível; executar sem plano aprovado não é.
+
+FORMATO, nesta ordem, sem preâmbulo:
+## Objetivo — uma frase
+## O que eu li — arquivo:linha do que embasa o plano
+## Passos — numerados; cada um com o arquivo que toca e o critério de pronto
+## Riscos — o que pode dar errado e como se percebe
+## O que eu não sei — o que precisaria ser medido antes de executar
+
+TAREFA: $TAREFA
+EOF
+}
+
+# ---------------- fotografia do disco ----------------
+# Cobre o que é rastreado E o que não é (--porcelain lista untracked). Fora de repo git,
+# cai para find+mtime+tamanho. Medido: 0,02 s em repo de 34.389 arquivos.
+foto() {
+  if git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
+    # Pathspec obrigatório: `~/Projetos/ia-chat` não é repo próprio, está dentro do repo do
+    # HOME. Sem `-- "$REPO"` a foto pega 202 linhas do home inteiro (medido) e qualquer cache
+    # que outro processo escrever durante o disparo reprova um plano inocente. Falso positivo
+    # mata a confiança no gate mais rápido que falso negativo. Com pathspec: 1 linha, 0,00 s.
+    git -C "$REPO" --no-optional-locks status --porcelain -- "$REPO" 2>/dev/null
+    git -C "$REPO" --no-optional-locks rev-parse HEAD 2>/dev/null || true
+  else
+    find "$REPO" -type f -not -path "*/.git/*" -exec stat -f '%N %z %m' {} + 2>/dev/null | sort
+  fi
+}
+
+CMD_HUMANO="$CASCA ${PLANO_FLAG:+$PLANO_FLAG }-p \"<preâmbulo + tarefa>\""
+[ "$CASCA" = codex ] && CMD_HUMANO="codex exec $PLANO_FLAG \"<preâmbulo + tarefa>\""
+BYTES_PREAMBULO=$(preambulo | wc -c | tr -d ' ')
+
+# ---------------- modo seco: o padrão ----------------
+if [ "$GASTAR" -eq 0 ]; then
+  cat <<EOF
+ia-plan — MODO SECO (nada foi disparado, nada foi gasto)
+
+casca      $CASCA
+trava      $TRAVA$([ "$TRAVA" = gate ] && echo "   ⚠️  sem modo plano nem sandbox: só a medição do disco separa plano de execução")
+comando    $CMD_HUMANO
+repo       $REPO
+prompt     $BYTES_PREAMBULO B de preâmbulo + tarefa
+custo      1 turno da assinatura de $CASCA (do Bauer). Um plano típico medido na frota: 3,4-12,5 KB de volta.
+volta      arquivo em $DIR_PLANOS/ + ponteiro nominado a @$DE na sala
+
+Disparar de verdade: repita o comando com --gastar
+EOF
+  exit 0
+fi
+
+# ---------------- disparo ----------------
+ID="$(date +%Y-%m-%d-%H%M%S)-$CASCA"
+TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+mkdir -p "$DIR_PLANOS"
+foto > "$TMP/antes.txt"
+
+case "$CASCA" in
+  codex) set -- codex exec $PLANO_FLAG "$(preambulo)" ;;
+  *)     set -- "$CASCA" $PLANO_FLAG -p "$(preambulo)" ;;
+esac
+
+echo "→ $CASCA em modo plano (trava: $TRAVA) · teto ${TETO_SEG}s · gastando 1 turno" >&2
+set +m   # sem job control o watchdog morre calado; com ele o bash imprime "Terminated: 15"
+"$@" > "$TMP/saida.txt" 2>"$TMP/erro.txt" < /dev/null &
+PID=$!
+# Watchdog casado pelo PID do próprio filho: `timeout`/`gtimeout` não existem neste macOS, e
+# padrão genérico mata processo errado. O `>/dev/null` solta os descritores do chamador — sem
+# ele o `sleep` sobrevivente segura o stdout de quem chamou e a sessão fica pendurada.
+# `pkill -P` antes do kill: matar só a casca deixa os filhos dela vivos (medido: 4 órfãos
+# em 4 disparos). Netos ainda escapam — limitação conhecida, não coberta.
+( sleep "$TETO_SEG"; pkill -P "$PID" 2>/dev/null; kill -TERM "$PID" 2>/dev/null ) >/dev/null 2>&1 & CAO=$!
+SAIU=0; wait "$PID" 2>/dev/null || SAIU=$?     # sem `|| SAIU=$?` o set -e mata o script no
+pkill -P "$CAO" 2>/dev/null || true            # timeout e o gate abaixo nunca roda
+kill "$CAO" 2>/dev/null || true
+wait "$CAO" 2>/dev/null || true
+
+# A foto de depois roda SEMPRE — inclusive quando a casca travou ou quebrou. Uma casca que
+# escreveu e depois pendurou é exatamente o caso em que o gate precisa falar.
+foto > "$TMP/depois.txt"
+
+# ---------------- gate: o disco, não a palavra ----------------
+if ! diff -q "$TMP/antes.txt" "$TMP/depois.txt" >/dev/null 2>&1; then
+  ALVO="$DIR_PLANOS/$ID.QUARENTENA.md"
+  { echo "# PLANO EM QUARENTENA — $CASCA violou o modo plano"; echo
+    echo "tarefa: $TAREFA"; echo "repo:   $REPO"; echo
+    echo "## o que mudou no disco"; echo '```'
+    diff "$TMP/antes.txt" "$TMP/depois.txt" || true; echo '```'; echo
+    echo "## o plano que ela devolveu (NÃO confiável — ela mexeu no disco)"; echo
+    cat "$TMP/saida.txt"; } > "$ALVO"
+  echo "✗ GATE REPROVOU: $CASCA alterou o disco em modo plano." >&2
+  echo "  quarentena: $ALVO" >&2
+  avisa_sala "$CASCA" "$DE" \
+    "ia-plan REPROVADO: pediram plano de \"$TAREFA\" e eu alterei o disco de $REPO. O plano está em quarentena, não use: $ALVO"
+  exit 3
+fi
+
+if [ "$SAIU" -gt 128 ]; then
+  cp "$TMP/saida.txt" "$DIR_PLANOS/$ID.PARCIAL.md" 2>/dev/null || true
+  echo "✗ $CASCA estourou o teto de ${TETO_SEG}s e foi morta (disco intacto — o gate passou)." >&2
+  echo "  parcial: $DIR_PLANOS/$ID.PARCIAL.md · IA_PLAN_TETO=<segundos> aumenta o teto" >&2
+  exit 5
+fi
+
+if [ ! -s "$TMP/saida.txt" ]; then
+  echo "✗ $CASCA não devolveu nada (saiu=$SAIU). stderr:" >&2
+  head -20 "$TMP/erro.txt" >&2
+  exit 4
+fi
+
+# ---------------- entrega: plano em arquivo, ponteiro na sala ----------------
+ALVO="$DIR_PLANOS/$ID.md"
+{ echo "# Plano — $TAREFA"; echo
+  echo "casca: $CASCA · trava: $TRAVA · repo: $REPO · pedido por: $DE"
+  echo "gate do disco: INTACTO (fotografado antes e depois; nenhum byte mudou)"; echo "---"; echo
+  cat "$TMP/saida.txt"; } > "$ALVO"
+
+BYTES=$(wc -c < "$ALVO" | tr -d ' ')
+PASSOS=$(grep -cE '^[0-9]+[.)] ' "$TMP/saida.txt" 2>/dev/null || echo 0)   # só passos numerados
+TITULO=$(printf '%s' "$TAREFA" | cut -c1-60)
+PONTEIRO="plano pronto: \"$TITULO\" · ${BYTES} B · ~${PASSOS} passos · gate do disco INTACTO · ler: $ALVO"
+
+avisa_sala "$CASCA" "$DE" "$PONTEIRO"
+echo "✔ $ALVO"

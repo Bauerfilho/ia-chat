@@ -1,0 +1,6 @@
+{
+  "na_sala": ["claude", "codex", "kimi"],
+  "brain": "claude",
+  "teto_bytes": 40960,
+  "notificar_operador": false
+}

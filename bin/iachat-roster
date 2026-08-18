@@ -1,0 +1,306 @@
+#!/usr/bin/env python3
+"""iachat-roster — quem é quem na sala, e o que o disco PROVA sobre cada uma.
+
+Existe porque `iachat status` responde "na sala: claude, codex, kimi" lendo uma lista
+estática do config.json (iachat_core.py:460 e :467). Em 17/08, às 21:07, essa linha
+dizia que o codex estava na sala enquanto o sino dele não existia e o cursor dele
+estava 15 mensagens atrás. A mensagem #15 ficou parada 56 minutos. A lista não estava
+errada: ela estava respondendo outra pergunta.
+
+REGRA DESTE PROGRAMA (trava 1 do contrato e6): todo campo é uma OBSERVAÇÃO com hora,
+nunca uma promessa. Cada linha distingue TRÊS desfechos, nunca dois:
+  · visto              — o disco prova que a IA agiu nesta sala (cursor com leitura);
+  · ausente            — o disco prova que NADA a vincula a esta sala (sem cursor,
+                         sem chamado pendente, sem sino);
+  · não-verificável    — existe artefato, mas ele não prova nem nega (cursor
+                         corrompido, chamado sem leitura, sino sem sala declarada).
+Há um quarto rótulo, que não é desfecho de evidência: "fora da sala" — o config
+PROVA que o nome não está em na_sala. Nome fora da sala nunca vira presença
+fantasma nem vira "ausente" (trava 3 do contrato).
+Fundir "não-verificável" com qualquer um dos outros dois é exatamente o defeito
+que esta peça existe para matar. Um roster que mente é pior que roster nenhum.
+
+READ-ONLY POR CONSTRUÇÃO: lê os JSON crus com pathlib, de propósito. Não importa
+iachat_core, porque `core.status()` (iachat_core.py:455) → `config()` (:123-124) →
+`garantir_estrutura()` (:110-121) faz mkdir e ESCREVE config.json e iachat.md.
+Perguntar quem está na sala nunca pode criar a sala. E não pega o lock: `status()`
+pega (:457) e lê o chat inteiro só para contar mensagens — no teto de 100 KB isso é
+bloquear todo mundo que quer postar para responder uma pergunta de cadastro.
+"""
+from __future__ import annotations
+
+import json
+import os
+import plistlib
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+BELL_LABEL = "com.bauer.ia-bell-{}"  # ia-bell-install-daemon.sh:16
+LIMITE_PARADO_S = 600  # chamado parado há mais de 10 min vira alerta
+
+
+def home() -> Path:
+    return Path(os.environ.get("IACHAT_HOME", "~/ia-chat-global")).expanduser()
+
+
+def normaliza(nome: object) -> str:
+    return str(nome).strip().lower().lstrip("@")
+
+
+def idade(ts: float | None) -> tuple[float | None, str]:
+    """Segundos e rótulo curto. `None` vira '—', nunca vira zero."""
+    if ts is None:
+        return None, "—"
+    s = max(0.0, time.time() - ts)
+    if s < 90:
+        return s, f"há {int(s)}s"
+    if s < 5400:
+        return s, f"há {int(s // 60)}min"
+    return s, f"há {s / 3600:.1f}h"
+
+
+def quando(iso: object) -> float | None:
+    if not isinstance(iso, str) or not iso:
+        return None
+    try:
+        return datetime.fromisoformat(iso).timestamp()
+    except ValueError:
+        return None
+
+
+def sinos_no_ar() -> dict[str, str]:
+    """label -> PID. Captura a saída INTEIRA antes de julgar.
+
+    `launchctl list | grep -q` daria falso negativo: o grep sai no primeiro casamento,
+    o pipe fecha, o launchctl morre de SIGPIPE. Foi o que negou um daemon que tinha
+    subido, em 17/08 (ia-bell-install-daemon.sh:48-51). Custo medido na NOTA: 0,00s.
+    """
+    try:
+        out = subprocess.run(
+            ["launchctl", "list"], capture_output=True, text=True, timeout=10
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    achados = {}
+    for linha in out.splitlines():
+        campos = linha.split("\t")
+        if len(campos) >= 3 and campos[2].startswith("com.bauer.ia-bell-"):
+            achados[campos[2]] = campos[0]
+    return achados
+
+
+def sala_do_sino(label: str) -> tuple[bool, str | None]:
+    """Para QUAL sala esse sino toca. Devolve (plist_legível, IACHAT_HOME|None).
+
+    O plist carrega IACHAT_HOME (ia-bell-install-daemon.sh:35), então um sino no ar
+    pode estar vigiando outra sala — e aí ele está no ar e é inútil para esta. Sem
+    esta checagem o campo `sino` seria exatamente o tipo de verde que mente. E se o
+    plist não abre, isso é "não consigo ver" — nunca vira "no ar" por omissão.
+    """
+    p = Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
+    try:
+        with p.open("rb") as f:
+            d = plistlib.load(f)
+    except (OSError, ValueError, KeyError, TypeError, plistlib.InvalidFileException):
+        return False, None
+    return True, d.get("EnvironmentVariables", {}).get("IACHAT_HOME")
+
+
+def estado_cursor(h: Path, ia: str) -> tuple[str, int, float | None, str]:
+    """O que o cursor prova. -> (categoria, ultima_lida, leu_s, leu_rotulo)
+
+    categoria: "visto" (leitura provada), "sem-cursor" (arquivo ausente),
+    "corrupto" (arquivo existe e não parseia — não consigo ver), ou "vazio"
+    (parseia mas ultima_lida=0 e sem `em`: existe e não prova nada).
+    """
+    p = h / "cursor" / f"{ia}.json"
+    if not p.exists():
+        return "sem-cursor", 0, None, "—"
+    try:
+        cur = json.loads(p.read_text(encoding="utf-8"))
+        lida = int(cur.get("ultima_lida", 0) or 0)
+    except (OSError, ValueError, TypeError, AttributeError):
+        return "corrupto", 0, None, "—"
+    s_leu, r_leu = idade(quando(cur.get("em", "")))
+    if lida > 0 or s_leu is not None:
+        return "visto", lida, s_leu, r_leu
+    return "vazio", 0, None, "—"
+
+
+def olhar(ia: str, h: Path, ultima: int | None, sinos: dict, na_sala: bool) -> dict:
+    """Uma linha do cadastro: tudo que o disco prova sobre esta IA, mais o desfecho."""
+    cat, lida, s_leu, r_leu = estado_cursor(h, ia)
+
+    flag = h / "pendente" / f"{ia}.md"
+    s_flag, r_flag = idade(flag.stat().st_mtime if flag.exists() else None)
+
+    label = BELL_LABEL.format(ia)
+    pid = sinos.get(label)
+    sino_outro = None      # sino no ar vigiando OUTRA sala (caminho dela)
+    sino_incetivo = False  # sino no ar, mas a sala dele eu não consegui ler
+    if pid:
+        legivel, alvo = sala_do_sino(label)
+        if not legivel or alvo is None:
+            sino_incetivo = True
+        elif Path(alvo).expanduser() != h:
+            sino_outro = alvo
+
+    # ── o desfecho da linha (trava 1: três desfechos, nunca dois) ───────────
+    if not na_sala:
+        # o config PROVA que não está em na_sala — não é ausente, é fora da sala
+        desfecho = "fora da sala"
+    elif cat == "visto":
+        desfecho = "visto"
+    elif cat == "corrupto":
+        desfecho = "não-verificável"
+    elif cat in ("sem-cursor", "vazio"):
+        # sem prova de ato da IA. Há QUALQUER outro artefato (chamado, sino)?
+        # Se sim, não é ausência provada — é evidência que não basta.
+        desfecho = "não-verificável" if (s_flag is not None or pid) else "ausente"
+    else:
+        desfecho = "não-verificável"
+
+    # Atraso só faz sentido para quem já leu alguma vez. Para quem nunca leu,
+    # mensagem parada não é atraso — é ausência. Vira '—', nunca número (NOTA §4).
+    atraso = max(0, ultima - lida) if (cat == "visto" and ultima is not None) else None
+    return {
+        "ia": ia,
+        "na_sala": na_sala,
+        "desfecho": desfecho,
+        "cursor_cat": cat,
+        "sino_pid": pid,
+        "sino_label": label,
+        "sino_outro": sino_outro,
+        "sino_incetivo": sino_incetivo,
+        "lida": lida,
+        "atraso": atraso,
+        "leu_s": s_leu,
+        "leu": r_leu,
+        "parado_s": s_flag,
+        "parado": r_flag,
+    }
+
+
+def main(argv: list[str]) -> int:
+    h = home()
+    if not (h / "config.json").exists():
+        print(f"✗ sala não encontrada em {h}", file=sys.stderr)
+        return 2
+
+    try:
+        cfg = json.loads((h / "config.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        print(f"✗ config.json ilegível em {h}", file=sys.stderr)
+        return 2
+    sala = [normaliza(x) for x in cfg.get("na_sala", [])]
+    voc = cfg.get("vocacao", {}) or {}
+
+    # ultima mensagem: SÓ o .estado.json (iachat_core.py:207). Ausente → None → '—'.
+    # Nunca 0: com 0, o atraso de quem já leu sairia negativo-cortado e a contagem
+    # pareceria certeza onde não há nenhuma.
+    try:
+        ultima = int(json.loads((h / ".estado.json").read_text(encoding="utf-8"))
+                     .get("ultima", 0) or 0)
+    except (OSError, ValueError, TypeError):
+        ultima = None
+
+    sinos = sinos_no_ar()
+
+    # Nomes fora de na_sala que têm artefato na sala (cursor ou chamado) não viram
+    # presença fantasma nem "ausente": entram como "fora da sala" (trava 3).
+    nomes = list(dict.fromkeys(sala))  # ordem do config, sem duplicatas
+    extras = []
+    for pasta, sufixo in (("cursor", ".json"), ("pendente", ".md")):
+        d = h / pasta
+        if d.is_dir():
+            for p in sorted(d.iterdir()):
+                if p.suffix == sufixo:
+                    nome = p.stem.lower()
+                    if nome not in nomes and nome not in extras:
+                        extras.append(nome)
+    if len(argv) > 1:
+        alvo = normaliza(argv[1])
+        if alvo not in nomes and alvo not in extras:
+            extras.append(alvo)
+
+    linhas = [olhar(ia, h, ultima, sinos, True) for ia in nomes]
+    linhas += [olhar(ia, h, ultima, sinos, ia in sala) for ia in extras]
+
+    titulo_ultima = f"última #{ultima}" if ultima is not None else "última —"
+    print(f"sala {h} · {titulo_ultima} · {time.strftime('%H:%M:%S')}")
+    print()
+    print(f"{'ia':<10} {'desfecho':<16} {'sino':<16} {'leu':<11} {'atraso':>6}  "
+          f"{'chamado parado':<15} vocação")
+    for L in linhas:
+        if not L["sino_pid"]:
+            sino = "✗ SEM SINO"
+        elif L["sino_outro"]:
+            sino = "⚠ outra sala"
+        elif L["sino_incetivo"]:
+            sino = "? sala incerta"
+        else:
+            sino = f"no ar {L['sino_pid']}"
+        atraso = "—" if L["atraso"] is None else (str(L["atraso"]) or "—")
+        parado = L["parado"] + (" ⚠" if L["parado_s"] is not None else "")
+        v = voc.get(L["ia"], {}) or {}
+        rot = v.get("bom") or "(não declarada)"
+        print(f"{L['ia']:<10} {L['desfecho']:<16} {sino:<16} {L['leu']:<11} "
+              f"{atraso:>6}  {parado:<15} {rot}")
+
+    # ── o que exige ação, com o motivo medido ────────────────────────────────
+    alertas = []
+    for L in linhas:
+        if not L["sino_pid"]:
+            alertas.append(
+                f"{L['ia']}: sino NÃO INSTALADO ({L['sino_label']} ausente de launchctl). "
+                f"Nomear {L['ia']} não avisa ninguém.\n"
+                f"    subir: ia-bell-install-daemon.sh {L['ia']}"
+            )
+        elif L["sino_outro"]:
+            alertas.append(
+                f"{L['ia']}: sino no ar (PID {L['sino_pid']}) mas vigiando OUTRA sala "
+                f"({L['sino_outro']}). Para esta sala ele é inútil."
+            )
+        elif L["sino_incetivo"]:
+            alertas.append(
+                f"{L['ia']}: sino no ar (PID {L['sino_pid']}) mas o plist não abre ou não "
+                f"declara IACHAT_HOME — não dá para afirmar que vigia esta sala."
+            )
+        if L["cursor_cat"] == "corrupto":
+            alertas.append(
+                f"{L['ia']}: cursor ilegível ({h / 'cursor' / (L['ia'] + '.json')}) — "
+                f"não consigo provar nem negar que leu. Linha marcada não-verificável."
+            )
+        if L["parado_s"] is not None and L["parado_s"] > LIMITE_PARADO_S:
+            extra = (f", sala #{ultima}" if ultima is not None else "")
+            alertas.append(
+                f"{L['ia']}: chamado {L['parado']} e ainda não leu "
+                f"(cursor #{L['lida']}{extra} — {L['atraso']} atrás)."
+                if L["atraso"] is not None else
+                f"{L['ia']}: chamado {L['parado']} e ainda não leu."
+            )
+    if alertas:
+        print()
+        for a in alertas:
+            print(f"⚠ {a}")
+
+    # ── a parte que quase todo painel esconde (saída obrigatória) ────────────
+    print()
+    print("não sei dizer, e não vou fingir:")
+    print("  · se a janela de alguma delas está aberta AGORA — nenhum arquivo desta")
+    print("    sala prova isso; 'leu' é a última vez que ela leu, não que ela existe")
+    print("  · se quem leu há pouco está LIVRE ou no meio de um raciocínio de 3 min —")
+    print("    presença não é disponibilidade, e este programa não promete resposta")
+    sem_voc = [L["ia"] for L in linhas if L["na_sala"] and L["ia"] not in voc]
+    if sem_voc:
+        eh = "é boa" if len(sem_voc) == 1 else "são boas"
+        print(f"  · no que {', '.join(sem_voc)} {eh}: config.json não tem bloco")
+        print("    `vocacao` para ela(s) — nominar é palpite até alguém declarar")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))

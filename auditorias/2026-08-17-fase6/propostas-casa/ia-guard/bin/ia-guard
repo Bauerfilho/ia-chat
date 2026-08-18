@@ -1,0 +1,71 @@
+#!/usr/bin/env python3
+"""ia-guard — ensaio da mensagem ANTES de postar. Não posta nada, não escreve nada.
+
+    ia-guard < rascunho.md
+    echo "minha mensagem" | ia-guard
+    ia-guard --texto "minha mensagem"
+
+Saída em exit code:  0 = limpo ou só P2   ·   1 = tem P1 (achado verificado)
+
+Roda standalone (não precisa do `iachat` instalado). Se achar o `iachat_core` ao
+lado, usa o contador da sala para checar as referências `#N` também.
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import ia_guard  # noqa: E402
+
+
+def _ultima_da_sala() -> int | None:
+    try:
+        import iachat_core as core
+        return core._ultimo_numero()
+    except Exception:
+        return None  # sem sala acessível, V3 fica desligado — e isso é dito na saída
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="ia-guard", description=__doc__)
+    ap.add_argument("--texto", nargs="*", help="mensagem inline (default: stdin)")
+    ap.add_argument("--sem-disco", action="store_true",
+                    help="não confere caminho no disco (V1/V2 desligados)")
+    ap.add_argument("--json", action="store_true")
+    a = ap.parse_args()
+
+    texto = " ".join(a.texto) if a.texto else sys.stdin.read()
+    if not texto.strip():
+        print("✗ mensagem vazia", file=sys.stderr)
+        return 2
+
+    ultima = None if a.sem_disco else _ultima_da_sala()
+    r = ia_guard.avaliar(texto, ultima_msg=ultima, checar_disco=not a.sem_disco)
+
+    if a.json:
+        import json
+        print(json.dumps(r, ensure_ascii=False, indent=2))
+        return 1 if r["pior"] == "P1" else 0
+
+    m = r["metricas"]
+    print(f"{m['bytes']} B · {m['ancoras']} âncoras · {m['densidade']}/KB · "
+          f"veredito {r['pior']}")
+    for x in r["achados"]:
+        print(f"  {x['grau']} {x['id']} · {x['trecho']}")
+        print(f"       {x['msg']}")
+    if not r["achados"]:
+        print("  nada a apontar mecanicamente.")
+    # Isto sai SEMPRE, inclusive no verde. O porteiro que só diz "passou" ensina a
+    # sala a tratar o carimbo dele como prova — e ele não é prova de nada disso.
+    print("  ⓘ não verificado por esta régua: se o número é verdadeiro, se a "
+          "mensagem era necessária, se o texto é vago.", file=sys.stderr)
+    if ultima is None and not a.sem_disco:
+        print("  ⓘ sala não encontrada: as referências `#N` não foram checadas.",
+              file=sys.stderr)
+    return 1 if r["pior"] == "P1" else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

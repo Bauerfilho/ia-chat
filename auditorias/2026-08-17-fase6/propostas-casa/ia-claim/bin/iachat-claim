@@ -1,0 +1,153 @@
+#!/usr/bin/env python3
+"""iachat claim — reserva de território entre IAs que compartilham o disco.
+
+Protótipo standalone. Na integração vira o subcomando `claim` do `bin/iachat`
+(um `sub.add_parser("claim", ...)` por verbo, no mesmo estilo de `page`/`search`).
+
+  iachat-claim take   <caminho> --de X --para-que "..." [--min 60]
+  iachat-claim renew  <caminho> --de X [--min 60]
+  iachat-claim free   <caminho> --de X
+  iachat-claim check  <caminho> --de X       # exit 0 = pode; exit 1 = de outra
+  iachat-claim list   [--todas]
+  iachat-claim break  <caminho> --de X --motivo "..."   # avisa o dono no chat
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import iachat_claim as cl  # noqa: E402
+
+
+def _linha(c: dict, restante: float | None = None) -> str:
+    r = restante if restante is not None else cl.restante_min(c)
+    marca = f"{r:+.0f} min" if r > 0 else f"VENCIDA {abs(r):.0f} min"
+    return f"{c['caminho']}\n   {c['de']:8} {marca:>16}   {c.get('para_que','—')}"
+
+
+def cmd_take(a) -> int:
+    try:
+        r = cl.reservar(a.de, a.caminho, a.para_que, a.min)
+    except ValueError as e:
+        print(f"✗ {e}", file=sys.stderr)
+        return 2
+    if not r["ok"]:
+        c = r["conflito"]
+        print(f"✗ já reservado por {c['de']} — {r['restante_min']:.0f} min restantes", file=sys.stderr)
+        print(f"   {c['caminho']}\n   para: {c.get('para_que','—')}", file=sys.stderr)
+        if r.get("suspeita"):
+            print(f"   ⚠️  {r['suspeita']}", file=sys.stderr)
+        print(f"   Falar com {c['de']}: iachat post --de {a.de} \"@{c['de']} preciso de {c['caminho']} — ...\"", file=sys.stderr)
+        print(f"   Quebrar (avisa {c['de']}): iachat claim break {c['caminho']} --de {a.de} --motivo \"...\"", file=sys.stderr)
+        return 1
+    c = r["claim"]
+    print(f"🔒 {c['caminho']}")
+    print(f"   {c['de']} por {c['minutos']} min (até {c['ate'][11:16]}) — {c['para_que']}")
+    print(f"   liberar: iachat claim free {c['caminho']} --de {c['de']}")
+    return 0
+
+
+def cmd_renew(a) -> int:
+    r = cl.renovar(a.de, a.caminho, a.min)
+    if not r["ok"]:
+        print(f"✗ {r['motivo']}", file=sys.stderr)
+        return 1
+    c = r["claim"]
+    print(f"🔁 +{c['minutos']} min até {c['ate'][11:16]} (renovação #{c['renovacoes']})")
+    return 0
+
+
+def cmd_free(a) -> int:
+    r = cl.liberar(a.de, a.caminho)
+    if not r["ok"]:
+        print(f"✗ {r['motivo']}", file=sys.stderr)
+        return 1
+    print(f"🔓 {r.get('liberado', a.caminho)}" if "liberado" in r else f"= {r['motivo']}")
+    return 0
+
+
+def cmd_check(a) -> int:
+    r = cl.checar(a.de, a.caminho)
+    if r["estado"] == "livre":
+        print(f"✔ livre: {r['caminho']}")
+        return 0
+    c = r["claim"]
+    if r["estado"] == "minha":
+        print(f"✔ sua, {r['restante_min']:.0f} min restantes")
+        return 0
+    print(f"🔒 reservado por {c['de']} até {c['ate'][11:16]} ({r['restante_min']:.0f} min) — {c.get('para_que','—')}")
+    if r.get("suspeita"):
+        print(f"⚠️  {r['suspeita']}")
+    return 1
+
+
+def cmd_list(a) -> int:
+    cs = cl.listar(incluir_vencidas=a.todas)
+    if not cs:
+        print("(nenhuma reserva viva)")
+        return 0
+    for c in cs:
+        print(_linha(cl._com_alvo(c)))
+        s = cl._suspeita(c)
+        if s:
+            print(f"   ⚠️  {s}")
+    print(f"\n{len(cs)} reserva(s) · padrão {cl.MIN_PADRAO} min · teto {cl.MIN_TETO} min")
+    return 0
+
+
+def cmd_break(a) -> int:
+    try:
+        r = cl.quebrar(a.de, a.caminho, a.motivo)
+    except ValueError as e:
+        print(f"✗ {e}", file=sys.stderr)
+        return 2
+    if "quebrada" not in r:
+        print(f"= {r['motivo']}")
+        return 0
+    c = r["quebrada"]
+    print(f"💥 reserva de {c['de']} sobre {c['caminho']} quebrada")
+    if r.get("msg"):
+        print(f"   {c['de']} foi avisado no chat (mensagem #{r['msg']})")
+    else:
+        print(f"   ⚠️  NÃO avisei {c['de']}: {r.get('erro_post')}", file=sys.stderr)
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="iachat-claim", description=__doc__)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    def comum(p, de=True):
+        p.add_argument("caminho")
+        if de:
+            p.add_argument("--de", required=True)
+        return p
+
+    p = comum(sub.add_parser("take", help="reservar um caminho"))
+    p.add_argument("--para-que", dest="para_que", required=True, help="o que você vai fazer ali")
+    p.add_argument("--min", type=int, default=cl.MIN_PADRAO, help=f"minutos (padrão {cl.MIN_PADRAO}, teto {cl.MIN_TETO})")
+    p.set_defaults(f=cmd_take)
+
+    p = comum(sub.add_parser("renew", help="estender a partir de agora"))
+    p.add_argument("--min", type=int, default=cl.MIN_PADRAO)
+    p.set_defaults(f=cmd_renew)
+
+    comum(sub.add_parser("free", help="liberar (só o dono)")).set_defaults(f=cmd_free)
+    comum(sub.add_parser("check", help="posso mexer? exit 1 = de outra IA")).set_defaults(f=cmd_check)
+
+    p = sub.add_parser("list", help="reservas vivas")
+    p.add_argument("--todas", action="store_true", help="incluir vencidas")
+    p.set_defaults(f=cmd_list)
+
+    p = comum(sub.add_parser("break", help="quebrar reserva alheia — avisa o dono no chat"))
+    p.add_argument("--motivo", required=True)
+    p.set_defaults(f=cmd_break)
+
+    a = ap.parse_args()
+    return a.f(a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

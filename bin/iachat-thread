@@ -1,0 +1,264 @@
+#!/usr/bin/env python3
+"""Encadeia mensagens do ia-chat sem alterar o formato do núcleo.
+
+O vínculo vive na primeira linha do corpo, como ``re: #N``. Assim, mensagens
+antigas continuam válidas e a rotação leva o vínculo junto para o recorte.
+
+Comandos:
+  iachat-thread post --de IA --re N [--para IA] [--fecha] TEXTO
+  iachat-thread ler N
+  iachat-thread list [--abertos]
+"""
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import iachat_core as core  # noqa: E402
+
+
+# O contrato pede ``re: #N``. A marca de conclusão continua explícita e aceita
+# as duas variantes usuais do sinal de conferência ao ler histórico existente.
+RE_VINCULO = re.compile(r"^re:\s*#([1-9]\d*)(?:\s+(✔|✓))?\s*$", re.IGNORECASE)
+
+
+class ErroFio(RuntimeError):
+    """Inconsistência que impede montar o histórico sem inventar ligação."""
+
+
+def _corpo(mensagem: dict) -> str:
+    """Extrai o corpo depois do metadado+título preservados pelo núcleo."""
+    partes = mensagem["bruto"].split("\n\n", 1)
+    return partes[1].rstrip("\n") if len(partes) == 2 else ""
+
+
+def _vinculo(mensagem: dict) -> tuple[int | None, bool]:
+    """Só a primeira linha do corpo pode ser pai; citações internas não contam."""
+    linhas = _corpo(mensagem).splitlines()
+    if not linhas:
+        return None, False
+    achado = RE_VINCULO.fullmatch(linhas[0].strip())
+    if not achado:
+        return None, False
+    return int(achado.group(1)), bool(achado.group(2))
+
+
+def _carregar() -> tuple[list[dict], int]:
+    """Lê um snapshot coerente de recortes imutáveis + sala ativa."""
+    snapshots: list[tuple[Path, str]] = []
+    with core.travado():
+        for caminho in core._recortes() + [core.p_chat()]:
+            try:
+                snapshots.append((caminho, caminho.read_text(encoding="utf-8")))
+            except OSError as erro:
+                raise ErroFio(f"não consegui ler {caminho}: {erro}") from erro
+
+    mensagens: list[dict] = []
+    for caminho, texto in snapshots:
+        for original in core.parse(texto):
+            mensagem = dict(original)
+            mensagem["fonte"] = caminho.stem
+            mensagem["pai"], mensagem["resolve"] = _vinculo(mensagem)
+            mensagens.append(mensagem)
+
+    mensagens.sort(key=lambda item: item["n"])
+    por_numero: dict[int, dict] = {}
+    for mensagem in mensagens:
+        numero = mensagem["n"]
+        if numero in por_numero:
+            outra = por_numero[numero]
+            raise ErroFio(
+                f"mensagem #{numero} duplicada em {outra['fonte']} e {mensagem['fonte']}"
+            )
+        pai = mensagem["pai"]
+        if pai is not None and pai >= numero:
+            raise ErroFio(
+                f"vínculo inválido em #{numero}: re: #{pai} não aponta para mensagem anterior"
+            )
+        por_numero[numero] = mensagem
+
+    total_bytes = sum(len(mensagem["bruto"].encode("utf-8")) for mensagem in mensagens)
+    return mensagens, total_bytes
+
+
+def _raiz(numero: int, por_numero: dict[int, dict]) -> int:
+    """Segue os pais; pai ausente transforma o primeiro órfão em raiz auditável."""
+    atual = numero
+    vistos: set[int] = set()
+    while atual in por_numero:
+        if atual in vistos:
+            raise ErroFio(f"ciclo detectado a partir da mensagem #{numero}")
+        vistos.add(atual)
+        pai = por_numero[atual]["pai"]
+        if pai is None or pai not in por_numero:
+            return atual
+        atual = pai
+    return numero
+
+
+def _fios(mensagens: list[dict]) -> tuple[dict[int, list[dict]], dict[int, dict]]:
+    """Agrupa raízes e todos os descendentes, inclusive ramificações."""
+    por_numero = {mensagem["n"]: mensagem for mensagem in mensagens}
+    fios: dict[int, list[dict]] = {}
+    for mensagem in mensagens:
+        raiz = _raiz(mensagem["n"], por_numero)
+        fios.setdefault(raiz, []).append(mensagem)
+    for itens in fios.values():
+        itens.sort(key=lambda item: item["n"])
+    return fios, por_numero
+
+
+def _estado(fio: list[dict]) -> tuple[str, list[str]]:
+    """A última mensagem decide: marca explícita fecha; nominação deixa a bola."""
+    ultima = fio[-1]
+    if ultima["resolve"]:
+        return "FECHADO", []
+    if ultima["para"]:
+        return "ABERTO", list(ultima["para"])
+    return "FECHADO", []
+
+
+def _descricao(raiz: dict, limite: int = 76) -> str:
+    """Primeira linha útil da raiz, sem confundir marcador órfão com assunto."""
+    linhas = _corpo(raiz).splitlines()
+    if linhas and RE_VINCULO.fullmatch(linhas[0].strip()):
+        linhas = linhas[1:]
+    texto = next((linha.strip() for linha in linhas if linha.strip()), "(sem descrição)")
+    return texto if len(texto) <= limite else texto[: limite - 1] + "…"
+
+
+def _montar(numero: int) -> tuple[int, list[dict], int, list[dict]]:
+    mensagens, total_bytes = _carregar()
+    fios, por_numero = _fios(mensagens)
+    if numero not in por_numero:
+        raise ErroFio(f"não existe mensagem #{numero} em recortes nem no ativo")
+    raiz = _raiz(numero, por_numero)
+    return raiz, fios[raiz], total_bytes, mensagens
+
+
+def cmd_post(args: argparse.Namespace) -> int:
+    texto = " ".join(args.texto).strip() if args.texto else sys.stdin.read().strip()
+    if not texto:
+        print("✗ resposta vazia", file=sys.stderr)
+        return 2
+    try:
+        _, _, _, mensagens = _montar(args.pai)
+    except ErroFio as erro:
+        print(f"✗ {erro}", file=sys.stderr)
+        return 2
+
+    # A validação acima usa recortes + ativo. O núcleo continua dono do lock,
+    # da numeração, do sino e da neutralização de metadado falso.
+    if not any(mensagem["n"] == args.pai for mensagem in mensagens):
+        print(f"✗ não existe mensagem #{args.pai}", file=sys.stderr)
+        return 2
+    marcador = f"re: #{args.pai}" + (" ✔" if args.fecha else "")
+    destinos = [nome for grupo in (args.para or []) for nome in grupo.split(",") if nome]
+    try:
+        resultado = core.post(args.de, f"{marcador}\n{texto}", destinos)
+    except ValueError as erro:
+        print(f"✗ {erro}", file=sys.stderr)
+        return 2
+
+    alvo = ", ".join(f"@{nome}" for nome in resultado["para"]) or "ninguém"
+    acao = "fechou" if args.fecha else "respondeu"
+    print(f"✔ #{resultado['n']} {acao} ao fio de #{args.pai} → {alvo}")
+    for aviso in resultado["avisos"]:
+        print(f"⚠️  {aviso}", file=sys.stderr)
+    return 0
+
+
+def cmd_ler(args: argparse.Namespace) -> int:
+    try:
+        raiz, fio, total_bytes, _ = _montar(args.numero)
+    except ErroFio as erro:
+        print(f"✗ {erro}", file=sys.stderr)
+        return 2
+
+    estado, bola = _estado(fio)
+    custo = sum(len(mensagem["bruto"].encode("utf-8")) for mensagem in fio)
+    percentual = 100 * custo / total_bytes if total_bytes else 0
+    fontes = list(dict.fromkeys(mensagem["fonte"] for mensagem in fio))
+    destino = ", ".join(f"@{nome}" for nome in bola) if bola else "—"
+    print(
+        f"🧵 fio #{raiz} · {len(fio)} mensagem(ns) · {estado} · bola: {destino}\n"
+        f"   {custo} B de {total_bytes} B no histórico ({percentual:.1f}%) · "
+        f"fonte(s): {', '.join(fontes)}\n"
+    )
+    for mensagem in fio:
+        print(mensagem["bruto"].rstrip())
+        print()
+    return 0
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    try:
+        mensagens, _ = _carregar()
+        fios, _ = _fios(mensagens)
+    except ErroFio as erro:
+        print(f"✗ {erro}", file=sys.stderr)
+        return 2
+
+    ultima_sala = max((mensagem["n"] for mensagem in mensagens), default=0)
+    linhas: list[tuple[bool, int, int, str]] = []
+    for raiz, fio in fios.items():
+        estado, bola = _estado(fio)
+        aberto = estado == "ABERTO"
+        if args.abertos and not aberto:
+            continue
+        divida = ultima_sala - fio[-1]["n"]
+        icone = "🔴" if aberto else "✅"
+        destino = ",".join(f"@{nome}" for nome in bola) if bola else "—"
+        texto = (
+            f"{icone} fio #{raiz:<4} {len(fio):>3} msg  {estado:<7} "
+            f"bola:{destino:<16} parado há {divida:>3} msg · {_descricao(fio[0])}"
+        )
+        linhas.append((aberto, divida, raiz, texto))
+
+    if not linhas:
+        print("(nenhum fio aberto)" if args.abertos else "(nenhum fio)")
+        return 0
+    for _, _, _, texto in sorted(linhas, key=lambda item: (not item[0], -item[1], item[2])):
+        print(texto)
+    return 0
+
+
+def _positivo(valor: str) -> int:
+    numero = int(valor)
+    if numero < 1:
+        raise argparse.ArgumentTypeError("o número deve ser positivo")
+    return numero
+
+
+def parser() -> argparse.ArgumentParser:
+    cli = argparse.ArgumentParser(prog="iachat-thread", description=__doc__)
+    comandos = cli.add_subparsers(dest="comando", required=True)
+
+    post = comandos.add_parser("post", help="responder a uma mensagem específica")
+    post.add_argument("--de", required=True, help="IA autora")
+    post.add_argument("--re", dest="pai", type=_positivo, required=True, help="mensagem-pai")
+    post.add_argument("--para", action="append", help="destinos, separados por vírgula")
+    post.add_argument("--fecha", action="store_true", help="marcar o fio como resolvido")
+    post.add_argument("texto", nargs="*", help="resposta (vazio = stdin)")
+    post.set_defaults(funcao=cmd_post)
+
+    ler = comandos.add_parser("ler", help="ler raiz e todos os descendentes")
+    ler.add_argument("numero", type=_positivo, help="qualquer mensagem do fio")
+    ler.set_defaults(funcao=cmd_ler)
+
+    listar = comandos.add_parser("list", help="listar fios por dívida")
+    listar.add_argument("--abertos", action="store_true", help="mostrar só fios abertos")
+    listar.set_defaults(funcao=cmd_list)
+    return cli
+
+
+def main() -> int:
+    args = parser().parse_args()
+    return args.funcao(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

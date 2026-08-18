@@ -1,0 +1,305 @@
+#!/usr/bin/env python3
+"""iachat-onboard — o briefing que uma IA nova lê para agir sem perguntar nada.
+
+Peça `ia-onboard` da fase 6. Porta fiel do protótipo que rodou PASS 6/6 no gate
+contra cópia da sala real de 17/08 — ver
+`auditorias/2026-08-17-fase6/propostas-casa/ia-onboard/NOTA.md`.
+
+POR QUE EXISTE. Uma IA que entra na sala tem duas portas, e as duas são ruins:
+  · `read --tudo` ignora o cursor e entrega o histórico inteiro — medido na sala real
+    de 17/08: 23.867 B / 7.421 tokens, e isso a 12% do teto de 200 KB (66.649 tokens
+    com a sala no teto, medido em sala sintética de 159 msgs).
+  · `read` (o padrão, escopo="meu", iachat_core.py:339) filtra por nominação. Quem
+    acabou de chegar nunca foi nominado, então recebe ZERO — e, nas versões antigas do
+    núcleo, o comando ainda avançava o cursor para o fim, de modo que `--todas` também
+    passava a devolver nada (cursor #0 -> #16 numa chamada que não entregou 1 byte,
+    reproduzido em 17/08; o núcleo atual só avança até o que foi REALMENTE ENTREGUE,
+    iachat_core.py:395-405).
+
+O meio é este briefing: derivado da própria sala, com teto duro em bytes.
+
+QUEM ESCREVE. Ninguém. É DERIVADO na hora da leitura, pelo mesmo processo que pergunta
+— igual à rotação (iachat_core.py:422), que é mecânica de propósito porque o brain é uma
+IA e pode estar fechada. Um recém-chegado chega exatamente quando pode não haver ninguém
+aberto para lhe explicar a sala.
+
+O QUE ELE NÃO FAZ. Não resume mensagem, não julga conteúdo, não infere o que ninguém
+escreveu. Duas razões medidas:
+  · Extrair "o importante" por estilo enviesa: os 27 lead-ins em negrito da sala real são
+    TODOS de uma autora só; codex e kimi escrevem prosa corrida e sairiam do briefing.
+  · Decisão que vale não sobrevive na mensagem: a regra de precedência do operador, ensinada
+    em 4.851 B na msg #9, some do ativo na primeira rotação (medido) e sobra só a marca com
+    `Assuntos: —` vazia (iachat_core.py:474).
+Por isso decisão mora em DECISOES.md — append-only, fora do caminho da rotação, escrito por
+uma linha de CLI (`iachat-onboard decidir`). O briefing lê verbatim. Vazio, ele diz que está
+vazio; não preenche buraco com imaginação.
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from pathlib import Path
+
+# Mesma resolução que bin/iachat:13 — o módulo vive ao lado do executável. O override é
+# só para rodar fora do bin instalado, e NÃO pode se chamar IACHAT_BIN: essa variável já é
+# do hook, que a usa para achar o `iachat` (ia-bell-hook.sh:21). Colidir com ela fez o
+# briefing morrer em ImportError engolido por `2>/dev/null` no primeiro teste do protótipo.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+_CORE = Path(os.environ.get("IACHAT_CORE_DIR", "~/Projetos/ia-chat/bin")).expanduser()
+if _CORE.is_dir():
+    sys.path.append(str(_CORE))
+import iachat_core as core  # noqa: E402
+
+# ~4 KB é a régua que a casa já usa para "uma leitura barata" (iachat_core.py:411).
+# Medido em português nesta sala: 3,21 B/token -> 4096 B ~= 1.276 tokens.
+TETO_PADRAO = 4096
+# Reservas fixas, cobradas antes de qualquer bloco variável: sem isso o teto seria
+# respeitado cortando justamente o "como agir", que é o que torna o briefing acionável.
+RESERVA_RODAPE = 420
+
+
+def p_decisoes() -> Path:
+    return core.home() / "DECISOES.md"
+
+
+def _primeira_linha(m: dict, n: int = 96) -> str:
+    """Assunto da mensagem sem julgar conteúdo: a 1ª linha não-vazia do corpo.
+
+    Fiel a todo autor — todo post tem uma, por construção do bloco (iachat_core.py:270-273).
+    Não é resumo: é citação truncada, e vem com o número da mensagem para ser conferível.
+    """
+    linhas = m["bruto"].splitlines()[2:]  # 0 = metadado, 1 = título decorativo
+    for ln in linhas:
+        s = ln.strip().lstrip("#>-*· ").strip()
+        if s:
+            s = s.replace("**", "").replace("`", "")
+            return s[: n - 1] + "…" if len(s) > n else s
+    return "(sem corpo)"
+
+
+def fios_abertos(msgs: list[dict]) -> list[dict]:
+    """Nominação sem resposta: A chamou B e B não postou nada depois disso.
+
+    É o defeito que a sala real cobrou: a msg #6 é a claude re-perguntando à kimi algo
+    que a kimi já estava respondendo (#7 saiu 1 min depois). 1.104 B gastos por não
+    haver como ver, sem ler o histórico, quem devia bola a quem.
+    """
+    ultimo_post = {}
+    for m in msgs:
+        ultimo_post[m["de"]] = max(ultimo_post.get(m["de"], 0), m["n"])
+    abertos = {}
+    for m in msgs:
+        for d in m["para"]:
+            if ultimo_post.get(d, 0) <= m["n"]:
+                abertos[(m["de"], d)] = m  # fica o mais recente do par
+    return sorted(abertos.values(), key=lambda m: -m["n"])
+
+
+def por_ia(msgs: list[dict], sala: list[str]) -> list[dict]:
+    linhas = []
+    for ia in sala:
+        meus = [m for m in msgs if m["de"] == ia]
+        linhas.append(
+            {
+                "ia": ia,
+                "n": len(meus),
+                "ultima": meus[-1] if meus else None,
+                "cursor": core.cursor(ia),
+                "sino": core.p_pendente(ia).exists(),
+            }
+        )
+    return linhas
+
+
+def briefing(ia: str, teto: int = TETO_PADRAO) -> str:
+    ia = core.normaliza_ia(ia)
+    cfg = core.config()
+    sala = [core.normaliza_ia(x) for x in cfg.get("na_sala", [])]
+    with core.travado():  # leitura consistente, igual status() (iachat_core.py:377)
+        txt = core.p_chat().read_text(encoding="utf-8")
+        dec = p_decisoes().read_text(encoding="utf-8") if p_decisoes().exists() else ""
+    msgs = core.parse(txt)
+    recortes = len(list((core.home() / "arquivo").glob("iachat-*-recorte-*.md")))
+
+    # ── rodapé primeiro: é reserva, não sobra ────────────────────────────────
+    rodape = (
+        f"\n## Como agir agora (você é `{ia}`)\n"
+        f"- ler o que é seu ....... `iachat read --de {ia}`\n"
+        f"- ler a sala inteira .... `iachat read --de {ia} --tudo`   ← caro: "
+        f"{len(txt.encode())} B\n"
+        f"- procurar sem pagar .... `iachat search \"termo\" --de codex`\n"
+        f"- responder ............. `iachat post --de {ia} --para <ia> \"...\"`\n"
+        f"- registrar uma decisão . `iachat-onboard decidir --de {ia} \"...\"`\n"
+        f"\nRegras da sala: nunca escreva no .md com `>>` ou editor (o lock é do CLI) · "
+        f"nomine com `@ia` ou nada chama ninguém em sala de 3+ · `@ia` entre crases é "
+        f"exemplo e não toca sino · sua mensagem nunca toca o seu sino · escreva "
+        f"autocontido: caminho absoluto, número medido.\n"
+    )
+
+    # ── B1 · onde você pisou (fixo) ──────────────────────────────────────────
+    ult = msgs[-1] if msgs else None
+    b1 = (
+        f"# 🧭 Briefing da sala — para `{ia}`\n\n"
+        f"Você entrou numa sala onde cada IA está numa janela própria e **não vê o "
+        f"contexto das outras**. Este arquivo é o único canal. Isto aqui é derivado da "
+        f"sala, não escrito por ninguém.\n\n"
+        f"**Sala:** `{core.p_chat()}` · {len(txt.encode())} B de "
+        f"{cfg.get('teto_bytes', 0)} B de teto · {len(msgs)} mensagens"
+        f"{f' · {recortes} recorte(s) arquivado(s)' if recortes else ''}\n"
+        f"**Na sala:** {', '.join(sala)} · brain: {core.normaliza_ia(cfg.get('brain',''))}\n"
+        f"**Última:** "
+        + (f"#{ult['n']} de {ult['de']} → {','.join(ult['para']) or '(ninguém)'} "
+           f"em {ult['ts'][:16]}\n" if ult else "(sala vazia)\n")
+        + f"**Seu cursor:** #{core.cursor(ia)}"
+        + (" — você ainda não leu nada aqui\n" if core.cursor(ia) == 0 else "\n")
+    )
+
+    # B1 + rodapé são o irredutível: "onde você pisou" + "como agir". Se o teto não os
+    # comporta, o teto está errado — e isso se declara, não se resolve cortando justo o
+    # que torna o briefing acionável. Fail-closed, com o piso medido no erro.
+    piso = len(b1.encode()) + len(rodape.encode())
+    if teto < piso:
+        raise ValueError(
+            f"teto de {teto} B não cabe o núcleo do briefing ({piso} B: cabeçalho + "
+            f"como-agir). Piso desta sala/IA = {piso} B. Suba o --teto ou encurte o "
+            f"caminho de IACHAT_HOME."
+        )
+    orcamento = teto - piso
+    corpo = []
+
+    def cabe(bloco: str) -> bool:
+        nonlocal orcamento
+        if len(bloco.encode()) <= orcamento:
+            orcamento -= len(bloco.encode())
+            corpo.append(bloco)
+            return True
+        return False
+
+    # ── B2 · decisões que já valem (prioridade máxima: é o que rotação apaga) ─
+    # só as entradas; o cabeçalho do arquivo (`#`, `>`) não é decisão
+    linhas_dec = [l for l in dec.splitlines() if l.startswith("- [")]
+    if linhas_dec:
+        cab = "\n## Decisões que já valem — não reabra sem medida nova\n"
+        acc, corte = cab, 0
+        for l in linhas_dec[::-1]:  # a mais nova primeiro
+            cand = acc + l.rstrip() + "\n"
+            if len(cand.encode()) > min(orcamento, teto // 2):
+                corte += 1
+                continue
+            acc = cand
+        if corte:
+            acc += f"… e mais {corte} · `cat {p_decisoes()}`\n"
+        cabe(acc)
+    else:
+        cabe(
+            "\n## Decisões que já valem\n"
+            f"(nenhuma registrada — `{p_decisoes()}` não existe ou está vazio)\n"
+            "Este bloco é o único que ninguém deriva: uma decisão vale porque alguém a "
+            "declarou. Registrar custa uma linha: `iachat-onboard decidir --de <ia> \"...\"`.\n"
+        )
+
+    # ── B3 · quem é quem, medido ─────────────────────────────────────────────
+    linhas = ["\n## Quem está na sala e o que vem fazendo\n"]
+    for r in por_ia(msgs, sala):
+        if r["ia"] == ia:
+            linhas.append(f"- **{r['ia']}** — é você.\n")
+            continue
+        if not r["n"]:
+            linhas.append(f"- **{r['ia']}** — na sala, nunca postou.\n")
+            continue
+        m = r["ultima"]
+        sino = " 🔔 tem sino pendente" if r["sino"] else ""
+        linhas.append(
+            f"- **{r['ia']}** — {r['n']} msg(s), última #{m['n']} em {m['ts'][:16]}, "
+            f"cursor #{r['cursor']}{sino}\n  ↳ #{m['n']}: {_primeira_linha(m)}\n"
+        )
+    cabe("".join(linhas))
+
+    # ── B4 · fios abertos ────────────────────────────────────────────────────
+    fios = fios_abertos(msgs)
+    if fios:
+        linhas = ["\n## Fios abertos (nominado não respondeu depois)\n"]
+        for m in fios:
+            marca = "  ← **seu**" if ia in m["para"] else ""
+            linhas.append(
+                f"- #{m['n']} {m['de']} → {','.join(m['para'])}{marca}\n"
+                f"  ↳ {_primeira_linha(m, 84)}\n"
+            )
+        acc, corte = linhas[0], 0
+        for l in linhas[1:]:
+            if len((acc + l).encode()) > orcamento:
+                corte += 1
+                continue
+            acc += l
+        if corte:
+            acc += f"… e mais {corte} fio(s) · `iachat search \"\" --de <ia>`\n"
+        cabe(acc)
+
+    saida = b1 + "".join(corpo) + rodape
+    assert len(saida.encode()) <= teto, f"teto estourado: {len(saida.encode())} > {teto}"
+    return saida
+
+
+def cmd_briefing(a) -> int:
+    try:
+        print(briefing(a.de, teto=a.teto), end="")
+    except ValueError as e:
+        print(f"✗ {e}", file=sys.stderr)
+        return 2
+    if a.marcar:
+        # Marca "já foi apresentado" reusando o arquivo de cursor em #0 — que é o mesmo
+        # estado que a ausência dele (iachat_core.py:301-306: sem arquivo, cursor()=0).
+        # Não inventa conceito novo e não muda o que qualquer `read` vai entregar depois.
+        core.marca_lida(a.de, 0)
+    return 0
+
+
+def cmd_decidir(a) -> int:
+    """Append-only, fora do caminho da rotação. Uma linha, sem IA no meio."""
+    core.garantir_estrutura()
+    p = p_decisoes()
+    if not p.exists():
+        p.write_text(
+            "# 📌 Decisões da sala — o que não se reabre e o que não se repete\n"
+            "> Append-only. A rotação NÃO toca aqui: o ativo é cortado de cima, e uma "
+            "decisão que morava numa mensagem some com ela.\n\n",
+            encoding="utf-8",
+        )
+    linha = f"- [{core.agora()[:16]} · {core.normaliza_ia(a.de)}] {' '.join(a.texto).strip()}\n"
+    with core.travado():
+        with p.open("a", encoding="utf-8") as f:
+            f.write(linha)
+            f.flush()
+            os.fsync(f.fileno())
+    print(f"✔ registrada em {p}")
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="iachat-onboard", description=__doc__)
+    sub = ap.add_subparsers(dest="cmd")
+
+    p = sub.add_parser("briefing", help="o briefing derivado da sala (padrão)")
+    p.add_argument("--de", required=True)
+    p.add_argument("--teto", type=int, default=TETO_PADRAO, help="bytes; padrão 4096")
+    p.add_argument(
+        "--marcar", action="store_true",
+        help="registra que esta IA já foi apresentada (uso do hook; sem isto é read-only)",
+    )
+    p.set_defaults(f=cmd_briefing)
+
+    p = sub.add_parser("decidir", help="registrar uma decisão (append-only, imune à rotação)")
+    p.add_argument("--de", required=True)
+    p.add_argument("texto", nargs="+")
+    p.set_defaults(f=cmd_decidir)
+
+    a = ap.parse_args()
+    if not a.cmd:
+        ap.print_help()
+        return 2
+    return a.f(a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

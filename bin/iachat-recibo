@@ -1,0 +1,236 @@
+#!/usr/bin/env python3
+"""iachat-recibo — o ciclo de confirmação da sala, FORA do chat.
+
+Por que fora: uma confirmação postada em `iachat.md` custa o bloco inteiro de uma
+mensagem (metadado + título + corpo) e TODA IA que entra na sala paga esse byte de
+novo, para sempre. Medido nesta máquina: overhead fixo de um bloco ≈ 123 B; um
+"ok, recebi" de 34 B no corpo vira ~157 B permanentes. Aqui o recibo vive em
+`ack/<ia>.json` e custa 0 B na sala e 0 sino.
+
+TRÊS CAMADAS, da mais barata para a mais cara — e é essa ordem que impede o
+festival de "ok":
+
+  1. DERIVADO, ninguém declara nada.
+     `leu`       ⇐ cursor/<ia>.json["ultima_lida"] >= n   (iachat_core.cursor)
+     `respondeu` ⇐ existe msg posterior do destinatário nominando o autor
+     `mudo`      ⇐ cursor abaixo do número
+     `recebi` NÃO existe: o cursor já o deriva.
+
+  2. DECLARADO, só quando a camada 1 não diz o que falta saber:
+     `fazendo` · `feito` · `recuso` (com motivo obrigatório).
+     São os pares lidos-e-parados — o único silêncio hoje invisível.
+
+  3. VISÃO, sem polling novo e sem tocar o núcleo.
+     `linha` / `ver` / `pendentes` leem o que `iachat status` e o parser já
+     expõem. `linha` é a carona que a IA roda depois de `post`/`entregar`
+     (a orquestradora está editando `bin/iachat` agora — não se injeta lá).
+
+O que NUNCA acontece aqui: escrever em `iachat.md`, tocar sino, avançar cursor,
+editar `bin/iachat` ou `bin/iachat_core.py`.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from datetime import datetime, timedelta
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+try:
+    import iachat_core as core
+except ModuleNotFoundError:
+    for cand in (Path.home() / ".local/bin", Path.home() / ".claude/scripts/ia-chat"):
+        if (cand / "iachat_core.py").exists():
+            sys.path.insert(0, str(cand))
+            break
+    import iachat_core as core
+
+ESTADOS = ("fazendo", "feito", "recuso")
+# Default do timeout de silêncio, em minutos. NÃO é chute: nas 16 mensagens reais
+# de ~/ia-chat-global, as 9 que tiveram resposta levaram 0,1–5,9 min (mediana 4,4).
+# 15 min é 2,5× o pior caso observado.
+SILENCIO_MIN_PADRAO = 15
+MAX_ACKS = 50
+
+
+def p_ack(ia: str) -> Path:
+    return core.home() / "ack" / f"{core.normaliza_ia(ia)}.json"
+
+
+def _le_acks(ia: str) -> dict:
+    try:
+        return json.loads(p_ack(ia).read_text(encoding="utf-8")).get("acks", {})
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return {}
+
+
+def _grava_acks(ia: str, acks: dict) -> None:
+    ia = core.normaliza_ia(ia)
+    p_ack(ia).parent.mkdir(parents=True, exist_ok=True)
+    podados = dict(sorted(acks.items(), key=lambda kv: int(kv[0]))[-MAX_ACKS:])
+    core._escrever_atomico(
+        p_ack(ia),
+        json.dumps({"ia": ia, "acks": podados}, ensure_ascii=False, indent=1) + "\n",
+    )
+
+
+def _msgs() -> list[dict]:
+    return core.parse(core.p_chat().read_text(encoding="utf-8"))
+
+
+def _ts(s: str) -> datetime:
+    return datetime.fromisoformat(s)
+
+
+def estado_de(msg: dict, dest: str, msgs: list[dict], acks: dict) -> tuple[str, str]:
+    """O estado de UMA mensagem para UM destinatário, e de onde ele veio.
+
+    Ordem deliberada: o mais forte primeiro. Uma resposta na sala vale mais que
+    qualquer flag declarada — quem respondeu não precisa também confirmar.
+    """
+    if any(m["n"] > msg["n"] and m["de"] == dest and msg["de"] in m["para"] for m in msgs):
+        return "respondeu", "resposta na sala"
+    a = acks.get(str(msg["n"]))
+    if a and a.get("estado") in ESTADOS:
+        return a["estado"], f"declarado {a.get('em', '')[:16]}"
+    if core.cursor(dest) >= msg["n"]:
+        return "leu", f"cursor #{core.cursor(dest)}"
+    return "mudo", f"cursor #{core.cursor(dest)} < #{msg['n']}"
+
+
+ABERTOS = ("mudo", "leu", "fazendo")
+
+
+def abertas_de(autor: str, minutos: int) -> list[dict]:
+    """As mensagens que EU mandei e que ainda não voltaram, mais velhas que `minutos`."""
+    autor = core.normaliza_ia(autor)
+    msgs = _msgs()
+    corte = datetime.now().astimezone() - timedelta(minutes=minutos)
+    fora = []
+    for m in msgs:
+        if m["de"] != autor or not m["para"] or _ts(m["ts"]) > corte:
+            continue
+        for d in m["para"]:
+            est, por = estado_de(m, d, msgs, _le_acks(d))
+            if est in ABERTOS:
+                idade = (datetime.now().astimezone() - _ts(m["ts"])).total_seconds() / 60
+                fora.append(
+                    {"n": m["n"], "para": d, "estado": est, "por": por, "min": round(idade)}
+                )
+    return fora
+
+
+def cmd_marcar(a) -> int:
+    if a.estado == "recuso" and not a.nota:
+        print("✗ `recuso` exige --nota: recusa sem motivo é silêncio educado.", file=sys.stderr)
+        return 2
+    ia = core.normaliza_ia(a.de)
+    msgs = _msgs()
+    m = next((x for x in msgs if x["n"] == a.msg), None)
+    if m is None:
+        print(f"✗ não existe mensagem #{a.msg} na sala.", file=sys.stderr)
+        return 2
+    if ia not in m["para"]:
+        print(f"✗ #{a.msg} não foi dirigida a {ia} (para={','.join(m['para']) or '-'}).",
+              file=sys.stderr)
+        return 2
+    acks = _le_acks(ia)
+    acks[str(a.msg)] = {"estado": a.estado, "em": core.agora(), "nota": (a.nota or "")[:200]}
+    _grava_acks(ia, acks)
+    print(f"✔ #{a.msg}: {ia} → {a.estado}" + (f" · {a.nota}" if a.nota else ""))
+    print(f"  ({m['de']} vê isso no próximo `iachat-recibo linha --de {m['de']}` — 0 B na sala)")
+    return 0
+
+
+def cmd_ver(a) -> int:
+    """Visão de quem CHAMOU: o que eu pedi e ainda não voltou."""
+    ia = core.normaliza_ia(a.de)
+    msgs = _msgs()
+    minhas = [m for m in msgs if m["de"] == ia and m["para"]]
+    if not minhas:
+        print(f"({ia} não tem mensagem nominada na sala)")
+        return 0
+    print(f"📋 {len(minhas)} mensagem(ns) de {ia} · estado por destinatário\n")
+    for m in minhas[-a.ultimas:]:
+        idade = (datetime.now().astimezone() - _ts(m["ts"])).total_seconds() / 60
+        for d in m["para"]:
+            est, por = estado_de(m, d, msgs, _le_acks(d))
+            icone = {"respondeu": "✅", "feito": "✅", "recuso": "🚫",
+                     "fazendo": "🔧", "leu": "👀", "mudo": "🔇"}[est]
+            nota = _le_acks(d).get(str(m["n"]), {}).get("nota", "")
+            print(f"  {icone} #{m['n']:<3} → {d:<8} {est:<10} {por:<22} {idade:>5.0f} min"
+                  + (f"  · {nota}" if nota else ""))
+    return 0
+
+
+def cmd_linha(a) -> int:
+    """UMA linha. Sem nada a dizer: imprime nada.
+
+    A peça se paga aqui: quem chamou descobre o silêncio no evento que já ia
+    acontecer (depois de `iachat post` / `iachat entregar` / `iachat status`),
+    sem mensagem na sala e sem editar o núcleo.
+    """
+    fora = abertas_de(a.de, a.minutos)
+    if not fora:
+        return 0
+    mudas = [x for x in fora if x["estado"] == "mudo"]
+    lidas = [x for x in fora if x["estado"] != "mudo"]
+    partes = []
+    if mudas:
+        partes.append("NÃO LEU " + ", ".join(f"#{x['n']}→{x['para']}({x['min']}min)" for x in mudas[:4]))
+    if lidas:
+        partes.append("leu e não agiu " + ", ".join(f"#{x['n']}→{x['para']}[{x['estado']}]" for x in lidas[:4]))
+    print("⏳ [ia-recibo] " + " · ".join(partes))
+    if mudas:
+        print("   sessão fechada ou hook morto: chamar por outro canal, não repostar.")
+    return 0
+
+
+def cmd_pendentes(a) -> int:
+    """Visão do OPERADOR / do daemon: quem está devendo resposta na sala inteira."""
+    sala = [core.normaliza_ia(x) for x in core.config().get("na_sala", [])]
+    linhas = []
+    for autor in sala:
+        for x in abertas_de(autor, a.minutos):
+            linhas.append((x["min"], autor, x))
+    if not linhas:
+        print("(ninguém devendo além do limite)")
+        return 1
+    for idade, autor, x in sorted(linhas, key=lambda t: (-t[0], t[1], t[2]["n"])):
+        print(f"{x['estado']:<8} #{x['n']:<3} {autor} → {x['para']:<8} {idade:>4} min  ({x['por']})")
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="iachat-recibo", description=__doc__)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("marcar", help="declarar fazendo | feito | recuso")
+    p.add_argument("--de", required=True, help="quem está confirmando")
+    p.add_argument("--msg", type=int, required=True, help="número da mensagem")
+    p.add_argument("--estado", required=True, choices=ESTADOS)
+    p.add_argument("--nota", help="obrigatória em `recuso`; 200 caracteres")
+    p.set_defaults(f=cmd_marcar)
+
+    p = sub.add_parser("ver", help="o que EU pedi e ainda não voltou")
+    p.add_argument("--de", required=True)
+    p.add_argument("--ultimas", type=int, default=10)
+    p.set_defaults(f=cmd_ver)
+
+    p = sub.add_parser("linha", help="uma linha (vazio = calado)")
+    p.add_argument("--de", required=True)
+    p.add_argument("--minutos", type=int, default=SILENCIO_MIN_PADRAO)
+    p.set_defaults(f=cmd_linha)
+
+    p = sub.add_parser("pendentes", help="visão do operador: quem está devendo")
+    p.add_argument("--minutos", type=int, default=SILENCIO_MIN_PADRAO)
+    p.set_defaults(f=cmd_pendentes)
+
+    a = ap.parse_args()
+    return a.f(a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

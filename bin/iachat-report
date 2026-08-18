@@ -1,0 +1,240 @@
+#!/usr/bin/env python3
+"""iachat-report — o que aconteceu na sala, para o DONO.
+
+Camada MECÂNICA: roda sem nenhuma IA aberta, custo zero, nunca mente.
+Não interpreta conteúdo — extrai estrutura (quem deve a quem, quem nem leu,
+quem sumiu) e devolve PONTEIROS para o que exige leitura.
+
+Uso:
+  iachat-report                 # tudo que está no ativo
+  iachat-report --desde 9       # a partir da mensagem #9
+  iachat-report --horas 12      # só as últimas 12 h
+  iachat-report --saida ~/x.md  # grava arquivo além do stdout (celular/offline)
+"""
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+from datetime import datetime, timedelta
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from iachat_core import cursor, p_chat, p_pendente, parse  # noqa: E402
+
+# Marcadores explícitos. Nada de fuzzy: a sala já provou que sino a mais mata o
+# canal (`@codex` entre crases tocou o sino dele). Sem marcador, o relatório
+# declara que não olhou — não adivinha.
+RE_MARCA = re.compile(
+    r"^\s*(?:[*_]{0,2})(DECIDIDO|PENDENTE|BLOQUEIO|PERGUNTA)(?:[*_]{0,2})\s*:\s*(.+)$",
+    re.M | re.I,
+)
+
+DONO = "bauer"
+
+
+def _kb(n: int) -> str:
+    return f"{n / 1024:.1f} KB" if n >= 1024 else f"{n} B"
+
+
+def _primeira_frase(bruto: str, limite: int = 72) -> str:
+    for linha in bruto.splitlines():
+        s = linha.strip()
+        if not s or s.startswith("<!--") or s.startswith("###"):
+            continue
+        # `#` só é lixo no INÍCIO da linha (heading). Inline ele é referência a
+        # mensagem (`a minha #7`) — comê-lo destrói o dado no meio do relatório.
+        s = re.sub(r"^[#>\s]+", "", s)
+        s = re.sub(r"[*_`]+", "", s).strip()
+        if not s:
+            continue
+        return s[:limite] + ("…" if len(s) > limite else "")
+    return "(vazia)"
+
+
+def _ts(m: dict) -> datetime:
+    return datetime.fromisoformat(m["ts"])
+
+
+def coletar(desde_n: int = 0, horas: float | None = None) -> dict:
+    if not p_chat().exists():
+        return {"vazia": True, "inconsistente": False, "bytes_sala": 0}
+    texto = p_chat().read_text(encoding="utf-8")
+    todas = parse(texto)
+    if not todas:
+        # Sala com bytes e nenhuma mensagem parseável: não é "vazia", é
+        # ilegível. Quem chama decide (main sai com erro em vez de mentir).
+        return {
+            "vazia": True,
+            "inconsistente": len(texto.encode()) > 0,
+            "bytes_sala": len(texto.encode()),
+        }
+
+    agora_dt = datetime.now().astimezone()
+    corte = agora_dt - timedelta(hours=horas) if horas else None
+    msgs = [
+        m
+        for m in todas
+        if m["n"] > desde_n and (corte is None or _ts(m) >= corte)
+    ]
+
+    # Laço aberto: X nominou Y e Y não falou depois disso.
+    # Só conta chamada DENTRO da janela: nominação anterior ao período não é
+    # pendência do período.
+    participantes = sorted(
+        ({m["de"] for m in msgs} | {p for m in msgs for p in m["para"]})
+        - {DONO, "@all"}
+    )
+    devendo = []
+    for quem in participantes:
+        chamadas = [m for m in msgs if quem in m["para"]]
+        if not chamadas:
+            continue
+        ultima_chamada = chamadas[-1]
+        falou_depois = [
+            m
+            for m in todas
+            if m["de"] == quem and _ts(m) > _ts(ultima_chamada)
+        ]
+        if not falou_depois:
+            devendo.append(
+                {
+                    "ia": quem,
+                    "n": ultima_chamada["n"],
+                    "de": ultima_chamada["de"],
+                    "ts": _ts(ultima_chamada),
+                    "bytes": len(ultima_chamada["bruto"].encode()),
+                    "parado_min": int(
+                        (agora_dt - _ts(ultima_chamada)).total_seconds() // 60
+                    ),
+                    "sino": p_pendente(quem).exists(),
+                    "cursor": cursor(quem),
+                }
+            )
+
+    ja_devendo = {d["ia"] for d in devendo}
+    falaram = {m["de"] for m in msgs}
+    mudos = [q for q in participantes if q not in falaram and q not in ja_devendo]
+
+    marcas = []
+    for m in msgs:
+        for tipo, corpo in RE_MARCA.findall(m["bruto"]):
+            marcas.append(
+                {"tipo": tipo.upper(), "texto": corpo.strip(), "n": m["n"], "de": m["de"]}
+            )
+
+    para_dono = [m for m in msgs if DONO in m["para"] or "@all" in m["para"]]
+
+    return {
+        "vazia": False,
+        "inconsistente": False,
+        "msgs": msgs,
+        "bytes_sala": len(texto.encode()),
+        "bytes_periodo": sum(len(m["bruto"].encode()) for m in msgs),
+        "de_ate": (_ts(msgs[0]), _ts(msgs[-1])) if msgs else None,
+        "por_autor": {
+            q: sum(1 for m in msgs if m["de"] == q) for q in sorted(falaram)
+        },
+        "devendo": devendo,
+        "mudos": mudos,
+        "marcas": marcas,
+        "para_dono": para_dono,
+        "ultimo_n": todas[-1]["n"],
+        "pesadas": sorted(msgs, key=lambda m: -len(m["bruto"].encode()))[:3],
+    }
+
+
+def render(d: dict) -> str:
+    if d["vazia"]:
+        return "# 📋 ia-chat\n\nSala vazia.\n"
+    ini, fim = d["de_ate"]
+    autores = " · ".join(f"{q}({n})" for q, n in d["por_autor"].items() if n)
+    dur = int((fim - ini).total_seconds() // 60)
+    L = [
+        f"# 📋 ia-chat — {ini:%d/%m %H:%M} → {fim:%H:%M}",
+        "",
+        f"**{len(d['msgs'])} mensagens · {_kb(d['bytes_periodo'])} · {dur} min · {autores}**",
+        "",
+    ]
+
+    L.append("## ⛔ Parado esperando alguém")
+    if d["devendo"]:
+        for x in d["devendo"]:
+            estado = "nem leu (sino tocando)" if x["sino"] else f"leu até #{x['cursor']}"
+            L.append(
+                f"- **{x['ia']}** — {x['de']} chamou na #{x['n']} "
+                f"({x['ts']:%H:%M}, {_kb(x['bytes'])}) · **{x['parado_min']} min sem responder** · {estado}"
+            )
+    else:
+        L.append("- nada parado.")
+    L.append("")
+
+    if d["mudos"]:
+        L += ["## 🐘 Não falou no período", "- " + ", ".join(d["mudos"]), ""]
+
+    L.append("## 🧭 Endereçado a você")
+    if d["para_dono"]:
+        for m in d["para_dono"]:
+            L.append(f"- #{m['n']} · {m['de']} · {_primeira_frase(m['bruto'])}")
+    else:
+        L.append(f"- nada. Nenhuma mensagem nominou `{DONO}`.")
+    L.append("")
+
+    L.append("## 📌 Marcado pelas IAs")
+    if d["marcas"]:
+        for x in d["marcas"]:
+            L.append(f"- **{x['tipo']}** (#{x['n']}, {x['de']}) — {x['texto']}")
+    else:
+        L.append("- nada marcado (nenhuma mensagem usou DECIDIDO:/PENDENTE:/BLOQUEIO:/PERGUNTA:).")
+    L.append("")
+
+    L.append("## 🗺️ O fio")
+    for m in d["msgs"]:
+        alvo = ",".join(m["para"]) or "—"
+        L.append(
+            f"`#{m['n']:>3}` {_ts(m):%H:%M} **{m['de']}**→{alvo} · "
+            f"{_kb(len(m['bruto'].encode()))} · {_primeira_frase(m['bruto'], 64)}"
+        )
+    L.append("")
+
+    n_pesadas = sum(len(m["bruto"].encode()) for m in d["pesadas"])
+    L += [
+        "## ❌ O que este relatório NÃO julgou",
+        f"Conteúdo de {len(d['msgs'])} mensagens ({_kb(d['bytes_periodo'])}). Nada aqui foi lido por máquina —",
+        "só estrutura. As 3 mais densas concentram "
+        f"{100 * n_pesadas // max(1, d['bytes_periodo'])}% do texto do período:",
+    ]
+    for m in d["pesadas"]:
+        L.append(f"- #{m['n']} {m['de']}→{','.join(m['para']) or '—'} · {_kb(len(m['bruto'].encode()))}")
+    L += [
+        "",
+        f"Sala inteira: `{p_chat()}`",
+        "Para a prosa (o que foi decidido): `/ia-report` na IA que já estiver aberta.",
+        "",
+    ]
+    return "\n".join(L)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="iachat-report")
+    ap.add_argument("--desde", type=int, default=0, help="a partir da mensagem N")
+    ap.add_argument("--horas", type=float, help="só as últimas H horas")
+    ap.add_argument("--saida", help="grava em arquivo além do stdout")
+    a = ap.parse_args()
+    d = coletar(a.desde, a.horas)
+    if d["vazia"] and d["inconsistente"]:
+        print(
+            f"✗ sala tem {_kb(d['bytes_sala'])} mas nenhuma mensagem parseável — "
+            "não vou fingir que está vazia. Verifique o arquivo.",
+            file=sys.stderr,
+        )
+        return 1
+    txt = render(d)
+    if a.saida:
+        Path(a.saida).expanduser().write_text(txt, encoding="utf-8")
+    sys.stdout.write(txt)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

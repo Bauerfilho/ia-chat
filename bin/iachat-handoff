@@ -1,0 +1,518 @@
+#!/usr/bin/env python3
+"""iachat-handoff — passar uma TAREFA de uma IA para outra, com dono, prazo e fecho.
+
+Conversar e entregar trabalho são coisas diferentes. `iachat post` entrega um TEXTO:
+quando ele é lido, acabou. Um handoff entrega uma TAREFA: ela continua existindo
+depois de lida, tem dono, tem critério de pronto e só some quando alguém devolve o
+resultado. O chat não tem onde guardar isso — mensagem não tem estado.
+
+Nome do binário é `iachat-handoff` (não `iahandoff`): `install.sh` só instala
+`bin/iachat-*`. Um executável chamado `iahandoff` seria escrito e nunca instalado.
+
+TRÊS DECISÕES, cada uma medida (números em NOTA.md da proposta):
+
+1. O CORPO VAI PARA O DISCO, A SALA LEVA O PONTEIRO.
+2. ACEITAR É UM ATO, NÃO UM EFEITO DE LER.
+3. NÃO ACEITAR TEM QUE DOER — estado visível, nunca silêncio.
+
+Correções sobre o protótipo da proposta (ver relatório e5-handoff):
+- abrir sem critério verificável é recusado (heading vazio não passa);
+- fechar sem prova (artefato citado) é recusado;
+- estado `abandonado` é de primeira classe (aberto vencido vira abandonado).
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from datetime import datetime, timedelta
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import iachat_core as core  # noqa: E402
+
+# As seções que o recebedor não consegue substituir por dedução. Derivadas do teste
+# "sem isto, ele pergunta ou quebra?" aplicado à #15 — ver NOTA.md.
+OBRIGATORIAS = ("## Estado", "## Não faça", "## Pronto quando")
+PRAZO_PADRAO_H = 24
+# lista sem --todos: o que ainda precisa de alguém. abandonado entra porque
+# tarefa vencida sem dono é o pior desfecho se sumir da vista.
+ESTADOS_ABERTOS = ("aberto", "aceito", "abandonado")
+ALEGACOES = {
+    "terminei",
+    "pronto",
+    "done",
+    "ok",
+    "feito",
+    "complete",
+    "completed",
+    "acabou",
+    "acabei",
+    "(não declarada)",
+    "(nao declarada)",
+    "(não declarado)",
+    "(nao declarado)",
+}
+
+
+def p_handoff() -> Path:
+    return core.home() / "handoff"
+
+
+def _caminho(hid: str) -> Path:
+    return p_handoff() / f"{hid}.md"
+
+
+def _hoje() -> datetime:
+    return datetime.now().astimezone()
+
+
+def _novo_id() -> str:
+    """`HO-2026-08-17-01`: ordenável, legível e estável no nome do arquivo.
+
+    Usa o maior sufixo do dia, não `len(glob)+1`: um arquivo apagado no meio
+    faria o próximo colidir e sobrescrever o registro.
+    """
+    dia = f"{_hoje():%Y-%m-%d}"
+    n = 0
+    for p in p_handoff().glob(f"HO-{dia}-*.md"):
+        try:
+            n = max(n, int(p.stem.rsplit("-", 1)[-1]))
+        except ValueError:
+            continue
+    return f"HO-{dia}-{n + 1:02d}"
+
+
+def _ler(hid: str) -> tuple[dict, str]:
+    p = _caminho(hid)
+    if not p.exists():
+        raise ValueError(f"não achei o handoff '{hid}' em {p_handoff()}")
+    txt = p.read_text(encoding="utf-8")
+    if not txt.startswith("---\n"):
+        raise ValueError(f"{p} sem frontmatter")
+    cabeca, _, corpo = txt[4:].partition("\n---\n")
+    meta = {}
+    for linha in cabeca.splitlines():
+        k, _, v = linha.partition(":")
+        if k.strip():
+            meta[k.strip()] = v.strip()
+    return meta, corpo.lstrip("\n")
+
+
+def _grava(hid: str, meta: dict, corpo: str) -> None:
+    p_handoff().mkdir(parents=True, exist_ok=True)
+    cabeca = "".join(f"{k}: {v}\n" for k, v in meta.items())
+    core._escrever_atomico(_caminho(hid), f"---\n{cabeca}---\n\n{corpo.rstrip()}\n")
+
+
+def _corpo_de(a) -> str:
+    if a.corpo == "-":
+        return sys.stdin.read()
+    return Path(a.corpo).expanduser().read_text(encoding="utf-8")
+
+
+def _conteudo_secao(corpo: str, heading: str) -> str:
+    linhas = corpo.splitlines()
+    for i, ln in enumerate(linhas):
+        if ln.strip().startswith(heading):
+            buf: list[str] = []
+            for prox in linhas[i + 1 :]:
+                if prox.strip().startswith("## "):
+                    break
+                buf.append(prox)
+            return "\n".join(buf).strip()
+    return ""
+
+
+def _falta(corpo: str) -> list[str]:
+    faltam = []
+    for s in OBRIGATORIAS:
+        if s not in corpo:
+            faltam.append(s)
+        elif not _conteudo_secao(corpo, s):
+            faltam.append(f"{s} (seção vazia)")
+    return faltam
+
+
+def _criterio(corpo: str) -> str | None:
+    """Primeira linha útil de ## Pronto quando. None se não houver critério."""
+    texto = _conteudo_secao(corpo, "## Pronto quando")
+    if not texto:
+        return None
+    for ln in texto.splitlines():
+        s = ln.strip().lstrip("-* ")
+        if s and s.lower() not in ALEGACOES:
+            return s
+    return None
+
+
+def _passou_prazo(meta: dict) -> bool:
+    try:
+        return datetime.fromisoformat(meta["aceite_ate"]) <= _hoje()
+    except (KeyError, ValueError):
+        return False
+
+
+def _vencido(meta: dict) -> bool:
+    return meta.get("estado") in ("aberto", "abandonado") and _passou_prazo(meta)
+
+
+def _marcar_abandonados() -> list[str]:
+    """Aberto cujo prazo passou vira `abandonado` no disco. Nada some em silêncio."""
+    marcados: list[str] = []
+    with core.travado():
+        p_handoff().mkdir(parents=True, exist_ok=True)
+        for p in sorted(p_handoff().glob("HO-*.md")):
+            meta, corpo = _ler(p.stem)
+            if meta.get("estado") == "aberto" and _passou_prazo(meta):
+                meta["estado"] = "abandonado"
+                meta["abandonado_em"] = _hoje().isoformat(timespec="seconds")
+                _grava(p.stem, meta, corpo)
+                marcados.append(p.stem)
+    return marcados
+
+
+def _prova_valida(prova: str | None) -> bool:
+    if not prova or not prova.strip():
+        return False
+    so_letras = "".join(ch for ch in prova.lower() if ch.isalpha() or ch.isspace()).strip()
+    if prova.strip().lower() in ALEGACOES or so_letras in ALEGACOES:
+        return False
+    return True
+
+
+def _postar(de: str, para: str, texto: str) -> int:
+    r = core.post(de, texto, [para])
+    for w in r["avisos"]:
+        print(f"⚠️  {w}", file=sys.stderr)
+    return r["n"]
+
+
+def _ponteiro(hid: str, meta: dict, corpo: str, bytes_corpo: int) -> str:
+    ate = datetime.fromisoformat(meta["aceite_ate"])
+    criterio = _criterio(corpo) or "(não declarado)"
+    return (
+        f"🤝 **HANDOFF {hid}** → @{meta['para']} · {meta['titulo']}\n\n"
+        f"**Pronto quando:** {criterio}\n"
+        f"**Corpo** ({bytes_corpo} B, não paga quem não vai executar): `{_caminho(hid)}`\n"
+        f"**Aceite até** {ate:%d/%m %H:%M} — vencido, vira abandonado e volta para @{meta['de']}.\n\n"
+        f"`iachat-handoff aceitar {hid} --quem {meta['para']}` · "
+        f"`recusar` com motivo também fecha o laço; sumir, não."
+    )
+
+
+# ─── comandos ────────────────────────────────────────────────────────────────
+
+
+def cmd_abrir(a) -> int:
+    de, para = core.normaliza_ia(a.de), core.normaliza_ia(a.para)
+    sala = [core.normaliza_ia(x) for x in core.config().get("na_sala", [])]
+    if para not in sala:
+        print(f"✗ '{para}' não está na sala {sala} — handoff sem dono não existe.",
+              file=sys.stderr)
+        return 2
+    if para == de:
+        print("✗ handoff para si mesmo não é handoff, é anotação.", file=sys.stderr)
+        return 2
+    if a.prazo < 0:
+        print("✗ --prazo não pode ser negativo.", file=sys.stderr)
+        return 2
+
+    corpo = _corpo_de(a).strip()
+    if _criterio(corpo) is None:
+        print("✗ handoff sem critério de pronto — isso é recado, não handoff.",
+              file=sys.stderr)
+        print("  Sem critério verificável o dono entrega Completed sem artefato.",
+              file=sys.stderr)
+        print("  Exija uma frase em ## Pronto quando, contra artefato — não heading vazio.",
+              file=sys.stderr)
+        print("  Template: skills/ia-handoff/SKILL.md", file=sys.stderr)
+        return 2
+
+    faltando = _falta(corpo)
+    if faltando:
+        print("✗ corpo incompleto — falta: " + ", ".join(faltando), file=sys.stderr)
+        print("  Sem essas seções o dono PERGUNTA (e trava) ou QUEBRA em silêncio.",
+              file=sys.stderr)
+        print("  Template: skills/ia-handoff/SKILL.md", file=sys.stderr)
+        return 2
+
+    with core.travado():
+        p_handoff().mkdir(parents=True, exist_ok=True)
+        hid = _novo_id()
+        agora = _hoje()
+        meta = {
+            "id": hid,
+            "de": de,
+            "para": para,
+            "titulo": a.titulo,
+            "estado": "aberto",
+            "aberto_em": agora.isoformat(timespec="seconds"),
+            "aceite_ate": (agora + timedelta(hours=a.prazo)).isoformat(timespec="seconds"),
+            "msg_abertura": "",
+        }
+        _grava(hid, meta, corpo)
+
+    bytes_corpo = len(corpo.encode())
+    n = _postar(de, para, _ponteiro(hid, meta, corpo, bytes_corpo))
+    meta["msg_abertura"] = str(n)
+    with core.travado():
+        _grava(hid, meta, corpo)
+
+    ponteiro = len(_ponteiro(hid, meta, corpo, bytes_corpo).encode())
+    print(f"✔ {hid} aberto → @{para} · msg #{n}")
+    print(f"  corpo {bytes_corpo} B no disco · ponteiro {ponteiro} B na sala "
+          f"({100 - 100 * ponteiro // max(bytes_corpo, 1)}% a menos do que postar inteiro)")
+    return 0
+
+
+def _transicao(hid: str, quem: str, de_estados: tuple, para_estado: str) -> tuple[dict, str]:
+    quem = core.normaliza_ia(quem)
+    meta, corpo = _ler(hid)
+    campo = {
+        "aceito": "para",
+        "recusado": "para",
+        "fechado": "para",
+        "devolvido": "de",
+        "abandonado": "de",
+    }
+    verbo = {
+        "aceito": "aceitar",
+        "recusado": "recusar",
+        "fechado": "fechar",
+        "devolvido": "devolver",
+        "abandonado": "abandonar",
+    }
+    if meta["estado"] not in de_estados:
+        raise ValueError(
+            f"{hid} está '{meta['estado']}' — {verbo[para_estado]} só vale a partir de "
+            f"{' ou '.join(de_estados)}."
+        )
+    dono = meta[campo[para_estado]]
+    if quem != dono:
+        raise ValueError(f"{hid} é de @{dono}; '{quem}' não pode {verbo[para_estado]}.")
+    meta["estado"] = para_estado
+    meta[f"{para_estado}_em"] = _hoje().isoformat(timespec="seconds")
+    return meta, corpo
+
+
+def cmd_aceitar(a) -> int:
+    try:
+        with core.travado():
+            meta, corpo = _transicao(a.id, a.quem, ("aberto", "abandonado"), "aceito")
+            _grava(a.id, meta, corpo)
+    except ValueError as e:
+        print(f"✗ {e}", file=sys.stderr)
+        return 2
+    n = _postar(meta["para"], meta["de"],
+                f"✋ **{a.id} aceito** por @{meta['para']} — {meta['titulo']}. "
+                f"Devolvo o resultado com a prova, aqui, quando fechar.")
+    print(f"✔ {a.id} aceito por {meta['para']} · msg #{n}")
+    print(f"  corpo: {_caminho(a.id)}")
+    return 0
+
+
+def cmd_recusar(a) -> int:
+    try:
+        with core.travado():
+            meta, corpo = _transicao(a.id, a.quem, ("aberto", "aceito", "abandonado"), "recusado")
+            meta["motivo"] = a.motivo
+            _grava(a.id, meta, corpo)
+    except ValueError as e:
+        print(f"✗ {e}", file=sys.stderr)
+        return 2
+    n = _postar(meta["para"], meta["de"],
+                f"🚫 **{a.id} recusado** por @{meta['para']} — {meta['titulo']}.\n"
+                f"Motivo: {a.motivo}")
+    print(f"✔ {a.id} recusado · msg #{n} · a bola voltou para {meta['de']}")
+    return 0
+
+
+def cmd_fechar(a) -> int:
+    if not _prova_valida(a.prova):
+        print("✗ fechar sem prova é alegação — cite o artefato (caminho, comando, número).",
+              file=sys.stderr)
+        print("  'Terminei' sem artefato citado não fecha.", file=sys.stderr)
+        return 2
+    try:
+        with core.travado():
+            meta, corpo = _transicao(a.id, a.quem, ("aceito",), "fechado")
+            resultado = _corpo_de(a).strip() if a.corpo else (a.resultado or "")
+            if not resultado:
+                raise ValueError("fechar sem resultado é sumir com a tarefa")
+            meta["prova"] = a.prova.strip()
+            _grava(a.id, meta, corpo + f"\n\n## Retorno ({meta['fechado_em']})\n\n{resultado}\n")
+    except ValueError as e:
+        print(f"✗ {e}", file=sys.stderr)
+        return 2
+    resumo = a.resultado or "resultado no corpo do handoff"
+    n = _postar(meta["para"], meta["de"],
+                f"✅ **{a.id} fechado** por @{meta['para']} — {meta['titulo']}.\n"
+                f"{resumo}\n"
+                f"Prova: {meta['prova']}\n"
+                f"Retorno completo: `{_caminho(a.id)}`")
+    print(f"✔ {a.id} fechado · msg #{n}")
+    return 0
+
+
+def cmd_devolver(a) -> int:
+    try:
+        with core.travado():
+            meta, corpo = _transicao(a.id, a.quem, ("aberto", "aceito", "abandonado"), "devolvido")
+            meta["motivo"] = a.motivo
+            _grava(a.id, meta, corpo)
+    except ValueError as e:
+        print(f"✗ {e}", file=sys.stderr)
+        return 2
+    n = _postar(meta["de"], meta["para"],
+                f"↩️ **{a.id} retomado** por @{meta['de']} — {meta['titulo']}.\n"
+                f"Motivo: {a.motivo}. Não é mais sua tarefa.")
+    print(f"✔ {a.id} devolvido ao autor · msg #{n}")
+    return 0
+
+
+def cmd_cobrar(a) -> int:
+    """Toca o sino de novo, mesmo id. Sem id: lista os abandonados."""
+    _marcar_abandonados()
+    if not a.id:
+        linhas = []
+        for p in sorted(p_handoff().glob("HO-*.md")):
+            meta, _ = _ler(p.stem)
+            if meta.get("estado") != "abandonado":
+                continue
+            idade = _hoje() - datetime.fromisoformat(meta["aberto_em"])
+            linhas.append(
+                f"  {meta['id']:20} {meta['de']:>7} → {meta['para']:<7} "
+                f"abandonado {int(idade.total_seconds()//3600):>3}h  {meta['titulo'][:44]}"
+            )
+        if not linhas:
+            print("(nenhum handoff abandonado)")
+            return 0
+        print(f"🤝 cobrança — {len(linhas)} abandonado(s)")
+        print("\n".join(linhas))
+        print("\n`iachat-handoff cobrar <id>` toca o sino de novo no mesmo id.")
+        return 0
+
+    try:
+        meta, _corpo = _ler(a.id)
+    except ValueError as e:
+        print(f"✗ {e}", file=sys.stderr)
+        return 2
+    if meta["estado"] not in ("aberto", "abandonado"):
+        print(f"= {a.id} está '{meta['estado']}' — nada a cobrar")
+        return 0
+    idade = _hoje() - datetime.fromisoformat(meta["aberto_em"])
+    n = _postar(meta["de"], meta["para"],
+                f"🔔 **{a.id} continua sem dono** há {int(idade.total_seconds()//3600)}h — "
+                f"{meta['titulo']}.\n"
+                f"`iachat-handoff aceitar {a.id} --quem {meta['para']}` ou "
+                f"`iachat-handoff recusar {a.id} --quem {meta['para']} --motivo \"...\"`.")
+    print(f"✔ cobrança de {a.id} · msg #{n}")
+    return 0
+
+
+def cmd_lista(a) -> int:
+    _marcar_abandonados()
+    p_handoff().mkdir(parents=True, exist_ok=True)
+    linhas = []
+    for p in sorted(p_handoff().glob("HO-*.md")):
+        meta, _ = _ler(p.stem)
+        if a.quem and core.normaliza_ia(a.quem) not in (meta["de"], meta["para"]):
+            continue
+        if not a.todos and meta["estado"] not in ESTADOS_ABERTOS:
+            continue
+        idade = _hoje() - datetime.fromisoformat(meta["aberto_em"])
+        marca = meta["estado"]
+        if marca == "abandonado":
+            marca = "abandonado"
+        linhas.append(
+            f"  {meta['id']:20} {meta['de']:>7} → {meta['para']:<7} "
+            f"{marca:<12} {int(idade.total_seconds()//3600):>3}h  {meta['titulo'][:44]}"
+        )
+    if not linhas:
+        print("(nenhum handoff aberto)" if not a.todos else "(nenhum handoff)")
+        return 0
+    print(f"🤝 {len(linhas)} handoff(s)" + ("" if a.todos else " em aberto"))
+    print("\n".join(linhas))
+    abandonados = sum(1 for ln in linhas if "abandonado" in ln)
+    if abandonados:
+        print(f"\n⚠️  {abandonados} abandonado(s): `iachat-handoff cobrar` lista; "
+              f"`iachat-handoff cobrar <id>` toca o sino; "
+              f"`iachat-handoff devolver <id> --quem <autor> --motivo \"...\"` retoma.")
+    return 0
+
+
+def cmd_ver(a) -> int:
+    try:
+        meta, corpo = _ler(a.id)
+    except ValueError as e:
+        print(f"✗ {e}", file=sys.stderr)
+        return 2
+    print(f"🤝 {meta['id']} · {meta['de']} → {meta['para']} · {meta['estado']}")
+    print(f"   {meta['titulo']}")
+    print(f"   aberto {meta['aberto_em']} · aceite até {meta['aceite_ate']}\n")
+    print(corpo)
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="iachat-handoff", description=__doc__)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("abrir", help="criar o handoff e postar o ponteiro na sala")
+    p.add_argument("--de", required=True)
+    p.add_argument("--para", required=True)
+    p.add_argument("--titulo", required=True)
+    p.add_argument("--corpo", required=True, help="arquivo .md, ou '-' para stdin")
+    p.add_argument("--prazo", type=int, default=PRAZO_PADRAO_H, help="horas até vencer")
+    p.set_defaults(f=cmd_abrir)
+
+    p = sub.add_parser("aceitar", help="assumir a tarefa (é o que separa aceito de lido)")
+    p.add_argument("id")
+    p.add_argument("--quem", required=True)
+    p.set_defaults(f=cmd_aceitar)
+
+    p = sub.add_parser("cobrar", help="tocar o sino de novo, mesmo id; sem id lista abandonados")
+    p.add_argument("id", nargs="?", default=None)
+    p.set_defaults(f=cmd_cobrar)
+
+    p = sub.add_parser("ver", help="o corpo — só quem vai executar paga")
+    p.add_argument("id")
+    p.set_defaults(f=cmd_ver)
+
+    p = sub.add_parser("recusar", help="devolver a bola com motivo (nunca sumir)")
+    p.add_argument("id")
+    p.add_argument("--quem", required=True)
+    p.add_argument("--motivo", required=True)
+    p.set_defaults(f=cmd_recusar)
+
+    p = sub.add_parser("devolver", help="o autor retoma um handoff sem dono")
+    p.add_argument("id")
+    p.add_argument("--quem", required=True)
+    p.add_argument("--motivo", required=True)
+    p.set_defaults(f=cmd_devolver)
+
+    p = sub.add_parser("fechar", help="entregar o resultado e encerrar — exige --prova")
+    p.add_argument("id")
+    p.add_argument("--quem", required=True)
+    p.add_argument("--resultado", help="uma ou duas linhas, vão para a sala")
+    p.add_argument("--corpo", help="arquivo com o retorno longo, ou '-'")
+    p.add_argument("--prova", required=True,
+                   help="o artefato que comprova (caminho, comando, número) — obrigatório")
+    p.set_defaults(f=cmd_fechar)
+
+    p = sub.add_parser("lista", help="o que está aberto, de quem, há quanto tempo")
+    p.add_argument("--quem", help="só os que envolvem esta IA")
+    p.add_argument("--todos", action="store_true", help="+ fechados/recusados")
+    p.set_defaults(f=cmd_lista)
+
+    a = ap.parse_args()
+    try:
+        return a.f(a)
+    except (OSError, ValueError) as e:
+        print(f"✗ {e}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,216 @@
+#!/usr/bin/env python3
+"""iadecide — o registro do que a sala DECIDIU, separado do que ela CONVERSOU.
+
+Protótipo da peça `ia-decide`. Na integração final isto vira dois subcomandos do
+`iachat` (`iachat decidir` / `iachat decisoes`) e some daqui — está solto para não
+escrever no repositório durante a fase de projeto.
+
+POR QUE NÃO É O `search`: o `search` responde "onde aparece X". A pergunta que mata
+uma IA nova é "o que eu tenho que obedecer aqui?", que não tem termo de busca — você
+não procura `trusted_hash` se não sabe que existe uma regra sobre ele. E o `search`
+acha a decisão velha e a nova com o mesmo peso; ele é um índice de texto, não um
+registro de estado.
+
+POR QUE NÃO É APPEND PURO, ao contrário do chat: no chat o append existe porque o
+read-modify-write de um ativo de 200 KB custa 392 KB de I/O por mensagem SEGURANDO o
+lock que as outras IAs esperam (iachat_core.py:276-278). Aqui o arquivo é de 3-10 KB e
+a escrita é rara, então o motivo não se transporta — e reescrever compra uma coisa que
+o append não dá: `estado=revogada` fica GRAVADO na linha da decisão morta. Quem abrir
+o arquivo com Read/grep, sem passar pelo comando, vê que ela caducou. Revogação
+derivada só na leitura seria uma armadilha para quem não usa o CLI.
+"""
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+from datetime import datetime
+from pathlib import Path
+
+REPO_BIN = Path("/Users/bauervieiracesarfilhovieira/Projetos/ia-chat/bin")
+sys.path.insert(0, str(REPO_BIN))
+import iachat_core as core  # noqa: E402
+
+# Metadado é a verdade; o título é decoração. Mesma lição do chat (iachat_core.py:29):
+# foi um sufixo no título que quebrou o sino do Codex.
+RE_DEC = re.compile(
+    r"^<!-- iadec id=D(\d+) de=(\S+) ts=(\S+) sobre=(\S*) estado=(\S+) por=(\S*) -->$",
+    re.M,
+)
+
+CABECALHO = """# ⚖️ DECISÕES — o que já foi decidido nesta sala
+
+> **Não leia este arquivo inteiro nem edite à mão.** `iachat decisoes` devolve só o que
+> está vigente, em ~2 linhas por decisão. Gravar: `iachat decidir`.
+> Uma decisão nunca é apagada — quando cai, ela fica aqui com `estado=revogada` e o
+> ponteiro de quem a derrubou.
+
+"""
+
+
+def p_dec() -> Path:
+    return core.home() / "decisoes.md"
+
+
+def _ler() -> tuple[str, list[dict]]:
+    p = p_dec()
+    if not p.exists():
+        return CABECALHO, []
+    txt = p.read_text(encoding="utf-8")
+    achados = list(RE_DEC.finditer(txt))
+    decs = []
+    for i, m in enumerate(achados):
+        fim = achados[i + 1].start() if i + 1 < len(achados) else len(txt)
+        decs.append(
+            {
+                "id": int(m.group(1)),
+                "de": m.group(2),
+                "ts": m.group(3),
+                "sobre": m.group(4),
+                "estado": m.group(5),
+                "por": m.group(6),
+                "pos": m.start(),
+                "bruto": txt[m.start() : fim].rstrip() + "\n",
+            }
+        )
+    return txt, decs
+
+
+def _corpo(d: dict) -> tuple[str, str]:
+    """Devolve (vale, porque) lidos do bloco — sem reparsear o título."""
+    vale = porque = ""
+    for ln in d["bruto"].splitlines():
+        if ln.startswith("**Vale:**"):
+            vale = ln[9:].strip()
+        elif ln.startswith("**Porque:**"):
+            porque = ln[11:].strip()
+    return vale, porque
+
+
+def cmd_decidir(a) -> int:
+    de = core.normaliza_ia(a.de)
+    sala = [core.normaliza_ia(x) for x in core.config().get("na_sala", [])]
+    # O operador decide mais que as IAs; ele não está na lista `na_sala`.
+    if de not in sala + ["bauer", "operador"]:
+        print(f"✗ '{de}' não está na sala {sala} (nem é o operador)", file=sys.stderr)
+        return 2
+    texto = " ".join(a.texto).strip()
+    if not texto:
+        print("✗ decisão vazia", file=sys.stderr)
+        return 2
+    if not a.porque:
+        print("✗ falta --porque. Decisão sem motivo não sobrevive a quem não estava lá.",
+              file=sys.stderr)
+        return 2
+
+    with core.travado():
+        txt, decs = _ler()
+        novo_id = max([d["id"] for d in decs], default=0) + 1
+        agora = datetime.now().astimezone()
+
+        revoga = []
+        for r in a.revoga or []:
+            n = int(str(r).lstrip("Dd"))
+            alvo = next((d for d in decs if d["id"] == n), None)
+            if not alvo:
+                print(f"✗ D{n} não existe", file=sys.stderr)
+                return 2
+            if alvo["estado"] == "revogada":
+                print(f"⚠️  D{n} já estava revogada por D{alvo['por']}", file=sys.stderr)
+            revoga.append(alvo)
+
+        # Reescrita cirúrgica: só a linha de metadado do revogado muda.
+        for alvo in revoga:
+            velho = alvo["bruto"].splitlines()[0]
+            morto = velho.replace("estado=vigente", "estado=revogada").replace(
+                "por=-", f"por={novo_id}"
+            )
+            txt = txt.replace(velho, morto, 1)
+
+        marca = f" · revoga {', '.join('D%d' % x['id'] for x in revoga)}" if revoga else ""
+        bloco = (
+            f"\n<!-- iadec id=D{novo_id} de={de} "
+            f"ts={agora.isoformat(timespec='seconds')} sobre={a.sobre or '-'} "
+            f"estado=vigente por=- -->\n"
+            f"### ⚖️ D{novo_id} · **{de}** · {agora:%d/%m %H:%M} · "
+            f"{a.sobre or 'geral'}{marca}\n"
+            f"**Vale:** {texto}\n"
+            f"**Porque:** {a.porque.strip()}\n"
+        )
+        core._escrever_atomico(p_dec(), (txt or CABECALHO) + bloco)
+
+    print(f"✔ D{novo_id} gravada ({a.sobre or 'geral'})")
+    for x in revoga:
+        print(f"  ↳ D{x['id']} passou a REVOGADA")
+
+    if a.anunciar:
+        aviso = (
+            f"**Decisão D{novo_id}** ({a.sobre or 'geral'}): {texto}\n\n"
+            f"Porque: {a.porque.strip()}\n\n"
+            + (f"Revoga: {', '.join('D%d' % x['id'] for x in revoga)}\n\n" if revoga else "")
+            + "Ver o que está vigente: `iachat decisoes`"
+        )
+        r = core.post(de, aviso, [a.anunciar])
+        print(f"  ↳ anunciada na sala como #{r['n']} → {', '.join(r['para']) or 'ninguém'}")
+    return 0
+
+
+def cmd_decisoes(a) -> int:
+    _, decs = _ler()
+    if not decs:
+        print("(nenhuma decisão registrada)")
+        return 0
+    sel = decs if a.todas else [d for d in decs if d["estado"] == "vigente"]
+    if a.sobre:
+        sel = [d for d in sel if d["sobre"] == a.sobre]
+    if a.id:
+        n = int(str(a.id).lstrip("Dd"))
+        sel = [d for d in decs if d["id"] == n]
+    if not sel:
+        tags = sorted({d["sobre"] for d in decs if d["estado"] == "vigente"})
+        print(f"(nada casa). Assuntos com decisão vigente: {', '.join(tags)}")
+        return 0
+
+    vig = sum(1 for d in decs if d["estado"] == "vigente")
+    cab = f"⚖️  {len(sel)} decisão(ões)"
+    if not a.todas and not a.id:
+        cab += f" vigente(s) de {len(decs)} registradas"
+    print(cab + ("" if a.sobre is None else f" · sobre={a.sobre}"))
+    print()
+    for d in sel:
+        vale, porque = _corpo(d)
+        if d["estado"] == "revogada":
+            print(f"  D{d['id']} ⛔ REVOGADA por D{d['por']} — era: {vale}")
+            continue
+        print(f"  D{d['id']} [{d['sobre']}] {vale}")
+        print(f"       ↳ {porque}  ({d['de']}, {d['ts'][:10]})")
+    if not a.todas and not a.id and len(decs) > vig:
+        print(f"\n  ({len(decs)-vig} revogada(s) oculta(s) — `--todas` mostra)")
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="iadecide", description=__doc__)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("decidir", help="gravar uma decisão")
+    p.add_argument("--de", required=True)
+    p.add_argument("--porque", help="o motivo — obrigatório")
+    p.add_argument("--sobre", help="assunto, uma palavra: rotacao, hooks, canal…")
+    p.add_argument("--revoga", action="append", help="D3 (repetível)")
+    p.add_argument("--anunciar", help="também postar na sala, nominando esta IA")
+    p.add_argument("texto", nargs="*")
+    p.set_defaults(f=cmd_decidir)
+
+    p = sub.add_parser("decisoes", help="o que está vigente")
+    p.add_argument("--sobre", help="filtrar por assunto")
+    p.add_argument("--todas", action="store_true", help="+ as revogadas")
+    p.add_argument("--id", help="uma só, ex: D3 (mostra mesmo revogada)")
+    p.set_defaults(f=cmd_decisoes)
+
+    a = ap.parse_args()
+    return a.f(a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

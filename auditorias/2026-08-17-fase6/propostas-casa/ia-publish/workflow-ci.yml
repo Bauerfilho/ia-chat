@@ -1,0 +1,93 @@
+# Destino no repo: .github/workflows/testes.yml
+#
+# O QUE ESTE WORKFLOW RODA — E O QUE ELE SE RECUSA A RODAR
+#
+#   RODA os 3 arquivos de tests/. Nenhum deles toca macOS:
+#     · `grep -rn "launchctl|osascript|afplay" tests/` → ZERO ocorrências
+#     · o único subprocess é `sys.executable bin/iachat`
+#       (tests/teste_concorrencia.py:38 e :51) — nunca um shell script
+#     · o único módulo POSIX do núcleo é `fcntl` (bin/iachat_core.py:20,133,136),
+#       que é nativo de Linux — falta só no Windows
+#
+#   RODA `bash -n` nos 4 scripts .sh: confere sintaxe SEM executar nada.
+#
+#   NÃO RODA o sino, de propósito:
+#     · bin/ia-bell-daemon.sh:56 e :70 chamam `osascript`
+#     · bin/ia-bell-install-daemon.sh:45,46,52 chamam `launchctl`
+#     Nenhum dos dois existe em Linux e NENHUM teste os invoca. Colocá-los no CI
+#     seria fabricar um verde falso. Eles se provam na máquina, não no runner.
+#
+#   NÃO RODA shellcheck: nunca foi executado sobre este código (não está instalado
+#     na máquina onde isto foi preparado). Prometer que passa seria chute. Rode
+#     `brew install shellcheck && shellcheck bin/*.sh install.sh` na mão primeiro;
+#     se sair limpo, aí sim vale acrescentar um passo aqui.
+#
+# MEDIÇÕES QUE SUSTENTAM ESTE ARQUIVO (macOS 15, M4 Max, 2026-08-17):
+#   teste_concorrencia 1,23 s real · teste_nucleo 0,11 s · teste_rotacao 0,75 s
+#   → suíte inteira em ~2,1 s. Passou em Python 3.11.15, 3.12.13 e 3.14.6.
+#     (3.13 está na matriz por interpolação: não foi executado localmente.)
+
+name: testes
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # MEDIDO: sob locale C e sem a coerção do PEP 538
+  # (`LC_ALL=C PYTHONCOERCECLOCALE=0 PYTHONUTF8=0`), teste_nucleo.py morre com
+  # UnicodeEncodeError na linha 26, no primeiro print("✔ ..."). O runner ubuntu
+  # define LANG=C.UTF-8 e não cai nisso — mas esta linha custa zero e fecha a
+  # classe inteira de falha por encoding, em qualquer runner futuro.
+  PYTHONIOENCODING: utf-8
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  gates:
+    name: gates · ${{ matrix.os }} · py${{ matrix.python }}
+    strategy:
+      fail-fast: false          # ver TODAS as versões que quebram, não só a primeira
+      matrix:
+        os: [ubuntu-latest]
+        python: ["3.11", "3.12", "3.13", "3.14"]
+        include:
+          - os: macos-latest    # o ambiente real de quem usa o plugin
+            python: "3.12"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: gate 1 · concorrência (5 IAs × 20 msgs = 100 íntegras)
+        run: python3 tests/teste_concorrencia.py
+
+      - name: gates 2-5 e 10 · nominação, anti-eco, cursor, parser, leitura dirigida
+        run: python3 tests/teste_nucleo.py
+
+      - name: gates 6, 7 e 9 · rotação, idempotência, custo da busca
+        run: python3 tests/teste_rotacao.py
+
+  shell:
+    name: sintaxe dos scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: bash -n (confere sintaxe, não executa)
+        run: |
+          for f in bin/*.sh install.sh; do
+            bash -n "$f" && echo "ok  $f"
+          done
+
+# NOTA SOBRE AS VERSÕES DAS ACTIONS
+# `checkout@v4` e `setup-python@v5` são as majors estáveis conhecidas aqui. Se o
+# Actions começar a avisar depreciação de runtime Node, suba a major (v5/v6) —
+# a sintaxe dos `with:` usados acima não muda entre elas.

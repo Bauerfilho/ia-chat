@@ -1,0 +1,301 @@
+#!/usr/bin/env python3
+"""iachat-digest — destila NA ENTREGA, não no arquivo.
+
+O meio-termo que faltava entre "a mensagem está inteira no ativo" e "a mensagem
+saiu num recorte". Só que o meio-termo NÃO é reescrever o ativo — é entregar
+menos, uma vez, para quem está com a janela cheia, sem tocar no que está gravado.
+
+POR QUE NA ENTREGA E NÃO NO ARQUIVO (medido, não escolhido por gosto):
+
+· Destilar o ARQUIVO não paga. O caminho comum de leitura já é limitado por
+  cursor (`iachat_core.py:326`): cada IA vê cada mensagem UMA vez. Destilar o que
+  ela já leu economiza zero, e destilar o que ela ainda NÃO leu apaga conteúdo
+  antes da entrega. Medido em 17/08 na sala real (16 msgs, 24.757 B): claude e
+  kimi tinham 0 B pendentes; o codex, 9.143 B. Um destilador por idade teria
+  destilado justamente as mensagens que o codex ainda não viu.
+· E o teto do que se pode cortar sem mentir é baixo: 75% do corpo das 16
+  mensagens reais contém caminho, número medido, comando ou file:line — a
+  definição de autocontido que o próprio chat cobra de quem escreve
+  (`iachat_core.py:93`). Sobra 25% no grão de linha, 49% no grão de frase.
+
+· Destilar na ENTREGA paga, e paga num defeito real. Acima do teto de 6.144 B,
+  `iachat entregar` cai num modo degradado (`bin/iachat:64-69`) que imprime
+  `m['bruto'].splitlines()[2][:90]` — e o índice 2 é a LINHA EM BRANCO entre o
+  título e o corpo. Medido: o codex recebe 92 B de cabeçalhos VAZIOS para 9.143 B
+  pendentes (1%), o cursor não anda e o sino não apaga. O laço do hook não fecha
+  exatamente quando há mais o que dizer.
+
+O QUE NUNCA SE DESTILA: caminho absoluto, número medido, comando, file:line,
+citação literal do dono, cabeçalho e qualquer linha dentro de bloco de código.
+Perder isso quebra a autocontenção que este plugin existe para impor.
+
+QUEM DESTILA: ninguém. É um filtro de linha/frase, sem modelo, sem rede, sem
+API — o mesmo motivo pelo qual a rotação é mecânica (`iachat_core.py:422`): a IA
+que julgaria pode estar fechada justo na hora. Roda com a casca inteira caída.
+
+COMO SE RECUPERA O ORIGINAL: ele nunca saiu do lugar. O ativo não é reescrito —
+cada mensagem destilada leva o ponteiro `iachat page ativo <p>`, calculado com a
+mesma conta que o `iachat search` já usa (`iachat_core.py:557`). Reversibilidade
+sai de graça porque não houve escrita.
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import sys
+from pathlib import Path
+
+_BIN_REPO = Path(
+    os.environ.get("IACHAT_BIN", Path.home() / "Projetos" / "ia-chat" / "bin")
+)
+sys.path.insert(0, str(_BIN_REPO))
+import iachat_core as core  # noqa: E402
+
+TETO_PADRAO = 6144  # o mesmo de `iachat entregar` (bin/iachat:171)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# O QUE NUNCA SAI. Cada padrão existe por um fato que quem lê depois não tem como
+# reconstruir — quem lê está em outra janela e não viu nada do que você viu.
+# ─────────────────────────────────────────────────────────────────────────────
+PROTEGIDO = [
+    re.compile(r"`"),                              # comando, identificador, código
+    re.compile(r"(?:^|[\s(\"'])[~/][\w./~-]*/"),   # caminho absoluto ou ~/...
+    re.compile(r"\w+\.\w+:\d+"),                   # file:line   (config.toml:1119)
+    # QUALQUER dígito, não `\d{2,}`. Testei com dois dígitos e a frase "chegaram a
+    # mim exatamente 2 prompts dele" (msg #14) caiu — e ela é uma MEDIÇÃO. Número
+    # pequeno é o mais fácil de perder e o mais caro: "2 prompts" e "0 dessas três"
+    # decidem conduta. O custo de proteger 1 dígito é 5 pontos de corte (34% → 29%
+    # nas 16 msgs reais); pago sem discutir.
+    re.compile(r"\d"),                             # número medido: B, PID, contagem
+    re.compile(r"\*\"|\"\*"),                      # citação literal do dono  *"..."*
+]
+CERCA = re.compile(r"^\s*(?:```|~~~)")
+CABECALHO = re.compile(r"^#{1,6}\s")
+SO_ENFEITE = re.compile(r"^[\s\-*_=·—>#]*$")
+# Marcador de lista/citação: se a linha perder todas as frases, o marcador órfão sai junto.
+MARCADOR = re.compile(r"^(\s*(?:[-*+]|\d+\.|>)\s*)(.*)$", re.S)
+FRASE = re.compile(r"(?<=[.:;!?])\s+")
+
+
+def _tem_fato(s: str) -> bool:
+    if SO_ENFEITE.match(s):
+        return False
+    return any(p.search(s) for p in PROTEGIDO)
+
+
+def destila(bruto: str, grau: int) -> str:
+    """grau 0 = intacta · 1 = grão de LINHA · 2 = grão de FRASE.
+
+    O metadado e o título saem sempre inteiros: o metadado é o que o parser lê
+    (`iachat_core.py:30`) e o título é o que identifica a mensagem na tela.
+    A PRIMEIRA linha de corpo também fica sempre — é ela que diz do que se trata,
+    e sem ela o destilado vira lista de fatos soltos em vez de fio de conversa.
+    """
+    if grau <= 0:
+        return bruto
+    linhas = bruto.splitlines()
+    cabeca, corpo = linhas[:2], linhas[2:]
+
+    saida, em_cerca, primeira_vista = [], False, False
+    for ln in corpo:
+        if CERCA.match(ln):
+            em_cerca = not em_cerca
+            saida.append(ln)
+            continue
+        if em_cerca or CABECALHO.match(ln) or SO_ENFEITE.match(ln):
+            saida.append(ln)
+            continue
+        if not primeira_vista:            # a abertura: sempre fica
+            primeira_vista = True
+            saida.append(ln)
+            continue
+        if grau == 1:
+            if _tem_fato(ln):
+                saida.append(ln)
+            elif saida and saida[-1] != "":
+                saida.append("")
+            continue
+        # grau 2 — dentro da linha, frase a frase
+        m = MARCADOR.match(ln)
+        prefixo, resto = (m.group(1), m.group(2)) if m else ("", ln)
+        mantidas = [f for f in FRASE.split(resto) if _tem_fato(f)]
+        if mantidas:
+            saida.append(prefixo + " ".join(mantidas))
+        elif saida and saida[-1] != "":
+            saida.append("")
+
+    while saida and saida[-1] == "":
+        saida.pop()
+    return "\n".join(cabeca + saida) + "\n"
+
+
+def _pagina_no_ativo(txt: str, pos: int, cache: dict) -> int:
+    """Em que página do ativo esta mensagem está — a conta do `iachat search`."""
+    if "fr" not in cache:
+        cache["fr"] = core._fronteiras(txt.splitlines())
+    linha = txt[:pos].count("\n") + 1
+    return next((i + 1 for i, (a, b) in enumerate(cache["fr"]) if a < linha <= b), 1)
+
+
+def _monta(msgs: list[dict], graus: dict[int, int], txt: str, cache: dict) -> str:
+    partes = []
+    for m in msgs:
+        g = graus[m["n"]]
+        corpo = destila(m["bruto"], g)
+        if g:
+            pag = _pagina_no_ativo(txt, m["pos"], cache)
+            corpo = corpo.rstrip() + (
+                f"\n> 🗜️ destilado (grau {g}) de {len(m['bruto'].encode())} B · "
+                f"íntegra: `iachat page ativo {pag}`\n"
+            )
+        partes.append(corpo)
+    return "\n".join(partes)
+
+
+def planeja(msgs: list[dict], teto: int, txt: str) -> tuple[dict[int, int], str, dict]:
+    """Escala o grau das mais VELHAS primeiro, até caber no teto.
+
+    Velhas primeiro porque a última mensagem é a que o leitor vai responder — ela
+    é a que menos pode chegar picada. Se nem tudo em grau 2 couber, o excedente
+    mais velho vira uma linha de cabeçalho REAL (a primeira linha de corpo, não a
+    linha em branco do índice 2) + o ponteiro da página.
+    """
+    cache: dict = {}
+    graus = {m["n"]: 0 for m in msgs}
+    saida = _monta(msgs, graus, txt, cache)
+    for grau in (1, 2):
+        for m in msgs[:-1] if len(msgs) > 1 else msgs:
+            if len(saida.encode()) <= teto:
+                return graus, saida, cache
+            graus[m["n"]] = grau
+            saida = _monta(msgs, graus, txt, cache)
+    if len(saida.encode()) > teto and len(msgs) > 1:
+        graus[msgs[-1]["n"]] = 2
+        saida = _monta(msgs, graus, txt, cache)
+    return graus, saida, cache
+
+
+def _linha_de_assunto(m: dict) -> str:
+    """A primeira linha de CORPO — o índice 3, não o 2 (bin/iachat:68 pega o 2, que é vazio)."""
+    corpo = [l for l in m["bruto"].splitlines()[2:] if l.strip()]
+    return corpo[0][:100] if corpo else "(sem corpo)"
+
+
+def _entrega(ia: str, teto: int) -> tuple[str, list[dict], dict, int, list[dict]] | None:
+    """Devolve (corpo, msgs entregues, graus, bytes pendentes, msgs ORIGINAIS).
+
+    A lista original volta junto de propósito: o `ver` compara com o modo de hoje, e
+    comparar contra a lista já podada faria a minha própria medição mentir a favor.
+    """
+    r = core.ler(ia, escopo="meu", avancar=False)
+    if not r["msgs"]:
+        return None
+    msgs = r["msgs"]
+    originais = list(msgs)
+    with core.travado():
+        txt = core.p_chat().read_text(encoding="utf-8")
+    if r["bytes"] <= teto:
+        return ("\n".join(m["bruto"] for m in msgs), msgs, {m["n"]: 0 for m in msgs},
+                r["bytes"], originais)
+    graus, corpo, cache = planeja(msgs, teto, txt)
+    # Ainda estourou com tudo em grau 2: corta as mais velhas para cabeçalho REAL.
+    while len(corpo.encode()) > teto and len(msgs) > 1:
+        fora = msgs.pop(0)
+        pag = _pagina_no_ativo(txt, fora["pos"], cache)
+        graus.pop(fora["n"])
+        corpo = (
+            f"   #{fora['n']} de {fora['de']}: {_linha_de_assunto(fora)}\n"
+            f"      → `iachat page ativo {pag}`\n"
+        ) + _monta(msgs, graus, txt, cache)
+    return corpo, msgs, graus, r["bytes"], originais
+
+
+def cmd_entregar(a) -> int:
+    """Substituto direto de `iachat entregar` — só muda o que hoje é o modo degradado."""
+    e = _entrega(a.de, a.teto)
+    if e is None:
+        return 0
+    corpo, msgs, graus, bruto, _ = e
+    destiladas = [n for n, g in graus.items() if g]
+    saiu = len(corpo.encode())
+    if not destiladas:
+        print(f"📬 [ia-chat] {len(msgs)} mensagem(ns) para você ({saiu} B). "
+              f"Já entregues abaixo — não precisa rodar nada.\n")
+    else:
+        print(f"📬 [ia-chat] {len(msgs)} mensagem(ns) para você · {bruto} B na sala, "
+              f"{saiu} B entregues. As marcadas 🗜️ vieram destiladas: caminho, número "
+              f"medido e comando estão inteiros; a prosa que os explica ficou na "
+              f"íntegra, no ponteiro de cada uma.\n")
+    print(corpo)
+    if not a.sem_avancar:
+        core.marca_lida(a.de, max(m["n"] for m in msgs))
+    return 0
+
+
+def cmd_ver(a) -> int:
+    """Mede sem entregar e sem mexer no cursor."""
+    e = _entrega(a.de, a.teto)
+    if e is None:
+        print(f"(nada pendente para {a.de})")
+        return 0
+    corpo, msgs, graus, bruto, originais = e
+    saiu = len(corpo.encode())
+    # O modo de hoje, reproduzido sobre a lista INTEIRA — é contra ele que se compara.
+    hoje = "\n".join(
+        f"   #{m['n']} de {m['de']}: {m['bruto'].splitlines()[2][:90]}" for m in originais
+    )
+    print(f"pendente para {a.de}: {bruto} B em {len(originais)} msg(s) · teto {a.teto} B")
+    for m in originais:
+        g = graus.get(m["n"])
+        d = len(destila(m["bruto"], g).encode()) if g is not None else 0
+        rot = "cortada p/ cabeçalho" if g is None else f"grau {g}"
+        print(f"   #{m['n']:<3} {len(m['bruto'].encode()):>6} B → {d:>6} B   {rot}")
+    print(f"\n   hoje  (bin/iachat:64-69): {len(hoje.encode()):>6} B entregues "
+          f"({100*len(hoje.encode())//bruto}% do pendente)")
+    print(f"   digest:                   {saiu:>6} B entregues "
+          f"({100*saiu//bruto}% do pendente) · teto {a.teto} B "
+          f"{'OK' if saiu<=a.teto else 'ESTOUROU'}")
+    return 0
+
+
+def cmd_nivel(a) -> int:
+    """Auditoria do destilador: mostra a mesma mensagem nos 3 graus."""
+    with core.travado():
+        msgs = core.parse(core.p_chat().read_text(encoding="utf-8"))
+    m = next((x for x in msgs if x["n"] == a.n), None)
+    if m is None:
+        print(f"✗ #{a.n} não está no ativo", file=sys.stderr)
+        return 2
+    print(destila(m["bruto"], a.grau))
+    print(f"--- grau {a.grau}: {len(m['bruto'].encode())} B → "
+          f"{len(destila(m['bruto'], a.grau).encode())} B ---")
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="iachat-digest", description=__doc__)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("entregar", help="entrega destilada quando o pendente estoura o teto")
+    p.add_argument("--de", required=True)
+    p.add_argument("--teto", type=int, default=TETO_PADRAO)
+    p.add_argument("--sem-avancar", action="store_true", help="não mexer no cursor")
+    p.set_defaults(f=cmd_entregar)
+
+    p = sub.add_parser("ver", help="medir a entrega sem entregar (não mexe no cursor)")
+    p.add_argument("--de", required=True)
+    p.add_argument("--teto", type=int, default=TETO_PADRAO)
+    p.set_defaults(f=cmd_ver)
+
+    p = sub.add_parser("nivel", help="ver uma mensagem destilada num grau (auditoria)")
+    p.add_argument("n", type=int)
+    p.add_argument("--grau", type=int, default=2, choices=[0, 1, 2])
+    p.set_defaults(f=cmd_nivel)
+
+    a = ap.parse_args()
+    return a.f(a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
