@@ -669,7 +669,11 @@ def colher(e: dict, a) -> int:
 
     print(corpo)
     if not a.calado:
-        r = anuncia(e.get("de", "bauer"), corpo, ["all"])
+        # Assina quem ABRIU a missão (`cmd_goal` grava `"de"`), não quem rodou o colher.
+        # O fallback é o brain, não o dono: estado sem `"de"` significa que não sabemos
+        # quem abriu — e "não sei" nunca deve virar "foi ele". Um estado assim só existe
+        # se foi gravado por uma versão anterior ao campo.
+        r = anuncia(e.get("de") or core.config().get("brain", DONO), corpo, ["all"])
         if r:
             print(f"\n↪ na sala como #{r['n']}")
     if not entregues:

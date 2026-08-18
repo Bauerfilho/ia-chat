@@ -34,10 +34,21 @@ def checa(nome: str, condicao: bool, detalhe: str = "") -> None:
         falhas.append(nome)
 
 
+# Subcomandos que assinam mensagem na sala. Sem TTY e sem `--de`, o comando RECUSA
+# em vez de assinar como o dono (`autor()`, bin/iachat-comando) — e o teste
+# roda por subprocesso, que é exatamente o caso sem TTY que a guarda existe para pegar.
+# Declarar o autor aqui, num lugar só, mantém os testes medindo o gate que eles querem
+# medir; quem quer provar a própria guarda passa `--de` (ou a ausência dele) de propósito.
+ASSINAM = {"goal", "plan", "concluir", "parar", "decidi"}
+
+
 def roda(env: dict[str, str], *args: str) -> subprocess.CompletedProcess[str]:
     """A mesma porta pública que o dono usa no terminal."""
+    argv = list(args)
+    if argv and argv[0] in ASSINAM and "--de" not in argv:
+        argv += ["--de", "claude"]
     return subprocess.run(
-        [sys.executable, str(CMD), *args], env=env, capture_output=True, text=True,
+        [sys.executable, str(CMD), *argv], env=env, capture_output=True, text=True,
     )
 
 
@@ -143,7 +154,10 @@ def main() -> int:
         )
 
         # ---- T1: /goal grava e ANUNCIA na sala ------------------------------
-        g = roda(env, "goal", "--novo", "arrumar o sino do codex sem quebrar o hash")
+        # `--de bauer` de propósito: é ESTE caminho que o teste prova — o dono não está
+        # em `na_sala`, então quem assina é a orquestradora, com a procedência na frente.
+        g = roda(env, "goal", "--novo", "--de", "bauer",
+                 "arrumar o sino do codex sem quebrar o hash")
         e1 = estado(base)
         chat = core.p_chat().read_text(encoding="utf-8")
         checa(

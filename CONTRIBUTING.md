@@ -31,6 +31,48 @@ python3 tests/teste_concorrencia.py
 **Verde inteiro antes de abrir PR.** Não "verde no que eu mexi": a bateria é cruzada de
 propósito — o gate de fronteira, por exemplo, só falha quando outro teste se comporta mal.
 
+## O CI roda o mesmo laço — e num Python que o seu talvez não seja
+
+`.github/workflows/testes.yml` faz exatamente o que está escrito acima: a bateria
+inteira, arquivo por arquivo. Nada de framework novo, nada de subconjunto.
+
+Ele roda em **macOS**, e não em Ubuntu, por um motivo que decide sozinho:
+`tests/teste_python_sistema.py` existe para provar que este repositório roda no
+`/usr/bin/python3` do Mac. No Linux esse arquivo não existe, o teste se declara `⊘`, e a
+promessa central do projeto — *quem clona não instala nada* — atravessaria o CI sem ser
+testada. Um CI que não testa a promessa é um selo, não um gate. (`teste_server_connection.py`
+lê `pmset` e `ipconfig`, que também são daqui.)
+
+Roda em **duas pernas de Python**, e a que costuma pegar defeito é a primeira:
+
+```bash
+# a perna `sistema` — o Python que já vem no Mac, e a promessa do projeto
+for f in tests/teste_*.py; do
+  /usr/bin/python3 "$f" >/dev/null 2>&1 && echo "✔ $(basename $f)" || echo "✗ $(basename $f)"
+done
+```
+
+Um `match`, um `X | Y` fora de anotação ou um `tomllib` passa despercebido no seu
+terminal e quebra no Mac de quem clonar. **Rode a perna `sistema` antes de abrir PR.**
+
+O workflow também clona o repositório irmão `ia-chat-app` ao lado, porque
+`teste_python_sistema.py` e `teste_caminhos_citados.py` cobrem os arquivos de lá. Sem o
+irmão eles simplesmente cobrem menos e continuam verdes — falso verde silencioso —, então
+a ausência dele **para o job** em vez de passar. Localmente vale o mesmo: mantenha os dois
+repositórios lado a lado, como `~/Projetos/ia-chat` e `~/Projetos/ia-chat-app`.
+
+Duas coisas que o CI se recusa a fazer: **não fica verde sem rodar teste** (glob vazio é
+vermelho, com a mensagem dizendo isso) e **não pula calado** (todo `⊘` aparece contado na
+tabela do resumo e num aviso do job).
+
+**Sobre o badge:** o `README.md` ainda não tem um, de propósito. Badge só entra depois da
+primeira execução real, quando a URL existe e reflete um estado medido. Depois do primeiro
+push, a linha é:
+
+```markdown
+[![testes](https://github.com/DONO/ia-chat/actions/workflows/testes.yml/badge.svg)](https://github.com/DONO/ia-chat/actions/workflows/testes.yml)
+```
+
 ## Todo teste precisa do caso que REPROVA
 
 **Gate que nunca viu vermelho não é gate.** É uma função que imprime ✔.
@@ -141,7 +183,8 @@ python3 tests/teste_caminhos_citados.py
 
 ## Antes de abrir o PR
 
-1. Bateria inteira verde (o laço lá em cima).
+1. Bateria inteira verde (o laço lá em cima) — e verde também com `/usr/bin/python3`,
+   que é a perna do CI que pega o que o seu Python esconde.
 2. Teste novo? Provado vermelho ao menos uma vez, de propósito.
 3. Mexeu no núcleo? `tests/teste_compat.py` rodado e citado no PR.
 4. Nenhum `IACHAT_HOME` apontando para a sala real em teste algum.
