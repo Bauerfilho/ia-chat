@@ -44,7 +44,24 @@ echo "✔ CLI      $DEST_BIN/iachat  →  $DEST_SCRIPTS/iachat"
 echo "✔ skills   $DEST_SKILLS/ia-*  ($(ls -d "$SRC"/skills/*/ | wc -l | tr -d ' ') instaladas)"
 echo "✔ sala     $SALA"
 echo
-echo "Claude Code: já vê as skills em $DEST_SKILLS."
+# A linha do Claude era afirmada SEM verificar nada — "já vê as skills" saía igual numa
+# máquina onde o Claude Code nem está instalado, e ficava duplamente falsa quando
+# `IACHAT_SKILLS` aponta para fora de `~/.claude/skills`, que é o único lugar onde ele
+# procura sozinho. Achado auditando a instalação numa máquina limpa, em 18/08.
+#
+# Instalador que declara sucesso onde não há nada ensina o usuário a não confiar nele —
+# e a confiança no instalador é a primeira que se ganha ou se perde num repositório novo.
+# O teste é pelo BINÁRIO, não pela pasta: `~/.claude` pode ter acabado de nascer — este
+# mesmo instalador a cria ao copiar as skills para lá. Diretório não distingue "tem
+# Claude Code" de "eu criei a pasta há um segundo".
+if ! command -v claude >/dev/null 2>&1; then
+  echo "Claude Code: não encontrado nesta máquina — as skills ficaram em $DEST_SKILLS."
+elif [ "$DEST_SKILLS" = "$HOME/.claude/skills" ]; then
+  echo "Claude Code: já vê as skills em $DEST_SKILLS."
+else
+  echo "Claude Code: procura em ~/.claude/skills, e você instalou em $DEST_SKILLS."
+  echo "             ln -s \"$DEST_SKILLS\"/* ~/.claude/skills/"
+fi
 if grep -q "$DEST_SKILLS" "$HOME/.kimi-code/config.toml" 2>/dev/null; then
   echo "Kimi:        já lê $DEST_SKILLS (extra_skill_dirs) — nada a fazer."
 else
