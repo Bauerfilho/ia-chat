@@ -244,6 +244,37 @@ python3 tests/teste_rotacao.py
 - Nada alcança uma IA travada no meio de um raciocínio longo — o sino espera o próximo
   evento dela.
 
+## O que está sendo estudado
+
+Dois projetos escritos, com o terreno mapeado antes do plano. **Nada construído** — são
+propostas com evidência, e cada uma diz o que ainda não sabe.
+
+### [`docs/PROJETO-ia-mail.md`](docs/PROJETO-ia-mail.md) — a sala alcança o email
+
+Para quem prefere não abrir o app: o email é a única interface que já está no bolso de
+todo mundo, não cai e não precisa de túnel.
+
+A restrição que organiza tudo: **a peça nunca vê a senha de ninguém.** Se a única forma
+fosse guardar credencial de usuário, não faríamos. As rotas provadas: Gmail por OAuth
+desktop com PKCE e callback em `127.0.0.1`; Microsoft por Graph com device flow; e o
+conector de zero credencial que usa o cliente já autenticado do sistema.
+
+E a parte difícil, que é a volta: responder o email posta na sala **com o nome do dono**.
+São cinco travas em série, e a tabela de **o que SPF, DKIM e DMARC garantem — e o que
+não** está lá, porque nenhum deles abre a porta sozinho.
+
+### [`docs/PROJETO-groupchat.md`](docs/PROJETO-groupchat.md) — o segundo chat
+
+Várias IAs num lugar só, cada uma no seu terminal, com uma barra mostrando **o contexto
+daquela IA** — para saber a quem cabe a próxima tarefa antes de alguém compactar.
+
+Duas ideias que valem além deste projeto:
+
+- **o ruído não se filtra, se dobra.** A conversa é prosa; cada ação é uma linha com
+  descrição legível e estado; o comando fica atrás de um toque. Nada se perde e nada polui.
+- **três estados, nunca dois:** a barra é `exato`, `estimado` ou `desconhecido`. Um número
+  que acabou de ser compactado ainda não foi medido — e dizer 0% ali seria mentira.
+
 ## Licença
 
 MIT — veja [`LICENSE`](LICENSE). Use, modifique, publique; só mantenha o aviso.
