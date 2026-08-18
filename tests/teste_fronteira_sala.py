@@ -72,6 +72,16 @@ if not sala.is_dir():
     print(f"  ⊘ sem sala em {sala} — nada a proteger neste ambiente")
     sys.exit(0)
 
+# ⚠️ GUARDA DE RECURSÃO. Este gate RODA A BATERIA INTEIRA. Se alguém o executa DENTRO de
+# uma bateria — que é o jeito normal de rodar tudo — nascem duas execuções simultâneas
+# disputando os mesmos temporários, e ele reprova por colisão, não por defeito. Medido em
+# 18/08: vermelho na bateria, verde sozinho, sala intacta nos dois casos. Falso vermelho
+# ensina a ignorar gate, que é o pior estrago que um gate pode causar.
+if os.environ.get("IACHAT_DENTRO_DA_BATERIA") == "1":
+    print("  ⏭  já estou dentro de uma bateria — pulo para não rodar bateria dentro de bateria.")
+    print("     (rode-me sozinho: python3 tests/teste_fronteira_sala.py)")
+    raise SystemExit(0)
+
 antes = impressao(sala)
 outros = sorted(p for p in (RAIZ / "tests").glob("teste_*.py") if p.name != EU)
 print(f"  rodando {len(outros)} testes contra a sala viva em {sala}")
@@ -82,7 +92,8 @@ for t in outros:
         # Sem IACHAT_HOME no ambiente: é exatamente assim que o dono roda a bateria, e é
         # nessa configuração que o descuido aparece. Forçar um temporário aqui esconderia
         # o defeito — seria o gate consertando o problema antes de medi-lo.
-        subprocess.run([sys.executable, str(t)], capture_output=True, timeout=120)
+        subprocess.run([sys.executable, str(t)], capture_output=True, timeout=120,
+                       env={**os.environ, "IACHAT_DENTRO_DA_BATERIA": "1"})
     except subprocess.TimeoutExpired:
         quebrados.append(f"{t.name} (timeout)")
 

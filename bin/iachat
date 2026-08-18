@@ -62,7 +62,12 @@ def cmd_read(a) -> int:
                     quando = f" · última leitura em {marca[11:16]}"
         except Exception:
             pass          # sem cursor ainda, ou formato antigo: o aviso é opcional
-        print(f"(nada para {a.de} — cursor em #{r['desde']} de {r['total']} na sala{quando})")
+        # `total` é quantas mensagens existem DESDE o cursor, não o tamanho da sala.
+        # "cursor em #46 de 8 na sala" fazia parecer que a sala tinha 8 — tinha 54.
+        # Número certo com legenda errada é o mesmo que número errado.
+        novas = r.get("novas", 0)
+        print(f"(nada para {a.de} — cursor em #{r['desde']}; "
+              f"{novas} mensagem(ns) nova(s) na sala, nenhuma endereçada a você{quando})")
         return 0
     print(f"📬 {len(r['msgs'])} mensagem(ns) para {a.de} · {r['bytes']} B "
           f"de {r['bytes_sala']} B na sala\n")

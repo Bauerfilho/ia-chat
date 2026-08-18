@@ -509,7 +509,12 @@ def ler(ia: str, escopo: str = "meu", avancar: bool = True) -> dict:
             marca_lida(ia, até)
     return {
         "desde": desde,
+        # `total` é o tamanho da JANELA lida do disco, e ela inclui mensagens anteriores
+        # ao cursor — não serve para dizer "quantas novidades existem". Quem quiser esse
+        # número usa `novas`. A legenda errada em cima do número certo é a mesma mentira
+        # que um número errado: o `read` dizia "cursor em #46 de 8 na sala" com 54 na sala.
         "total": len(msgs),
+        "novas": len(novas),
         "msgs": sel,
         "ocultas": len(ocultas),
         "bytes": sum(len(m["bruto"].encode()) for m in sel),
