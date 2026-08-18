@@ -161,5 +161,36 @@ checa("PASS: sino off não exige daemon", r.returncode == 0, r.stdout + r.stderr
 checa("PASS: sino off grava false", config(sala).get("notificar_operador") is False)
 shutil.rmtree(raiz, ignore_errors=True)
 
+print("— o sino mudo NÃO é silêncio do Mac inteiro, e ele precisa saber —")
+# Auditoria cruzada de 18/08: três vizinhos chamam a notificação do macOS sem
+# consultar `notificar_operador` — o alarme de queda de energia (que ele PEDIU),
+# o relay, e o sino próprio de cada IA. Quem lê "🔕 mudo" e vai dormir supõe
+# silêncio. O comando não desliga nada: cada um tem consentimento próprio. Só
+# mostra o que existe, medido no launchctl.
+raiz, sala, _plist, env = laboratorio()
+r = roda(env, "sino")
+saida = r.stdout + r.stderr
+checa("o estado do sino do dono continua sendo a primeira coisa dita",
+      "sino do operador:" in saida, saida)
+checa("as outras fontes são listadas",
+      "outras fontes que podem tocar" in saida,
+      "sem esta lista, 'mudo' engana quem confia nele")
+checa("cada fonte diz se obedece a este sino",
+      "NÃO consulta este sino" in saida or "respeita este sino" in saida, saida)
+checa("com o sino mudo, o aviso aparece",
+      "🔕 mudo" not in saida or "ainda podem tocar" in saida,
+      "dizer 'mudo' e não avisar do resto é a metade que engana")
+checa("o comando ensina como silenciar cada uma",
+      "🔕 mudo" not in saida or "launchctl unload" in saida)
+
+# A listagem é LEITURA. Se ela desligasse algo, seria pior que o problema.
+antes = config(sala).get("notificar_operador")
+roda(env, "sino")
+checa("listar não muda o estado do sino", config(sala).get("notificar_operador") == antes)
+checa("listar não descarrega agente nenhum",
+      "unload" not in saida.replace("launchctl unload <plist dela>", ""),
+      "a linha de ajuda ensina o comando; o programa não o executa")
+shutil.rmtree(raiz, ignore_errors=True)
+
 print("\n%d ✔  %d ✗" % (_ok, _falhou))
 sys.exit(1 if _falhou else 0)

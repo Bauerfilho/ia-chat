@@ -223,7 +223,53 @@ def cmd_sino(a) -> int:
     print("sino do operador: %s" % ("🔔 ligado" if ligado else "🔕 mudo"))
     if a.estado:
         print("  (vale no próximo ciclo do daemon, ~15s — não precisa reiniciar nada)")
+
+    # `sino off` NÃO é silêncio do Mac inteiro, e quem não sabe disso vai dormir
+    # achando que sabe. Achado por auditoria cruzada em 18/08: três vizinhos tocam
+    # sem consultar `notificar_operador`. Isto não desliga nada — cada um é
+    # instalação própria, com consentimento próprio. Só mostra o que existe.
+    outras = _outras_fontes_de_som()
+    if outras:
+        print()
+        print("  outras fontes que podem tocar este Mac:")
+        for nome, estado, obedece in outras:
+            marca = "respeita este sino" if obedece else "NÃO consulta este sino"
+            print("    · %-28s %-14s %s" % (nome, estado, marca))
+        if not ligado and any(not o for _, _, o in outras):
+            print("    ⚠️  com o sino mudo, estas ainda podem tocar.")
+            print("        para silenciar cada uma:  launchctl unload <plist dela>")
     return 0
+
+
+def _outras_fontes_de_som() -> list[tuple[str, str, bool]]:
+    """As outras coisas instaladas que sabem chamar o macOS para tocar.
+
+    Devolve (nome, estado, obedece_ao_sino_do_dono). Estado é medido no
+    `launchctl`, não presumido: um plist no disco não prova agente carregado, e
+    é justamente essa diferença que faria a lista mentir.
+    """
+    try:
+        proc = subprocess.run(["launchctl", "list"], capture_output=True,
+                              text=True, timeout=10)
+        carregados = proc.stdout if proc.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        # terceiro desfecho: não consegui olhar — dizer isso, não inventar
+        return [("(não consegui consultar o launchctl)", "?", False)]
+
+    fontes: list[tuple[str, str, bool]] = []
+    for label, nome, obedece in (
+        ("com.bauer.ia-server-connection", "alarme de queda/internet", False),
+        ("com.bauer.iachat-relay", "relay (sem destino)", False),
+    ):
+        fontes.append((nome, "no ar" if label in carregados else "parado", obedece))
+
+    # o sino de cada IA é instalação dela, com consentimento dela — o do dono
+    # não manda nesses, e é por isso que eles entram na lista
+    por_ia = [l.split("\t")[-1] for l in carregados.splitlines()
+              if "com.bauer.ia-bell-" in l and "operador" not in l]
+    if por_ia:
+        fontes.append(("sino próprio de %d IA(s)" % len(por_ia), "no ar", False))
+    return fontes
 
 
 def _daemon_operador_da_sala(sala: Path) -> tuple[bool, str]:
