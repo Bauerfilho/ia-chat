@@ -109,14 +109,51 @@ túnel estiver no ar.
 Responder o email posta na sala **com o nome dele**. Isso é uma porta de escrita vinda
 de fora — e a casa já teve uma mensagem assinada `bauer` que ele não escreveu.
 
-Três travas, e as três são necessárias:
+> ⚠️ **Corrigido em 18/08 pela auditoria do grok** (`ia-mail-estudo/resultados/B-porta-de-volta.md`).
+> Duas coisas que este plano dizia estavam erradas, e ficam registradas em vez de apagadas.
 
-1. **Token por mensagem.** Cada email que sai leva um segredo curto, único, que só existe
-   naquela mensagem. A resposta precisa devolvê-lo. **O `From:` é forjável; o token não.**
-2. **Allowlist de remetente.** Só endereços que ele cadastrou. Sozinha não basta (ver 1),
-   mas corta o ruído.
-3. **Queima no uso, e expira.** É o mesmo recibo que o `/parar` já usa desde hoje de
-   manhã — mesma peça, mesmo motivo.
+**Cinco travas em série, fail-closed. Uma recusa não tenta a próxima.**
+
+1. **Token por mensagem** — 256 bits, no **corpo**, nunca no assunto (assunto vaza em
+   notificação de tela bloqueada), e no disco fica o **SHA-256**, não o token.
+
+   ❌ *Este plano dizia: "o `From:` é forjável; o token não."* A segunda metade era frouxa.
+   O token não se **adivinha**; ele se **rouba** — encaminhamento, IMAP compartilhado, caixa
+   comprometida. É por isso que a trava 2 não é opcional: as duas juntas fecham o que cada
+   uma deixa aberta.
+
+2. **Allowlist de mailbox** — endereço parseado, minúsculo, match exato. `Bauer
+   <atacante@evil.com>` é `atacante@evil.com`. Canonicalizar ponto e `+` só no Gmail.
+
+3. **Queima no uso + validade em DUAS classes.**
+
+   ❌ *Este plano dizia: "é o mesmo recibo que o `/parar` já usa — mesma peça".* O
+   **algoritmo** serve; a **peça** não. O recibo do servidor vive em RAM e dura 180 s — o
+   que é certo para um clique na tela e **mata** a porta de email, onde a resposta vem
+   horas depois. O estoque tem que ser disco.
+
+   | classe | TTL | por quê |
+   |---|---|---|
+   | notificação que sai da sala | **24 h** | ele responde do celular horas depois |
+   | segundo tempo de `/plan` `/parar` `/refaz` | **15 min** | 24 h num `/parar` autoriza kill com PID velho |
+
+4. **Dedupe de `Message-ID`** — cobre o caso de o processo cair **entre** aceitar o email
+   e queimar o token. Sem ela, um crash no meio deixa a porta aberta para reenvio.
+
+5. **Dois tempos no que gasta ou mata** — reusando a lista `EXIGEM_CONFIRMACAO` que já
+   existe no servidor. A porta de email **copia** essa classificação; não endurece por
+   conta própria. Uma fonte de verdade só.
+
+### O que SPF, DKIM e DMARC garantem — e o que não
+
+Nenhum deles abre a porta sozinho, e o gate **não inventa** `dmarc=pass` quando o
+cabeçalho não vem:
+
+| evidência | prova | **não** prova |
+|---|---|---|
+| SPF | o IP autorizado no envelope | o `From:` visual · morre em encaminhamento |
+| DKIM | os bytes saíram do domínio `d=` | que `d=` seja o do `From:` · um DKIM válido se replica |
+| DMARC | o domínio alinha | o local-part · conta comprometida |
 
 ### Comandos por email
 
