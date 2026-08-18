@@ -1,0 +1,638 @@
+#!/usr/bin/env python3
+"""Responde, por conteúdo, se todas as cópias executáveis do ia-chat batem.
+
+O comando é deliberadamente somente leitura. Ele não instala, não remonta, não
+atualiza o app e não reinicia servidor. Quando encontra divergência, devolve exit 1
+e imprime o comando que corrige a camada correspondente.
+
+Camadas medidas:
+
+* scripts do checkout x ``~/.claude/scripts/ia-chat`` x symlinks no PATH;
+* ``ui/`` x bundle versionado x ``/Applications/ia-chat.app``;
+* listeners vivos nas portas do ia-chat, incluindo origem, rotas e arquivos servidos.
+
+Os arquivos são comparados por SHA-256. Data só participa da pergunta específica
+"o arquivo pode ter mudado depois que este processo abriu?"; um simples ``touch``
+não reprova quando o conteúdo continua igual ao blob do checkout.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
+
+UI_ARQUIVOS = ("index.html", "estilo.css", "sala.js", "servir.py")
+ROTAS_NAO_SONDADAS = {"/api/stream"}  # SSE é infinito; não serve como sonda curta.
+TOKEN_RE = re.compile(rb"[?&]t=([A-Za-z0-9_-]{8,256})")
+
+
+def sha256(caminho: Path) -> str:
+    """Hash em fluxo: não carrega um asset grande inteiro na memória."""
+    h = hashlib.sha256()
+    with caminho.open("rb") as f:
+        for bloco in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(bloco)
+    return h.hexdigest()
+
+
+def sha256_bytes(conteudo: bytes) -> str:
+    return hashlib.sha256(conteudo).hexdigest()
+
+
+def digest_manifesto(manifesto: Dict[str, str]) -> str:
+    """Uma revisão agregada e determinística para uma camada de vários arquivos."""
+    h = hashlib.sha256()
+    for nome, valor in sorted(manifesto.items()):
+        h.update(nome.encode("utf-8"))
+        h.update(b"\0")
+        h.update(valor.encode("ascii"))
+        h.update(b"\n")
+    return h.hexdigest()
+
+
+def curto(valor: Optional[str]) -> str:
+    return "ausente" if not valor else valor[:12] + "…"
+
+
+def executar(argv: Sequence[str], timeout: float = 8) -> Tuple[Optional[int], bytes, bytes]:
+    """Executa sem shell; ``None`` distingue falha do instrumento de exit não-zero."""
+    try:
+        p = subprocess.run(
+            list(argv), capture_output=True, timeout=timeout, stdin=subprocess.DEVNULL
+        )
+        return p.returncode, p.stdout, p.stderr
+    except (OSError, subprocess.SubprocessError) as exc:
+        return None, b"", str(exc).encode("utf-8", "replace")
+
+
+@dataclass
+class Achado:
+    camada: str
+    item: str
+    estado: str
+    detalhe: str
+    correcao: Optional[str] = None
+
+    def json(self) -> dict:
+        return {
+            "camada": self.camada,
+            "item": self.item,
+            "estado": self.estado,
+            "detalhe": self.detalhe,
+            "correcao": self.correcao,
+        }
+
+
+@dataclass
+class Laudo:
+    achados: List[Achado] = field(default_factory=list)
+    revisoes: Dict[str, str] = field(default_factory=dict)
+    processos: List[dict] = field(default_factory=list)
+    limitacoes: List[str] = field(default_factory=list)
+
+    def add(
+        self,
+        camada: str,
+        item: str,
+        estado: str,
+        detalhe: str,
+        correcao: Optional[str] = None,
+    ) -> None:
+        self.achados.append(Achado(camada, item, estado, detalhe, correcao))
+
+    @property
+    def falhou(self) -> bool:
+        return any(a.estado in {"FAIL", "INCONCLUSIVO"} for a in self.achados)
+
+    def json(self) -> dict:
+        return {
+            "resultado": "FAIL" if self.falhou else "PASS",
+            "revisoes": self.revisoes,
+            "achados": [a.json() for a in self.achados],
+            "processos": self.processos,
+            "limitacoes": self.limitacoes,
+        }
+
+
+@dataclass(frozen=True)
+class Contexto:
+    repo: Path
+    app_repo: Path
+    scripts: Path
+    bin_dir: Path
+    app_instalado: Path
+
+    @property
+    def corrigir_scripts(self) -> str:
+        return f"cd {shlex.quote(str(self.repo))} && ./install.sh"
+
+    @property
+    def corrigir_bundle(self) -> str:
+        return f"cd {shlex.quote(str(self.app_repo))} && ./montar.sh"
+
+    @property
+    def corrigir_app(self) -> str:
+        return f"cd {shlex.quote(str(self.app_repo))} && ./instalar-app.sh --atualizar"
+
+
+def fontes_scripts(repo: Path) -> List[Path]:
+    """Espelha os globs abertos do install.sh; cresce com comandos novos."""
+    bin_dir = repo / "bin"
+    candidatos = {bin_dir / "iachat", bin_dir / "iachat_core.py"}
+    candidatos.update(p for p in bin_dir.glob("ia-*") if p.is_file())
+    candidatos.update(p for p in bin_dir.glob("iachat-*") if p.is_file())
+    return sorted((p for p in candidatos if p.is_file()), key=lambda p: p.name)
+
+
+def links_esperados(fontes: Iterable[Path]) -> Dict[str, str]:
+    """Espelha a política de symlink do instalador, sem exigir helpers internos."""
+    esperados: Dict[str, str] = {"iachat": "iachat"}
+    nomes = {p.name: p for p in fontes}
+    for nome, fonte in nomes.items():
+        if nome.endswith((".sh", ".py")):
+            continue
+        if nome.startswith(("iachat-", "ia-")) and os.access(str(fonte), os.X_OK):
+            esperados[nome] = nome
+    if "ia-bell-install-daemon.sh" in nomes:
+        esperados["ia-bell-install-daemon.sh"] = "ia-bell-install-daemon.sh"
+    return esperados
+
+
+def checar_scripts(ctx: Contexto, laudo: Laudo) -> None:
+    fontes = fontes_scripts(ctx.repo)
+    if not fontes:
+        laudo.add(
+            "scripts", "inventário", "INCONCLUSIVO",
+            f"nenhuma fonte encontrada em {ctx.repo / 'bin'}", ctx.corrigir_scripts,
+        )
+        return
+
+    origem: Dict[str, str] = {}
+    instalado: Dict[str, str] = {}
+    for fonte in fontes:
+        nome = fonte.name
+        destino = ctx.scripts / nome
+        origem[nome] = sha256(fonte)
+        if not destino.is_file():
+            laudo.add(
+                "scripts", nome, "FAIL", "ausente na instalação", ctx.corrigir_scripts
+            )
+            continue
+        instalado[nome] = sha256(destino)
+        if origem[nome] != instalado[nome]:
+            laudo.add(
+                "scripts", nome, "FAIL",
+                f"checkout {curto(origem[nome])} != instalado {curto(instalado[nome])}",
+                ctx.corrigir_scripts,
+            )
+        else:
+            laudo.add("scripts", nome, "PASS", curto(origem[nome]))
+
+    laudo.revisoes["scripts_checkout"] = digest_manifesto(origem)
+    laudo.revisoes["scripts_instalados"] = digest_manifesto(instalado)
+
+    for comando, nome_instalado in sorted(links_esperados(fontes).items()):
+        link = ctx.bin_dir / comando
+        destino = ctx.scripts / nome_instalado
+        if not link.is_symlink():
+            detalhe = "ausente no PATH" if not link.exists() else "existe, mas não é symlink"
+            laudo.add("path", comando, "FAIL", detalhe, ctx.corrigir_scripts)
+            continue
+        try:
+            real_link = link.resolve(strict=True)
+            real_destino = destino.resolve(strict=True)
+        except OSError as exc:
+            laudo.add("path", comando, "FAIL", f"symlink quebrado: {exc}", ctx.corrigir_scripts)
+            continue
+        if real_link != real_destino:
+            laudo.add(
+                "path", comando, "FAIL",
+                f"aponta para {real_link}, esperado {real_destino}", ctx.corrigir_scripts,
+            )
+        elif destino.is_file() and sha256(link) == sha256(destino):
+            laudo.add("path", comando, "PASS", f"→ {destino}")
+        else:
+            laudo.add("path", comando, "FAIL", "conteúdo não resolve ao instalado", ctx.corrigir_scripts)
+
+
+def checar_interface(ctx: Contexto, laudo: Laudo) -> None:
+    camadas = {
+        "ui_checkout": ctx.app_repo / "ui",
+        "ui_bundle": ctx.app_repo / "ia-chat.app/Contents/Resources/ui",
+        "ui_instalada": ctx.app_instalado / "Contents/Resources/ui",
+    }
+    manifestos: Dict[str, Dict[str, str]] = {nome: {} for nome in camadas}
+    correcoes = {
+        "ui_checkout": None,
+        "ui_bundle": ctx.corrigir_bundle,
+        "ui_instalada": ctx.corrigir_app,
+    }
+
+    for camada, raiz in camadas.items():
+        for nome in UI_ARQUIVOS:
+            arquivo = raiz / nome
+            if not arquivo.is_file():
+                laudo.add("interface", f"{camada}/{nome}", "FAIL", "ausente", correcoes[camada])
+            else:
+                manifestos[camada][nome] = sha256(arquivo)
+        laudo.revisoes[camada] = digest_manifesto(manifestos[camada])
+
+    fonte = manifestos["ui_checkout"]
+    for camada in ("ui_bundle", "ui_instalada"):
+        for nome in UI_ARQUIVOS:
+            esperado = fonte.get(nome)
+            atual = manifestos[camada].get(nome)
+            if esperado is None or atual is None:
+                continue
+            if esperado != atual:
+                laudo.add(
+                    "interface", f"{camada}/{nome}", "FAIL",
+                    f"checkout {curto(esperado)} != cópia {curto(atual)}", correcoes[camada],
+                )
+            else:
+                laudo.add("interface", f"{camada}/{nome}", "PASS", curto(atual))
+
+
+def _etime_segundos(texto: str) -> Optional[int]:
+    """Converte ``[[dd-]hh:]mm:ss``; formato numérico e estável do ps no macOS."""
+    try:
+        texto = texto.strip()
+        dias = 0
+        if "-" in texto:
+            parte_dias, texto = texto.split("-", 1)
+            dias = int(parte_dias)
+        partes = [int(x) for x in texto.split(":")]
+        while len(partes) < 3:
+            partes.insert(0, 0)
+        horas, minutos, segundos = partes[-3:]
+        return dias * 86400 + horas * 3600 + minutos * 60 + segundos
+    except (TypeError, ValueError):
+        return None
+
+
+def _ps(pid: int, campo: str) -> Optional[str]:
+    rc, out, _ = executar(["ps", "-p", str(pid), "-ww", "-o", campo + "="])
+    if rc != 0:
+        return None
+    texto = out.decode("utf-8", "replace").strip()
+    return texto or None
+
+
+def _lsof_nome(pid: int, descritor: str) -> Optional[Path]:
+    lsof = shutil.which("lsof") or ("/usr/sbin/lsof" if Path("/usr/sbin/lsof").is_file() else None)
+    if not lsof:
+        return None
+    rc, out, _ = executar([lsof, "-a", "-p", str(pid), "-d", descritor, "-Fn"])
+    if rc != 0:
+        return None
+    for linha in out.decode("utf-8", "replace").splitlines():
+        if linha.startswith("n/"):
+            return Path(linha[1:])
+    return None
+
+
+def _pid_na_porta(porta: int) -> Tuple[Optional[List[int]], str]:
+    lsof = shutil.which("lsof") or ("/usr/sbin/lsof" if Path("/usr/sbin/lsof").is_file() else None)
+    if not lsof:
+        return None, "lsof ausente"
+    rc, out, err = executar([lsof, "-nP", f"-iTCP:{porta}", "-sTCP:LISTEN", "-Fp"])
+    if rc not in (0, 1):
+        return None, err.decode("utf-8", "replace").strip() or f"lsof rc={rc}"
+    pids = []
+    for linha in out.decode("utf-8", "replace").splitlines():
+        if linha.startswith("p") and linha[1:].isdigit():
+            pids.append(int(linha[1:]))
+    return sorted(set(pids)), ""
+
+
+def _fonte_do_processo(pid: int) -> Tuple[Optional[Path], Optional[Path], str]:
+    comando = _ps(pid, "command")
+    cwd = _lsof_nome(pid, "cwd")
+    if not comando:
+        return None, cwd, "ps não devolveu a linha de comando"
+    try:
+        partes = shlex.split(comando)
+    except ValueError:
+        partes = comando.split()
+    candidatos = [p for p in partes if p.endswith(".py")]
+    candidatos.sort(key=lambda p: (Path(p).name not in {"servir.py", "servidor.py"}, p))
+    for bruto in candidatos:
+        caminho = Path(bruto).expanduser()
+        if not caminho.is_absolute() and cwd:
+            caminho = cwd / caminho
+        try:
+            caminho = caminho.resolve(strict=True)
+        except OSError:
+            continue
+        return caminho, cwd, comando
+    return None, cwd, comando
+
+
+def _token_do_processo(pid: int) -> Optional[str]:
+    """Lê somente a cauda do stdout; o token nunca entra no laudo."""
+    log = _lsof_nome(pid, "1")
+    if not log or not log.is_file():
+        return None
+    try:
+        with log.open("rb") as f:
+            f.seek(0, os.SEEK_END)
+            tamanho = f.tell()
+            f.seek(max(0, tamanho - 16384))
+            encontrados = TOKEN_RE.findall(f.read())
+    except OSError:
+        return None
+    return encontrados[-1].decode("ascii") if encontrados else None
+
+
+def _rotas_get(fonte: Path) -> List[str]:
+    """Extrai rotas do método GET real, em vez de manter outra lista que envelhece."""
+    try:
+        arvore = ast.parse(fonte.read_text(encoding="utf-8"))
+    except (OSError, SyntaxError, UnicodeError):
+        return []
+    rotas = set()
+    for no in ast.walk(arvore):
+        if not isinstance(no, (ast.FunctionDef, ast.AsyncFunctionDef)) or no.name != "do_GET":
+            continue
+        for filho in ast.walk(no):
+            if isinstance(filho, ast.Constant) and isinstance(filho.value, str):
+                if filho.value.startswith("/api/") and filho.value not in ROTAS_NAO_SONDADAS:
+                    rotas.add(filho.value)
+    return sorted(rotas)
+
+
+def _http(porta: int, rota: str, token: Optional[str]) -> Tuple[Optional[int], bytes, str]:
+    separador = "&" if "?" in rota else "?"
+    caminho = rota + (separador + urllib.parse.urlencode({"t": token}) if token else "")
+    req = urllib.request.Request(f"http://127.0.0.1:{porta}{caminho}", method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=3) as resposta:
+            return resposta.status, resposta.read(1024 * 1024), ""
+    except urllib.error.HTTPError as exc:
+        try:
+            corpo = exc.read(1024 * 1024)
+        except OSError:
+            corpo = b""
+        return exc.code, corpo, ""
+    except (OSError, ValueError) as exc:
+        return None, b"", str(exc)
+
+
+def _rota_inexistente(status: Optional[int], corpo: bytes) -> bool:
+    if status != 404:
+        return False
+    try:
+        dado = json.loads(corpo.decode("utf-8"))
+    except (UnicodeError, ValueError):
+        return b"rota inexistente" in corpo.lower()
+    return isinstance(dado, dict) and dado.get("erro") == "rota inexistente"
+
+
+def _hash_indice_git(caminho: Path) -> Optional[str]:
+    """SHA-256 do blob indexado; permite distinguir conteúdo novo de mero touch."""
+    rc, raiz_out, _ = executar(["git", "-C", str(caminho.parent), "rev-parse", "--show-toplevel"])
+    if rc != 0:
+        return None
+    raiz = Path(raiz_out.decode("utf-8", "replace").strip())
+    try:
+        relativo = caminho.relative_to(raiz).as_posix()
+    except ValueError:
+        return None
+    rc, conteudo, _ = executar(["git", "-C", str(raiz), "show", ":" + relativo])
+    return sha256_bytes(conteudo) if rc == 0 else None
+
+
+def checar_processo(
+    ctx: Contexto, laudo: Laudo, pid: int, porta: int, fonte_canonica: Optional[str]
+) -> None:
+    fonte, cwd, comando = _fonte_do_processo(pid)
+    registro = {
+        "pid": pid,
+        "porta": porta,
+        "cwd": str(cwd) if cwd else None,
+        "fonte": str(fonte) if fonte else None,
+        "sha256_disco": None,
+        "rotas_sondadas": {},
+        "fingerprint": None,
+    }
+    laudo.processos.append(registro)
+    correcao = f"reinicie o servidor da porta {porta}"
+
+    if fonte is None or not fonte.is_file():
+        laudo.add("processo", f"{pid}@{porta}", "INCONCLUSIVO",
+                  f"não localizei o .py carregado; comando={comando}", correcao)
+        return
+
+    hash_disco = sha256(fonte)
+    registro["sha256_disco"] = hash_disco
+    if fonte.name == "servir.py" and fonte_canonica and hash_disco != fonte_canonica:
+        laudo.add(
+            "processo", f"{pid}@{porta}/origem", "FAIL",
+            f"fonte do processo {curto(hash_disco)} != ui canônica {curto(fonte_canonica)}",
+            correcao,
+        )
+    else:
+        laudo.add("processo", f"{pid}@{porta}/origem", "PASS", f"{fonte} · {curto(hash_disco)}")
+
+    idade = _etime_segundos(_ps(pid, "etime") or "")
+    if idade is None:
+        laudo.add("processo", f"{pid}@{porta}/idade", "INCONCLUSIVO",
+                  "ps não devolveu etime numérico", correcao)
+    else:
+        inicio = time.time() - idade
+        try:
+            alterado = fonte.stat().st_mtime > inicio + 1.0
+        except OSError:
+            alterado = True
+        if not alterado:
+            laudo.add("processo", f"{pid}@{porta}/arquivo-posterior", "PASS",
+                      "o conteúdo em disco não foi regravado depois do start")
+        else:
+            hash_indice = _hash_indice_git(fonte)
+            if hash_indice == hash_disco:
+                laudo.add("processo", f"{pid}@{porta}/arquivo-posterior", "PASS",
+                          "data posterior, mas SHA-256 igual ao blob indexado (touch não reprova)")
+            else:
+                laudo.add(
+                    "processo", f"{pid}@{porta}/arquivo-posterior", "FAIL",
+                    "o arquivo foi regravado após o start e o SHA-256 atual não tem atestado "
+                    "de ser o carregado em memória", correcao,
+                )
+
+    token = None
+    status_estado, _, erro_estado = _http(porta, "/api/estado", None)
+    if status_estado == 401:
+        token = _token_do_processo(pid)
+        if not token:
+            laudo.add("processo", f"{pid}@{porta}/autenticação", "INCONCLUSIVO",
+                      "servidor exige token e o stdout não permite recuperá-lo", correcao)
+            return
+    elif status_estado is None:
+        laudo.add("processo", f"{pid}@{porta}/http", "INCONCLUSIVO",
+                  f"listener não respondeu: {erro_estado}", correcao)
+        return
+
+    rotas = _rotas_get(fonte)
+    if not rotas:
+        laudo.add("processo", f"{pid}@{porta}/rotas", "INCONCLUSIVO",
+                  "não extraí nenhuma rota GET da fonte", correcao)
+        return
+    fingerprint: Dict[str, str] = {}
+    for rota in rotas:
+        status, corpo, erro = _http(porta, rota, token)
+        registro["rotas_sondadas"][rota] = status
+        fingerprint[rota] = f"{status}:{sha256_bytes(corpo)}"
+        if status is None:
+            laudo.add("processo", f"{pid}@{porta}{rota}", "INCONCLUSIVO", erro, correcao)
+        elif _rota_inexistente(status, corpo):
+            laudo.add("processo", f"{pid}@{porta}{rota}", "FAIL",
+                      "a fonte atual declara a rota, mas o processo vivo responde rota inexistente",
+                      correcao)
+        else:
+            laudo.add("processo", f"{pid}@{porta}{rota}", "PASS", f"HTTP {status}")
+
+    # O servidor lê estes três assets a cada requisição. Compará-los prova o que a
+    # janela recebe agora; o hash do Python é tratado separadamente acima.
+    for nome in ("index.html", "estilo.css", "sala.js"):
+        arquivo = fonte.parent / nome
+        if not arquivo.is_file():
+            continue
+        rota = "/" if nome == "index.html" else "/" + nome
+        status, corpo, erro = _http(porta, rota, token)
+        fingerprint["asset:" + nome] = f"{status}:{sha256_bytes(corpo)}"
+        if status == 200 and sha256_bytes(corpo) == sha256(arquivo):
+            laudo.add("processo", f"{pid}@{porta}/{nome}", "PASS", curto(sha256_bytes(corpo)))
+        else:
+            detalhe = erro or f"HTTP {status}; resposta {curto(sha256_bytes(corpo))}, disco {curto(sha256(arquivo))}"
+            laudo.add("processo", f"{pid}@{porta}/{nome}", "FAIL", detalhe, correcao)
+
+    registro["fingerprint"] = digest_manifesto(fingerprint)
+
+
+def checar_processos(
+    ctx: Contexto, laudo: Laudo, portas: Sequence[int], manuais: Sequence[str]
+) -> None:
+    pares = set()
+    for bruto in manuais:
+        try:
+            pid_txt, porta_txt = bruto.split(":", 1)
+            pares.add((int(pid_txt), int(porta_txt)))
+        except ValueError:
+            laudo.add("processo", bruto, "INCONCLUSIVO", "use PID:PORTA")
+    for porta in portas:
+        pids, erro = _pid_na_porta(porta)
+        if pids is None:
+            laudo.add("processo", f"porta {porta}", "INCONCLUSIVO", erro)
+            continue
+        for pid in pids:
+            pares.add((pid, porta))
+
+    if not pares:
+        laudo.add("processo", "listeners", "PASS", "nenhum servidor ia-chat está vivo; camada não aplicável")
+        return
+
+    fonte_ui = ctx.app_repo / "ui/servir.py"
+    hash_ui = sha256(fonte_ui) if fonte_ui.is_file() else None
+    for pid, porta in sorted(pares):
+        checar_processo(ctx, laudo, pid, porta, hash_ui)
+
+    laudo.limitacoes.append(
+        "CPython fecha servir.py depois de compilá-lo e o servidor atual não expõe um endpoint "
+        "com SHA-256 do code object. O gate prova origem no disco, ausência de regravação posterior, "
+        "rotas GET (incluindo /api/groupchat) e hashes dos assets servidos; não chama isso de hash "
+        "criptográfico da memória. Reiniciar continua sendo a correção quando qualquer sonda diverge."
+    )
+
+
+def imprimir(laudo: Laudo) -> None:
+    por_camada: Dict[str, List[Achado]] = {}
+    for achado in laudo.achados:
+        por_camada.setdefault(achado.camada, []).append(achado)
+    simbolo = {"PASS": "✔", "FAIL": "✗", "INCONCLUSIVO": "?"}
+    for camada, achados in por_camada.items():
+        print(f"\n— {camada} —")
+        for a in achados:
+            print(f"  {simbolo[a.estado]} {a.item}: {a.detalhe}")
+
+    if laudo.revisoes:
+        print("\n— revisões agregadas —")
+        for camada, valor in laudo.revisoes.items():
+            print(f"  {camada:<22} {valor}")
+
+    correcoes = []
+    for achado in laudo.achados:
+        if achado.correcao and achado.estado != "PASS" and achado.correcao not in correcoes:
+            correcoes.append(achado.correcao)
+    if correcoes:
+        print("\nComo corrigir:")
+        for comando in correcoes:
+            print(f"  {comando}")
+
+    for limite in laudo.limitacoes:
+        print(f"\nLIMITAÇÃO DECLARADA: {limite}")
+    print("\nRESULTADO: " + ("FAIL — as cópias não batem" if laudo.falhou else "PASS — as cópias batem"))
+
+
+def _portas(texto: str) -> List[int]:
+    if not texto.strip():
+        return []
+    return [int(x.strip()) for x in texto.split(",") if x.strip()]
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    aqui = Path(__file__).resolve().parent
+    repo_padrao = aqui.parent
+    home = Path.home()
+    ap = argparse.ArgumentParser(description="Compara por SHA-256 todas as fontes do ia-chat")
+    ap.add_argument("--json", action="store_true", help="laudo estruturado")
+    ap.add_argument("--somente-copias", action="store_true", help="não sondar listeners vivos")
+    ap.add_argument("--portas", default=os.environ.get("IACHAT_PORTS", "8801,8899"))
+    ap.add_argument("--processo", action="append", default=[], metavar="PID:PORTA",
+                    help="inclui processo explícito (útil para auditoria/teste)")
+    args = ap.parse_args(argv)
+
+    try:
+        portas = _portas(args.portas)
+    except ValueError:
+        print("✗ --portas deve ser uma lista de inteiros separados por vírgula", file=sys.stderr)
+        return 2
+
+    ctx = Contexto(
+        repo=Path(os.environ.get("IACHAT_REPO", str(repo_padrao))).expanduser().resolve(),
+        app_repo=Path(os.environ.get("IACHAT_APP_REPO", str(repo_padrao.parent / "ia-chat-app"))).expanduser().resolve(),
+        scripts=Path(os.environ.get("IACHAT_SCRIPTS", str(home / ".claude/scripts/ia-chat"))).expanduser().resolve(),
+        bin_dir=Path(os.environ.get("IACHAT_BIN", str(home / ".local/bin"))).expanduser().resolve(),
+        app_instalado=Path(os.environ.get("IACHAT_APP_INSTALLED", "/Applications/ia-chat.app")).expanduser().resolve(),
+    )
+
+    laudo = Laudo()
+    checar_scripts(ctx, laudo)
+    checar_interface(ctx, laudo)
+    if not args.somente_copias:
+        checar_processos(ctx, laudo, portas, args.processo)
+
+    if args.json:
+        print(json.dumps(laudo.json(), ensure_ascii=False, indent=2))
+    else:
+        imprimir(laudo)
+    return 1 if laudo.falhou else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
