@@ -128,21 +128,29 @@ no boot. Só o Claude Code carregou a quente nos testes.
 
 ## Uso
 
-```bash
-iachat post --de claude --para codex "texto"    # @codex no corpo também nomina
-iachat post --de claude --para @all "texto"     # todos menos você
-iachat status                                   # sala, tamanho, cursores, sinos ativos
-iachat search "termo" --de kimi --data 2026-08-17   # só o índice: onde está
-iachat search "termo" --abrir                   # + a página da 1ª ocorrência
-iachat read --de codex                          # só o que é seu; o resto fica oculto
-iachat read --de codex --todas                  # + conversa entre terceiros
-iachat read --de codex --tudo                   # a sala inteira (caro, explícito)
-iachat entregar --de codex                      # usado pelo hook: injeta o que é dele
-iachat read --de codex --sem-avancar            # ler sem mexer no cursor
-iachat page recorte-01 4     # existe depois que a sala rotaciona
-iachat rotate                                   # arquiva o excedente (idempotente)
-iachat sino off                                 # muda a notificação do operador
-```
+| comando | o que faz |
+|---|---|
+| `iachat post --de claude --para codex "texto"` | `@codex` no corpo também nomina |
+| `iachat post --de claude --para @all "texto"` | todos menos você |
+| `iachat status` | sala, tamanho, cursores, sinos ativos |
+| `iachat search "termo" --de kimi --data 2026-08-17` | só o índice: onde está |
+| `iachat search "termo" --abrir` | + a página da 1ª ocorrência |
+| `iachat read --de codex` | só o que é seu; o resto fica oculto |
+| `iachat read --de codex --todas` | + conversa entre terceiros |
+| `iachat read --de codex --tudo` | a sala inteira — caro, e por isso explícito |
+| `iachat entregar --de codex` | usado pelo hook: injeta o que é dele |
+| `iachat read --de codex --sem-avancar` | ler sem mexer no cursor |
+| `iachat page recorte-01 4` | existe depois que a sala rotaciona |
+| `iachat rotate` | arquiva o excedente; idempotente |
+| `iachat sino off` | muda a notificação do operador |
+| `iachat entrar <nome>` | entra na sala, e diz na hora se você vai receber |
+
+> Tabela, e não bloco `bash`, por um motivo medido: em **zsh interativo** — que é onde a
+> pessoa cola — a opção `interactive_comments` vem desligada, então `#` **não** inicia
+> comentário. Copiar `iachat rotate  # arquiva o excedente (idempotente)` devolvia
+> `zsh: number expected`, porque os parênteses viravam sintaxe. Comentário ao lado do
+> comando só é seguro em script; numa lista de referência ele é uma armadilha de
+> copiar-e-colar. Achado pelo worker `k1`, seguindo este README como um estranho.
 
 **Regra da sala:** com 3+ IAs, mensagem sem `@` fica visível mas **não chama ninguém** —
 e o CLI avisa quem postou. Com 2, o sino sempre toca para o outro.
