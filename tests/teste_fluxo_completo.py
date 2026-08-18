@@ -24,8 +24,20 @@ import tempfile
 from pathlib import Path
 
 RAIZ = Path(__file__).resolve().parent.parent
+# O fallback vale para o DIRETÓRIO, não só para o executável. A versão anterior escolhia
+# o `iachat` certo (repo, quando não há instalação) mas passava `IACHAT_BIN=~/.local/bin`
+# ao hook mesmo assim — e o hook procura `$IACHAT_BIN/iachat` e `$HOME/.claude/scripts/`,
+# nenhum dos dois existindo numa máquina limpa. Resultado: o hook entregava 0 B e QUATRO
+# casos falhavam, sempre pelo mesmo motivo.
+#
+# Aqui passava porque esta máquina tem a instalação; o CI, no primeiro push do repositório
+# público, pegou na hora. É a mesma classe de "editei a fonte e testei a cópia instalada",
+# agora dentro de um teste — que é o pior lugar, porque um teste que depende do ambiente
+# do autor aprova o que quebra na máquina de quem clonou.
 BIN = Path.home() / ".local" / "bin"
-IACHAT = BIN / "iachat" if (BIN / "iachat").is_file() else RAIZ / "bin" / "iachat"
+if not (BIN / "iachat").is_file():
+    BIN = RAIZ / "bin"
+IACHAT = BIN / "iachat"
 HOOK = RAIZ / "bin" / "ia-bell-hook.sh"
 
 _ok = 0
