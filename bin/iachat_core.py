@@ -166,6 +166,42 @@ def travado():
             os.close(fd)
 
 
+@contextmanager
+def travado_leitura():
+    """Lock COMPARTILHADO: vários leitores ao mesmo tempo, nenhum escritor no meio.
+
+    Nasceu de dois achados da auditoria de carga de 18/08, que têm a mesma raiz — o
+    núcleo só tinha lock exclusivo:
+
+    · **`status()` bloqueava escritores para LER.** Medido: 9 ms segurando o lock
+      exclusivo num chat de 1 MB (~2 ms no teto padrão de 200 KB). Ninguém perdia
+      mensagem; era custo escondido que cresce com o arquivo.
+
+    · **`buscar()` não travava nada.** Um `post` appenda um bloco maior que `PIPE_BUF`
+      (512 B no macOS), então uma busca no meio da escrita podia ler a última mensagem
+      **picada** — e o `parse` simplesmente não a conta. Sem perda permanente no disco,
+      mas com **falso negativo silencioso** no resultado: a busca não acha o que existe.
+      Busca que mente é pior que busca lenta.
+
+    `LOCK_SH` resolve os dois: leitores não se bloqueiam entre si (o custo de `status`
+    some) e nenhum deles enxerga escrita pela metade (o falso negativo some).
+
+    O `RLock` de thread continua exclusivo aqui de propósito: ele é do processo, é
+    barato, e não vale a complexidade de um leitor-escritor em memória para ganhar
+    microssegundos.
+    """
+    garantir_estrutura()
+    lock = home() / ".lock" / "iachat.lock"
+    with _LOCK_THREAD:
+        fd = os.open(str(lock), os.O_CREAT | os.O_RDWR, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH)
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+
 def _escrever_atomico(caminho: Path, texto: str) -> None:
     """tmp + fsync + replace: o leitor sem lock nunca vê arquivo pela metade."""
     tmp = caminho.with_suffix(caminho.suffix + ".tmp")
@@ -492,7 +528,7 @@ def _msgs_desde(desde: int) -> list[dict]:
 
 def status() -> dict:
     cfg = config()
-    with travado():
+    with travado_leitura():          # leitura pura: não precisa bloquear quem posta
         txt = p_chat().read_text(encoding="utf-8")
     msgs = parse(txt)
     sala = [normaliza_ia(x) for x in cfg.get("na_sala", [])]
@@ -674,34 +710,37 @@ def buscar(termo: str, de: str | None = None, data: str | None = None) -> dict:
     """
     de = normaliza_ia(de) if de else None
     achados, _cache_fr = [], {}
-    for p in _recortes() + [p_chat()]:
-        try:
-            txt = p.read_text(encoding="utf-8")
-        except OSError:
-            continue
-        for m in parse(txt):
-            if de and m["de"] != de:
+    # Lock COMPARTILHADO: sem ele, uma busca no meio de um `post` lê a última
+    # mensagem picada e o `parse` não a conta — falso negativo silencioso.
+    with travado_leitura():
+        for p in _recortes() + [p_chat()]:
+            try:
+                txt = p.read_text(encoding="utf-8")
+            except OSError:
                 continue
-            if data and not m["ts"].startswith(data):
-                continue
-            if termo and termo.lower() not in m["bruto"].lower():
-                continue
-            linha = txt[: m["pos"]].count("\n") + 1
-            if p not in _cache_fr:
-                _cache_fr[p] = _fronteiras(txt.splitlines())
-            pag = next(
-                (i + 1 for i, (a, b) in enumerate(_cache_fr[p]) if a < linha <= b), 1
-            )
-            achados.append(
-                {
-                    "fonte": p.stem,
-                    "n": m["n"],
-                    "de": m["de"],
-                    "ts": m["ts"][:16],
-                    "linha": linha,
-                    "pagina": pag,
-                }
-            )
+            for m in parse(txt):
+                if de and m["de"] != de:
+                    continue
+                if data and not m["ts"].startswith(data):
+                    continue
+                if termo and termo.lower() not in m["bruto"].lower():
+                    continue
+                linha = txt[: m["pos"]].count("\n") + 1
+                if p not in _cache_fr:
+                    _cache_fr[p] = _fronteiras(txt.splitlines())
+                pag = next(
+                    (i + 1 for i, (a, b) in enumerate(_cache_fr[p]) if a < linha <= b), 1
+                )
+                achados.append(
+                    {
+                        "fonte": p.stem,
+                        "n": m["n"],
+                        "de": m["de"],
+                        "ts": m["ts"][:16],
+                        "linha": linha,
+                        "pagina": pag,
+                    }
+                )
     return {"termo": termo, "de": de, "data": data, "achados": achados}
 
 

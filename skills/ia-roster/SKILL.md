@@ -19,8 +19,9 @@ dele estava em `#1` com a sala em `#16`, e a mensagem `#15` estava parada havia
 **56 minutos**. A lista não mentiu: ela respondeu outra pergunta.
 
 Pior, a única linha do `status` que continha a pista é rotulada ao contrário.
-`bin/iachat:81` imprime `sino ativo  codex` a partir de `s['pendentes']`
-(`bin/iachat_core.py:469`), que é a lista de quem tem **flag por ler**. "Sino ativo"
+`bin/iachat` imprime `sino ativo  codex` a partir de `s['pendentes']` (a chave
+`pendentes` que `status()` monta em `bin/iachat_core.py`), que é a lista de quem tem
+**flag por ler**. "Sino ativo"
 lê como boa notícia e significa exatamente o oposto: *fulano foi chamado e não leu*.
 
 ## O comando
