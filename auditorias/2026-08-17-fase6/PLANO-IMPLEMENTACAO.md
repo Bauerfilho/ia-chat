@@ -43,5 +43,5 @@ estiver errada, corrija **e diga por quê**. Não recomece do zero sem motivo.
 
 ## Anti-redundância
 
-`auditorias/2026-08-17-fase6/JA-EXISTE.md` lista tudo que já existe, já foi proposto e já foi
+`JA-EXISTE.md` lista tudo que já existe, já foi proposto e já foi
 **descartado com medida**. Ressuscitar ideia descartada exige número novo.

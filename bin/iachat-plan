@@ -29,7 +29,25 @@ avisa_sala() { # de para texto
   return 0
 }
 
-[ $# -ge 2 ] || morre "uso: iachat-plan <casca> \"<tarefa>\" [--repo DIR] [--de QUEM] [--executar]"
+USO='uso: iachat-plan <casca> "<tarefa>" [--repo DIR] [--de QUEM] [--executar]
+
+  <casca>       kimi · codex · grok · qwen · qwclaude · agy
+  <tarefa>      o que você quer que ela PLANEJE (ela não implementa)
+
+  --repo DIR    o repositório sobre o qual ela planeja        (padrão: o diretório atual)
+  --de QUEM     quem assina o pedido na sala                  (padrão: $IA_PLAN_DE)
+  --executar    aciona a casca de verdade. SEM esta flag, o comando é SECO:
+                mostra o que gastaria e não gasta nada.
+
+Planejar é barato e reversível; aplicar não. Por isso o padrão é seco.'
+
+# `--help` NÃO é uso incorreto: quem pede ajuda não errou. Saía com código 2, o que
+# fazia qualquer script que chamasse `iachat-plan --help` tratar a ajuda como falha.
+case "${1:-}" in
+  -h|--help|help) printf '%s\n' "$USO"; exit 0 ;;
+esac
+
+[ $# -ge 2 ] || morre "$USO"
 CASCA="$1"; TAREFA="$2"; shift 2
 REPO="$PWD"; DE="${IA_PLAN_DE:-$(basename "${SHELL:-operador}")}"; EXECUTAR=0
 while [ $# -gt 0 ]; do

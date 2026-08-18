@@ -75,8 +75,8 @@ Códigos de saída — todos binários, para encadear:
 ## O plano volta em arquivo; a sala recebe só o ponteiro
 
 Medido: um plano típico da frota tem **3.425 a 12.529 B**. O `iachat entregar` corta em
-**6.144 B** (`bin/iachat:171`) — acima disso entrega só cabeçalhos. E o teto da sala inteira é
-**204.800 B** (`bin/iachat_core.py:42`).
+**6.144 B** (o `default` de `--teto` em `bin/iachat`) — acima disso entrega só cabeçalhos.
+E o teto da sala inteira é **204.800 B** (a constante `TETO_PADRAO`, em `bin/iachat_core.py`).
 
 Postar o plano inteiro perde duas vezes: o plano de 12,5 KB come **6,1% da sala** de forma
 permanente **e nem chega** a quem pediu, porque estoura o teto de entrega. O ponteiro medido no

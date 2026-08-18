@@ -1,5 +1,58 @@
 # CHANGELOG — ia-chat
 
+## 2026-08-18 — fase 8: a fila fechou, e a vigília nasceu
+
+> Bateria: **21 arquivos, 21 verdes.** Os 6 CLIs novos resolvem no PATH.
+> Os dois repositórios (`ia-chat` e `ia-chat-app`) passaram a existir de fato:
+> antes herdavam o repo do `$HOME` e não eram publicáveis.
+
+### As 6 peças que faltavam, entregues
+
+`ia-digest` (destilação na entrega) · `ia-onboard` (briefing de ~2 KB derivado da
+sala) · `ia-squad` (despachar missão pela sala, sem abrir processo) · `ia-plan`
+(acionar outra IA em modo plano, **seco por padrão**) · `ia-handoff` (passar
+trabalho, não texto) · `ia-roster` (quem está na sala e o que o disco prova).
+
+Cada uma com skill, CLI e teste **incluindo o caso que reprova**.
+
+⚠️ **Os quatro últimos foram renomeados** de `ia-squad`/`ia-plan`/`iahandoff`/`iaroster`
+para o padrão `iachat-*`. Motivo medido: o `install.sh` instala pelo glob `bin/iachat-*` —
+um binário fora do padrão era escrito no repo e **nunca instalado**.
+
+### `ia-server-connection` — uma skill, dois sinos, um gatilho
+
+Nasceu de duas quedas de energia na mesma madrugada. Na segunda, um worker tinha
+123 KB de raciocínio no log e **zero byte no disco**: perdeu tudo, porque ninguém
+o avisou de que o chão tinha sumido.
+
+- **⚡ `energy-bell`** — a energia caiu; você tem segundos. Nunca é silenciado.
+- **📡 `connection-bell`** — o fluxo para os provedores caiu; o trabalho local segue.
+- **🔕 `no-bell`** — detectou, **mediu**, e decidiu não tocar. Fica registrado para ser
+  auditável: silêncio medido é decisão, silêncio não registrado é omissão.
+
+Gatilho duplo: batimento (a cada 20 s) e evento (`--gatilho`, para quem acabou de
+falhar ao conectar e quer saber agora, não em 20 segundos).
+
+**Dois bugs corrigidos antes de estrear**, achados por auditoria externa
+(auditor ≠ autor):
+1. o `energy-bell` podia ser engolido **para sempre** se uma leitura do sensor
+   falhasse antes da queda;
+2. o `connection-bell` quase nunca disparava — dependia de borda, e numa queda
+   sustentada só existe uma.
+
+### `teste_fronteira_sala` — a bateria não pode sujar a sala do dono
+
+Meta-teste: roda a bateria inteira e compara a sala byte a byte, antes e depois.
+Nasceu porque um worker testou "chat pré-existente" **na sala real** e deixou
+mensagens de fixture lá. Nenhum dos 20 testes pegou — cada um só olhava a própria
+peça; este olha o que todos fazem juntos.
+
+### Instalação
+
+O `install.sh` passou a distribuir auxiliares por **glob aberto** (`bin/ia-*`).
+A lista explícita falhou, e o glob temático (`ia-*bell*`) falhou de novo quando a
+peça foi renomeada. **Padrão que codifica o nome de hoje quebra amanhã.**
+
 ## 2026-08-17 — fase 6: auditoria cruzada + peças novas
 
 > Validação independente final (contrato `q4-validacao`, rodada das 23:19):

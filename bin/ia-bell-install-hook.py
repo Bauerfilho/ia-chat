@@ -75,10 +75,26 @@ def main() -> int:
         return 2
     ia = args[0]
     remover = "--remover" in args
+
+    # Onde mora o `settings.json` de cada casca que usa o formato de hook do Claude Code.
+    #
+    # A Qwen entrou aqui em 18/08, achado do próprio enxame: o `~/.qwen/settings.json` já
+    # usa o MESMO formato (`SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`)
+    # e já tinha hooks em uso — só que o instalador não sabia o caminho e mandava todo
+    # mundo para o do Claude. Resultado: uma IA nominada na sala nunca recebia a chamada
+    # dentro da sessão, e ninguém percebia, porque o instalador dizia "✔ instalado".
+    #
+    # O Grok NÃO entra: o `~/.grok/config.toml` não tem nenhuma ocorrência de "hooks" —
+    # não é caminho errado, é mecanismo inexistente. Declarar isso é melhor que fingir
+    # cobertura.
+    SETTINGS = {
+        "claude": Path.home() / ".claude/settings.json",
+        "qwen": Path.home() / ".qwen/settings.json",
+    }
     alvo = Path(
         args[args.index("--settings") + 1]
         if "--settings" in args
-        else Path.home() / ".claude/settings.json"
+        else SETTINGS.get(ia, SETTINGS["claude"])
     ).expanduser()
 
     # Respeita IACHAT_SCRIPTS como o install.sh e o instalador do daemon já faziam. Antes

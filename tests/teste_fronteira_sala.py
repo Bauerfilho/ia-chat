@@ -99,5 +99,38 @@ checa(
 )
 checa("nenhum teste travou", not quebrados, ", ".join(quebrados))
 
+# ── nenhuma quebra deliberada ficou para trás ────────────────────────────────
+# Auditar um gate direito exige QUEBRAR o código e ver o teste ficar vermelho — é o
+# protocolo, e é o certo. O risco é a quebra sobreviver ao fim da auditoria: em 18/08 uma
+# auditora desarmou o gate de quarentena do `iachat-plan` para prová-lo (`if false;` no
+# lugar do `if ! diff -q`) e desfez logo depois, como o contrato mandava. Mas se ela
+# tivesse morrido no meio — e três workers morreram naquela mesma noite —, o gate ficaria
+# desarmado dentro de um repositório prestes a ser publicado, e nada acusaria.
+#
+# Este caso é a rede: qualquer marcador de quebra que chegue ao commit reprova a bateria.
+marcadores = ("QUEBRA-AUDITORIA", "QUEBRA-TESTE", "DESFAZER-ANTES-DE-COMMITAR")
+sujos_quebra: list[str] = []
+for p in RAIZ.rglob("*"):
+    if not p.is_file() or ".git/" in str(p) or p.suffix not in (".py", ".sh", ".md", ""):
+        continue
+    try:
+        texto = p.read_text(errors="replace")
+    except OSError:
+        continue
+    # O próprio arquivo cita os marcadores para documentá-los; ele não conta.
+    if p.name == EU:
+        continue
+    for n, linha in enumerate(texto.splitlines(), 1):
+        if any(m in linha for m in marcadores):
+            sujos_quebra.append(f"{p.relative_to(RAIZ)}:{n}")
+
+checa(
+    "nenhuma quebra deliberada de auditoria ficou no repositório",
+    not sujos_quebra,
+    ", ".join(sujos_quebra) +
+    "\n      alguém quebrou o código para testar um gate e não desfez. "
+    "O gate está DESARMADO.",
+)
+
 print(f"\n{_ok} ✔  {_falhou} ✗")
 sys.exit(1 if _falhou else 0)

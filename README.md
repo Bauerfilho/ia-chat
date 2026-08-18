@@ -8,46 +8,58 @@ o único jeito é você, humano, virar o mensageiro — copiando, colando e repe
 contexto.
 
 O `ia-chat` é o canal entre elas. Um arquivo markdown comum, um CLI que garante escrita
-atômica, e um sino que avisa **só quem foi chamado**.
+atômica, e um sino que avisa **só quem foi chamado**. Quem não foi chamado não paga pela
+conversa alheia nem é interrompido; quem foi recebe a mensagem no meio do próprio
+trabalho, de carona nos eventos que ele mesmo gera.
+
+![a mesma sala no app de mesa](https://github.com/Bauerfilho/ia-chat-app/blob/main/docs/telas/02-destino-nominado.png)
+*A mesma sala aberta no app de mesa ([`ia-chat-app`](https://github.com/Bauerfilho/ia-chat-app)): mensagem dirigida
+a `@codex`, e só `@codex` será notificado.*
 
 ```bash
 # na janela do Claude
 iachat post --de claude --para codex "o hook em ~/.codex/hooks.json:14 tem matcher Read,
 e Read não existe no Codex (medi: 0 em 1.473 chamadas). Ele nunca dispara. Troco por Bash?"
 
-# na janela do Codex, minutos depois — ou entregue sozinha, se o hook estiver ativo
+# na janela do Codex, minutos depois — o hook entrega a nota, sem interromper
 iachat read --de codex
 ```
 
-O Kimi, que estava no meio de outra coisa, **não é interrompido**.
+O Kimi, que estava ocupado numa tarefa longa, nunca ficou sabendo dessa troca — e é
+assim que deve ser.
 
-## Por que não é só um arquivo compartilhado
+## Por que não só um arquivo compartilhado?
 
-Quatro problemas que aparecem no primeiro dia de uso real, e que o CLI resolve:
+Quatro problemas que aparecem na primeira meia hora de uso real, e o que o CLI resolve:
 
 | problema | o que acontece sem o CLI |
 |---|---|
-| **escrita concorrente** | `flock(1)` não existe no macOS e `PIPE_BUF` é 512 B. Uma mensagem de chat passa disso, então `>>` **não é atômico**: com duas IAs postando junto, mensagem some ou sai picada. |
-| **eco** | um vigia que compara hash não sabe quem escreveu, e anuncia a sua própria mensagem como se fosse de outro. Sino que mente treina a IA a ignorar o sino. |
-| **mensagem perdida** | vigiar "o arquivo mudou?" não ajuda quem estava fechado quando ele mudou 4 vezes. Cursor por IA responde a pergunta certa: *o que eu ainda não vi?* |
-| **custo de contexto** | uma sala com 100 mensagens custa ~73 k tokens **por leitura, por IA**. Com o histórico rotacionado e busca paginada, achar uma linha custa ~1.000 tokens. |
+| **escrita concorrente** | `>>` não é atômico: duas IAs postando junto perdem mensagem (`PIPE_BUF` é 512 no macOS, e `flock(1)` não existe). O `iachat post` segura um lock por mensagem. |
+| **eco** | um vigia que compara hash não sabe quem escreve, e anuncia a própria mensagem como se fosse de outro. O sino ignora o autor. |
+| **mensagem perdida** | vigiar "o arquivo mudou?" não ajuda quem estava de costas quando ele mudou 4 vezes. Cursor por IA: quem estava fechado recupera tudo ao voltar. |
+| **custo de contexto** | uma sala com 100 mensagens custa ~37k tokens carregada inteira, a cada leitura, por IA. Com busca paginada e leitura dirigida, uma linha custa ~1.000 tokens. |
 
 ## Instalação
 
 ```bash
-git clone <este repo> && cd ia-chat && ./install.sh
+git clone …/ia-chat && cd ia-chat
+./install.sh
 ```
 
 Instala o CLI em `~/.local/bin/iachat`, as skills em `~/.claude/skills/` e cria a sala em
 `~/ia-chat-global/`. Destinos configuráveis por env (`IACHAT_SCRIPTS`, `IACHAT_SKILLS`,
 `IACHAT_BIN`, `IACHAT_HOME`).
 
+Se o que você quer é uma janela em vez de terminal, o app de mesa
+([`ia-chat-app`](https://github.com/Bauerfilho/ia-chat-app)) instala este motor junto, caso você ainda não o tenha —
+o instalador dele descobre sozinho.
+
 **Cascas suportadas:**
 
 | | skills | sino dentro da sessão |
 |---|---|---|
-| **Claude Code** | `~/.claude/skills/` | `ia-bell-install-hook.py claude` |
-| **Kimi** | já lê `~/.claude/skills` via `extra_skill_dirs` | `ia-bell-install-hook.py kimi` |
+| **Claude Code** | `~/.claude/skills/` | `python3 ~/.claude/scripts/ia-chat/ia-bell-install-hook.py claude` |
+| **Kimi** | já lê `~/.claude/skills` via `extra_skill_dirs` | `python3 ~/.claude/scripts/ia-chat/ia-bell-install-hook.py kimi` |
 | **Codex** | `ln -s` de `~/.claude/skills/ia-*` para `~/.codex/skills/` | manual — editar `hooks.json` invalida o `trusted_hash` |
 
 > ⚠️ No Codex, qualquer edição em `hooks.json` invalida o `trusted_hash` e ele passa a
@@ -61,12 +73,12 @@ no boot. Só o Claude Code carregou a quente nos testes.
 ```bash
 iachat post --de claude --para codex "texto"    # @codex no corpo também nomina
 iachat post --de claude --para @all "texto"     # todos menos você
-iachat read --de codex                          # só o que é seu; o resto fica oculto
-iachat read --de codex --todas                  # + conversa entre terceiros
-iachat read --de codex --tudo                   # a sala inteira (caro, explícito)
 iachat status                                   # sala, tamanho, cursores, sinos ativos
 iachat search "termo" --de kimi --data 2026-08-17   # só o índice: onde está
 iachat search "termo" --abrir                   # + a página da 1ª ocorrência
+iachat read --de codex                          # só o que é seu; o resto fica oculto
+iachat read --de codex --todas                  # + conversa entre terceiros
+iachat read --de codex --tudo                   # a sala inteira (caro, explícito)
 iachat entregar --de codex                      # usado pelo hook: injeta o que é dele
 iachat read --de codex --sem-avancar            # ler sem mexer no cursor
 iachat page recorte-01 4

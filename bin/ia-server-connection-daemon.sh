@@ -42,6 +42,9 @@ SALA="${IACHAT_HOME:-$HOME/ia-chat-global}"
 ESTADO="$SALA/.rede-estado.json"
 AVISOS="$SALA/rede/EVENTOS.md"
 LOG="$SALA/ia-server-connection.log"
+# Quantos ciclos de falha antes de o connection-bell tocar. 1 ciclo é
+# oscilação; 2 é evento. Energia NÃO usa limiar — ela avisa na hora.
+LIMIAR="${IACHAT_LIMIAR_REDE:-2}"
 
 mkdir -p "$SALA/pendente" "$SALA/rede"
 
@@ -150,46 +153,68 @@ ciclo() {
   # Sair da tomada é o sinal MAIS PRECOCE que existe: o Mac aguenta na bateria, o
   # roteador não. Os segundos ganhados aqui separam "salvei o parcial" de "perdi tudo".
   # Por isso não há tolerância nem contador: energia mudou, energia avisa.
-  if [ "$E" != "$ANT_E" ] && [ "$E" != "?" ] && [ "$ANT_E" != "?" ]; then
+  #
+  # ⚠️ CORRIGIDO 18/08, achado do auditor externo (ollama kimi-k3, que NÃO escreveu esta
+  # peça). O código comparava contra o valor do ciclo anterior, fosse ele qual fosse —
+  # inclusive "?" . Sequência que engolia a queda PARA SEMPRE: ciclo N o `pmset` falha e
+  # grava ANT_E="?"; entre os ciclos a energia cai de verdade; ciclo N+1 lê "bateria",
+  # mas a guarda `ANT_E != "?"` bloqueia o sino — e grava ANT_E="bateria", então dali em
+  # diante E==ANT_E e nunca mais toca. Uma leitura falha comia o alarme mais importante.
+  # A correção é comparar contra o último valor VÁLIDO: "?" não sobrescreve memória boa.
+  #
+  # Sair de "?" é ambíguo: pode ser "a energia mudou enquanto eu estava cego" ou apenas
+  # "voltei a enxergar e está tudo como antes". O custo dos dois erros NÃO é simétrico —
+  # deixar de avisar uma queda real custa trabalho perdido; avisar a mais custa um aviso.
+  # Por isso o desempate é pelo VALOR lido, não pela transição:
+  #   ? → bateria : toca. É o caso caro, e ele manda.
+  #   ? → tomada  : no-bell. Registrado (auditável), sem acordar ninguém — não dá para
+  #                 afirmar "a energia voltou" quando não se sabe se ela chegou a cair.
+  if [ "$E" != "$ANT_E" ] && [ "$E" != "?" ]; then
     if [ "$E" = "bateria" ]; then
       tocar energy "ENERGIA CAIU — o Mac está na bateria" \
         "SALVE O PARCIAL AGORA. O Mac aguenta; o roteador não. Quem fala com API remota cai em segundos."
+    elif [ "$ANT_E" = "?" ]; then
+      tocar no-bell "sensor de energia voltou a responder (? → tomada)" \
+        "Não dá para afirmar que a energia caiu: eu estava cego. Registrado, sem acordar ninguém."
     else
       tocar energy "ENERGIA VOLTOU — de volta à tomada" \
         "Remapeie ANTES de retomar: worker morto, IP possivelmente novo, servidor no endereço errado."
     fi
   fi
 
-  # ── 📡 CONNECTION-BELL — com tolerância a piscada ─────────────────────────
-  # Uma queda que dura um ciclo é oscilação; duas é evento. O contador é o que separa
-  # o `no-bell` do sino de verdade.
+  # ── 📡 CONNECTION-BELL — dispara por CONTADOR, não por borda ──────────────
+  # Uma queda que dura um ciclo é oscilação; duas é evento. Mas o gatilho é o CONTADOR
+  # chegando ao limiar, não a mudança de estado.
+  #
+  # ⚠️ CORRIGIDO 18/08, segundo achado do mesmo auditor externo. A versão anterior exigia
+  # `R != ANT_R` para tocar — e numa queda sustentada só existe UMA borda: no ciclo 1
+  # (FALHAS=1, abaixo do limiar → no-bell), e do ciclo 2 em diante `fora == fora`, sem
+  # borda, sem sino. Resultado medido no papel: **a rede podia ficar fora por horas com
+  # exatamente um no-bell e silêncio absoluto**, e o "CONEXÃO FORA" que a skill promete
+  # praticamente nunca disparava. O sino que existe para avisar não avisava.
+  #
+  # Agora: toca quando o contador ATINGE o limiar (`-eq`, uma vez só — nos ciclos
+  # seguintes ele já passou e não repete), e o estado da rede escolhe a mensagem.
   if [ "$R" != "no-ar" ]; then
     FALHAS=$((FALHAS + 1))
+    if [ "$FALHAS" -eq 1 ]; then
+      tocar no-bell "oscilação de rede (→ $R)" \
+        "Um ciclo fora, abaixo do limiar de 2: registrado, sem acordar ninguém. Se persistir, o próximo ciclo toca."
+    elif [ "$FALHAS" -eq "$LIMIAR" ]; then
+      if [ "$R" = "fora" ]; then
+        tocar connection "CONEXÃO FORA — $FALHAS ciclos" \
+          "NÃO redispare nada para fora. Trabalho local segue; o que fala com API remota vai morrer. Grave e espere."
+      else
+        tocar connection "CONEXÃO PARCIAL — LAN sim, provedores não" \
+          "A casa está de pé e a nuvem não. NÃO conclua que um worker falhou: ele está sem linha."
+      fi
+    fi
   else
-    if [ "$FALHAS" -ge 2 ] && [ "$ANT_R" != "no-ar" ]; then
+    if [ "$FALHAS" -ge "$LIMIAR" ]; then
       tocar connection "CONEXÃO VOLTOU — após $FALHAS ciclos fora" \
         "Remapeie contra o DISCO e redispare só o que comprovadamente morreu. Log grande sem artefato = morreu sem salvar."
     fi
     FALHAS=0
-  fi
-
-  if [ "$R" != "$ANT_R" ] && [ "$R" != "?" ] && [ "$ANT_R" != "?" ]; then
-    case "$R" in
-      fora|so-lan)
-        if [ "$FALHAS" -ge 2 ]; then
-          if [ "$R" = "fora" ]; then
-            tocar connection "CONEXÃO FORA — $FALHAS ciclos" \
-              "NÃO redispare nada para fora. Trabalho local segue; o que fala com API remota vai morrer. Grave e espere."
-          else
-            tocar connection "CONEXÃO PARCIAL — LAN sim, provedores não" \
-              "A casa está de pé e a nuvem não. NÃO conclua que um worker falhou: ele está sem linha."
-          fi
-        else
-          tocar no-bell "oscilação de rede ($ANT_R → $R)" \
-            "Um ciclo fora. Abaixo do limiar de 2: registrado e sem acordar ninguém."
-        fi
-        ;;
-    esac
   fi
 
   # ── 📡 IP — mudança silenciosa, e por isso traiçoeira ─────────────────────
@@ -199,9 +224,13 @@ ciclo() {
       "As URLs de servidor viraram pó, em silêncio. Reinicie os servidores e refaça o link do celular."
   fi
 
-  ANT_E="$E"; ANT_I="$I"; ANT_R="$R"
+  # "?" e "-" NÃO sobrescrevem memória válida: sensor que piscou não pode apagar o que a
+  # vigília já sabia. É a outra metade da correção do achado de 18/08.
+  [ "$E" != "?" ] && ANT_E="$E"
+  [ "$I" != "-" ] && ANT_I="$I"
+  [ "$R" != "?" ] && ANT_R="$R"
   printf '{"energia":"%s","ip":"%s","rede":"%s","falhas":%s,"visto":"%s"}\n' \
-    "$E" "$I" "$R" "$FALHAS" "$(date '+%Y-%m-%dT%H:%M:%S')" > "$ESTADO"
+    "$ANT_E" "$ANT_I" "$ANT_R" "$FALHAS" "$(date '+%Y-%m-%dT%H:%M:%S')" > "$ESTADO"
 }
 
 # `--gatilho`: quem tentou conectar e falhou chama isto. Mesmo classificador, sem esperar

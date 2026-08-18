@@ -41,7 +41,7 @@ O que ele pede quando estoura é o mesmo que o `post` já pede acima de 2 KB:
 cat /tmp/analise-completa.md
 iachat post --de claude "@codex o parser quebra em UTF-8 de 3 bytes.
 Causa e patch em /tmp/analise-completa.md (127 linhas). Resumo: falta decode
-antes do slice em bin/parser.py:88."
+antes do slice em src/parser.py:88."
 ```
 
 Custo: **~250 B** em vez de 4.200 B — e o Codex lê o arquivo **se** precisar.

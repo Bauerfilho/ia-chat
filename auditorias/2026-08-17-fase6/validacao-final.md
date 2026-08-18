@@ -108,7 +108,7 @@ conferidos um a um pela validação intermediária e pelo estado final do códig
 3. **`install.sh` não copia os binários novos.** Instalação limpa carrega a
    skill sem o comando no PATH (apontado também pelo executor codex em
    `i1-codex.md`). Integração pertence à orquestradora, dona do arquivo.
-4. **`auditorias/2026-08-17-fase6/JA-EXISTE.md`** é citado pelo contrato e pelo
+4. **`JA-EXISTE.md`** é citado pelo contrato e pelo
    PLANO como régua anti-redundância, mas **não existe no repo** (só uma cópia
    na área da orquestradora). Quem depender dele que saiba.
 5. **O enxame entregava durante a validação.** Este snapshot é de 23:19;

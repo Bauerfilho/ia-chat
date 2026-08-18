@@ -82,6 +82,82 @@ def cmd_status(a) -> int:
     return 0
 
 
+def _infra_de(ia: str) -> list[str]:
+    """O que FALTA para esta IA receber de verdade. Lista vazia = pronta.
+
+    Entrar na sala é só um nome no `config.json`. Receber é outra coisa: exige o sino
+    (daemon ou hook) ligado na casca dela. Um nome sem infraestrutura vira membro que
+    nunca é avisado — e quem o nomina fica esperando resposta que não vem, sem nada
+    indicando o porquê. Este check é o que transforma "adicionei" em "adicionei e ela
+    vai saber".
+    """
+    from pathlib import Path
+
+    faltas = []
+    label = f"com.bauer.ia-bell-{ia}"
+    plist = Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
+    if not plist.is_file():
+        faltas.append(f"sino do Mac (rode: ia-bell-install-daemon.sh {ia})")
+
+    settings = {
+        "claude": Path.home() / ".claude/settings.json",
+        "qwen": Path.home() / ".qwen/settings.json",
+    }.get(ia)
+    if settings and settings.is_file():
+        if "ia-bell-hook.sh" not in settings.read_text(errors="replace"):
+            faltas.append(f"hook de sessão (rode: ia-bell-install-hook.py {ia})")
+    elif ia == "kimi":
+        toml = Path.home() / ".kimi-code/config.toml"
+        if not toml.is_file() or "ia-bell-hook.sh" not in toml.read_text(errors="replace"):
+            faltas.append("hook de sessão (rode: ia-bell-install-hook.py kimi)")
+    elif ia not in ("bauer",):
+        faltas.append("hook de sessão: sem instalador conhecido para esta casca")
+    return faltas
+
+
+def cmd_entrar(a) -> int:
+    """Põe uma IA na sala — e diz, na hora, se ela vai mesmo receber.
+
+    Existia como "edite o config.json à mão", e o config aceitava qualquer nome: dava
+    para pôr na sala uma casca que a infraestrutura não conhece, sem aviso nenhum.
+    """
+    import json
+
+    ia = core.normaliza_ia(a.ia)
+    cfg = core.config()
+    sala = [core.normaliza_ia(x) for x in cfg.get("na_sala", [])]
+
+    if a.sair:
+        if ia not in sala:
+            print(f"✗ {ia} não está na sala ({', '.join(sala)})")
+            return 2
+        cfg["na_sala"] = [x for x in sala if x != ia]
+        core.p_config().write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n",
+                                   encoding="utf-8")
+        print(f"✔ {ia} saiu da sala · agora: {', '.join(cfg['na_sala'])}")
+        print("  o histórico dela FICA — mensagem antiga não se apaga por saída.")
+        return 0
+
+    faltas = _infra_de(ia)
+    if ia in sala:
+        print(f"= {ia} já está na sala ({', '.join(sala)})")
+    else:
+        cfg["na_sala"] = sala + [ia]
+        core.p_config().write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n",
+                                   encoding="utf-8")
+        print(f"✔ {ia} entrou · sala: {', '.join(cfg['na_sala'])}")
+        print(f"  ⚠️  a partir de agora `@all` chama {ia} também.")
+
+    if faltas:
+        print(f"\n⚠️  {ia} está na sala mas NÃO vai receber sozinha — falta:")
+        for f in faltas:
+            print(f"     · {f}")
+        print("   Até lá, ela só vê a sala se abrir por conta própria.")
+        return 1          # binário: entrou, mas não está pronta. Quem chama sabe disso.
+    print(f"\n✔ infraestrutura completa: {ia} recebe pelo sino e dentro da sessão.")
+    return 0
+
+
 def cmd_sino(a) -> int:
     """Liga/desliga a notificação do OPERADOR (a das IAs nunca desliga por aqui)."""
     cfg = core.config()
@@ -207,6 +283,11 @@ def main() -> int:
 
     p = sub.add_parser("status", help="estado da sala")
     p.set_defaults(f=cmd_status)
+
+    p = sub.add_parser("entrar", help="pôr (ou tirar) uma IA da sala, conferindo a infra")
+    p.add_argument("ia", help="nome da IA")
+    p.add_argument("--sair", action="store_true", help="tira em vez de pôr")
+    p.set_defaults(f=cmd_entrar)
 
     p = sub.add_parser("sino", help="notificação do operador: ligar, desligar, ver")
     p.add_argument("estado", nargs="?", choices=["on", "off"], help="vazio = só mostra")

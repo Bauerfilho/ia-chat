@@ -188,5 +188,55 @@ checa("saindo de sensor mudo, não inventa evento", flags(home) == {},
       "tratou 'não consegui olhar' como transição real")
 shutil.rmtree(home, ignore_errors=True)
 
+# ── 8 e 9. os dois bugs achados pelo AUDITOR EXTERNO em 18/08 ────────────────
+# Achados pelo ollama `kimi-k3`, que não escreveu esta peça — auditor ≠ autor funcionando.
+# Ficam aqui para sempre: bug encontrado que não vira teste volta.
+#
+# Os dois usam sensores FALSOS num PATH temporário. É a única forma de provar o
+# comportamento sem esperar a energia cair de verdade ou derrubar a internet do dono.
+def com_sensor_falso(estado: dict, binarios: dict[str, str]) -> str:
+    """Roda um ciclo com sensores forjados e devolve o dossiê de eventos."""
+    home = sala_nova(estado, ias=("claude",))
+    fake = home / "fakebin"
+    fake.mkdir()
+    for nome, corpo in binarios.items():
+        (fake / nome).write_text(corpo)
+        (fake / nome).chmod(0o755)
+    subprocess.run(
+        ["bash", str(DAEMON), "--uma-vez"],
+        env=dict(os.environ, IACHAT_HOME=str(home), PATH=f"{fake}:{os.environ['PATH']}"),
+        capture_output=True, timeout=30,
+    )
+    ev = home / "rede" / "EVENTOS.md"
+    texto = ev.read_text() if ev.is_file() else ""
+    shutil.rmtree(home, ignore_errors=True)
+    return texto
+
+
+# BUG 1 — o sensor piscou e a energia caiu de verdade.
+# Antes: `ANT_E="?"` bloqueava o sino E virava "bateria" no estado, então a queda ficava
+# engolida PARA SEMPRE. O alarme mais importante do sistema, morto por uma leitura falha.
+t = com_sensor_falso(
+    {"energia": "?", "ip": "-", "rede": "no-ar"},
+    {"pmset": "#!/bin/bash\necho \"Now drawing from 'Battery Power'\"\n"},
+)
+checa("BUG do auditor: '?' → bateria TOCA o energy-bell",
+      "energy-bell" in t and "ENERGIA CAIU" in t,
+      "a queda de energia foi engolida porque a leitura anterior falhou — "
+      "é o pior desfecho possível desta peça")
+
+# BUG 2 — queda SUSTENTADA de conexão.
+# Antes o sino exigia `R != ANT_R`, e numa queda contínua só existe UMA borda: o ciclo 1
+# dava no-bell e do ciclo 2 em diante `fora == fora`, sem borda. A rede podia ficar fora
+# por horas em silêncio absoluto.
+t = com_sensor_falso(
+    {"energia": "tomada", "ip": "-", "rede": "fora", "falhas": 1},
+    {"curl": "#!/bin/bash\nexit 1\n", "ping": "#!/bin/bash\nexit 1\n"},
+)
+checa("BUG do auditor: 2º ciclo fora TOCA o connection-bell",
+      "connection-bell" in t and "CONEXÃO FORA" in t,
+      "queda sustentada ficava em silêncio: o sino dependia de borda, e numa queda "
+      "contínua não há segunda borda")
+
 print(f"\n{_ok} ✔  {_falhou} ✗")
 sys.exit(1 if _falhou else 0)

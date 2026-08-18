@@ -16,6 +16,21 @@ set -u
 IA="${IACHAT_EU:-${1:-}}"
 [ -n "$IA" ] || exit 0
 SALA="${IACHAT_HOME:-$HOME/ia-chat-global}"
+# ── onboarding da IA NOVA ──────────────────────────────────────────────────
+# Achado da Kimi, 18/08: uma IA que chega pela primeira vez é INVISÍVEL para o
+# mecanismo de entrega. O hook sai na linha abaixo quando não há flag em
+# `pendente/` — e um recém-chegado nunca tem flag, porque nominar alguém exige
+# que já soubessem que ele entrou. Ela só descobria a sala se um humano contasse.
+#
+# Auto-extinguível: depois da primeira entrega o arquivo de cursor existe e este
+# teste falha para sempre. `--marcar` grava cursor #0, que é o MESMO estado que a
+# ausência do arquivo (iachat_core.py:301-306) — nenhum `read` posterior muda de
+# comportamento. Custa o mesmo que a linha seguinte: um `test -f`.
+ONBOARD="${IACHAT_BIN:-$HOME/.local/bin}/iachat-onboard"
+if [ ! -f "$SALA/cursor/$IA.json" ] && [ -x "$ONBOARD" ]; then
+    "$ONBOARD" briefing --de "$IA" --marcar 2>/dev/null
+fi
+
 [ -f "$SALA/pendente/$IA.md" ] || exit 0
 
 IACHAT="${IACHAT_BIN:-$HOME/.local/bin}/iachat"
