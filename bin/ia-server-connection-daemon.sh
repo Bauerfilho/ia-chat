@@ -35,8 +35,31 @@ GATILHO=0
 case "${1:-}" in
   --uma-vez) UMA_VEZ=1; shift ;;
   --gatilho) GATILHO=1; UMA_VEZ=1; shift ;;
+  -h|--help)
+    sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
+    exit 0 ;;
 esac
+
+# O intervalo TEM que ser um número, e a validação não é preciosismo.
+#
+# Medido em 18/08, na própria máquina do dono: o plist do LaunchAgent nasceu com
+# `--help` no lugar do intervalo. O `case` acima não tratava `--help`, então ele caía
+# aqui como valor, o `sleep --help` falhava a cada volta — e o laço passou a **girar sem
+# pausa**, fazendo `curl` na API a cada iteração, por nove minutos, escrevendo 176 KB de
+# "sleep: illegal option" num `.err` que ninguém lia.
+#
+# O pior: a vigília parecia viva. O `launchctl` mostrava pid e exit 0, o `.rede-estado.json`
+# era atualizado, e o instalador tinha dito "✔ no ar". Todo sinal apontava saúde. Um
+# vigia que arde em busy-wait enquanto reporta normalidade é a Bronca 2 na peça que existe
+# justamente para não deixar defeito passar em silêncio.
 INTERVALO="${1:-20}"
+case "$INTERVALO" in
+  ''|*[!0-9]*)
+    echo "✗ intervalo inválido: '$INTERVALO' — esperado número de segundos." >&2
+    echo "  (um valor não-numérico faria o sleep falhar e o laço girar sem pausa)" >&2
+    exit 2 ;;
+esac
+[ "$INTERVALO" -ge 1 ] 2>/dev/null || { echo "✗ intervalo precisa ser >= 1s" >&2; exit 2; }
 
 SALA="${IACHAT_HOME:-$HOME/ia-chat-global}"
 ESTADO="$SALA/.rede-estado.json"

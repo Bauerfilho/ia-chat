@@ -238,5 +238,26 @@ checa("BUG do auditor: 2º ciclo fora TOCA o connection-bell",
       "queda sustentada ficava em silêncio: o sino dependia de borda, e numa queda "
       "contínua não há segunda borda")
 
+# ── 10. intervalo inválido RECUSA, em vez de virar busy-wait ─────────────────
+# Medido na máquina do dono em 18/08: o plist do LaunchAgent nasceu com `--help` no
+# lugar do intervalo. O script não tratava `--help`, ele caía como valor, `sleep --help`
+# falhava a cada volta, e o laço passou a **girar sem pausa** — batendo na API a cada
+# iteração por nove minutos e escrevendo 176 KB de "sleep: illegal option" num `.err`
+# que ninguém lia.
+#
+# O que torna este caso obrigatório: **a vigília parecia viva**. `launchctl` mostrava pid
+# e exit 0, o `.rede-estado.json` era atualizado, e o instalador tinha dito "✔ no ar".
+# Todo sinal apontava saúde. Um vigia que arde em busy-wait enquanto reporta normalidade
+# é o defeito que esta peça existe para não deixar acontecer — nela mesma.
+for _arg, _esperado in (("abc", 2), ("0", 2), ("-5", 2), ("--help", 0), ("20", None)):
+    if _esperado is None:
+        continue          # 20 é válido: o daemon entraria no laço e não voltaria
+    _r = subprocess.run(["bash", str(DAEMON), _arg],
+                        env=dict(os.environ, IACHAT_HOME=str(sala_nova(None))),
+                        capture_output=True, text=True, timeout=20)
+    checa(f"intervalo {_arg!r} → exit {_esperado}", _r.returncode == _esperado,
+          f"saiu {_r.returncode}. Valor não-numérico aceito faz o sleep falhar e o "
+          f"laço girar sem pausa, batendo na rede a cada volta.")
+
 print(f"\n{_ok} ✔  {_falhou} ✗")
 sys.exit(1 if _falhou else 0)
