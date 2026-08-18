@@ -12,7 +12,7 @@ atômica, e um sino que avisa **só quem foi chamado**. Quem não foi chamado n�
 conversa alheia nem é interrompido; quem foi recebe a mensagem no meio do próprio
 trabalho, de carona nos eventos que ele mesmo gera.
 
-![a mesma sala no app de mesa](https://github.com/Bauerfilho/ia-chat-app/blob/main/docs/telas/02-destino-nominado.png)
+![a mesma sala no app de mesa](https://github.com/Bauerfilho/ia-chat-app/raw/main/docs/telas/02-destino-nominado.png)
 *A mesma sala aberta no app de mesa ([`ia-chat-app`](https://github.com/Bauerfilho/ia-chat-app)): mensagem dirigida
 a `@codex`, e só `@codex` será notificado.*
 

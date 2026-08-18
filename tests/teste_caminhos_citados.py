@@ -132,6 +132,18 @@ for doc in (RAIZ / "README.md", RAIZ.parent / "ia-chat-app" / "README.md"):
         readmes_ruins.append(f"{doc.name}: link relativo entre repos `{rel}` → 404 no GitHub")
     for ph in set(re.findall(r"<[a-z][a-z-]+>", t)):
         readmes_ruins.append(f"{doc.name}: placeholder {ph} num comando copiável")
+    # `![img](.../blob/...)` NÃO renderiza no GitHub: `blob` devolve a PÁGINA HTML do
+    # arquivo, não os bytes da imagem. O README aparece sem o screenshot — justamente o
+    # que decide se alguém rola a página. Para imagem, o caminho é `raw`.
+    for img in re.findall(r"!\[[^\]]*\]\((https://github\.com/[^)]*?/blob/[^)]+)\)", t):
+        readmes_ruins.append(f"{doc.name}: imagem com /blob/ não renderiza → use /raw/ ({img[:60]})")
+    # As imagens locais do README também: o repositório do app é o que tem screenshot na
+    # primeira dobra, e ele vive FORA da raiz varrida acima. Uma imagem que não carrega
+    # ali custa mais que qualquer outro defeito deste projeto — é a única coisa que a
+    # maioria vai ver.
+    for img in re.findall(r"!\[[^\]]*\]\((?!https?:)([^)]+)\)", t):
+        if not (doc.parent / img).exists():
+            readmes_ruins.append(f"{doc.name}: imagem local ausente → {img}")
 
 checa("os READMEs funcionam FORA do disco (no GitHub)", not readmes_ruins,
       "\n      ".join(readmes_ruins))
