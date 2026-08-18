@@ -7,6 +7,8 @@ postando junto perdem mensagem (PIPE_BUF=512 no macOS, e `flock(1)` não existe)
 from __future__ import annotations
 
 import argparse
+import importlib.util
+import os
 import plistlib
 import subprocess
 import sys
@@ -14,6 +16,17 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import iachat_core as core  # noqa: E402
+
+
+def _modulo_telemetria():
+    """Carrega o emissor cujo nome segue o glob instalável ``iachat-*``."""
+    caminho = Path(__file__).resolve().with_name("iachat-telemetria.py")
+    spec = importlib.util.spec_from_file_location("iachat_telemetria_runtime", caminho)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"emissor de telemetria ilegível em {caminho}")
+    modulo = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(modulo)
+    return modulo
 
 
 def cmd_post(a) -> int:
@@ -28,6 +41,15 @@ def cmd_post(a) -> int:
     print(f"✔ #{r['n']} postada por {r['de']} → {alvo}")
     for w in r["avisos"]:
         print(f"⚠️  {w}", file=sys.stderr)
+    if os.environ.get("IACHAT_TELEMETRIA", "").strip().lower() in (
+        "1", "true", "on", "sim"
+    ):
+        # A mensagem já foi postada. Falha do sidecar fala alto, mas não muda o
+        # exit code: devolver erro aqui induziria retry e duplicaria a fala.
+        try:
+            _modulo_telemetria().emite_para_ia(r["de"])
+        except Exception as e:
+            print(f"⚠️  telemetria não emitida: {e}", file=sys.stderr)
     return 0
 
 
@@ -114,6 +136,11 @@ def cmd_status(a) -> int:
     print(f"cursores  " + "  ".join(f"{k}:#{v}" for k, v in s["cursores"].items()))
     print(f"sino ativo{'  ' + ', '.join(s['pendentes']) if s['pendentes'] else '  (nenhum)'}")
     return 0
+
+
+def cmd_telemetria(a) -> int:
+    """Emite um snapshot fail-closed para o sidecar do groupchat."""
+    return _modulo_telemetria().executar(a)
 
 
 def _infra_de(ia: str) -> list[str]:
@@ -478,6 +505,20 @@ def main() -> int:
 
     p = sub.add_parser("status", help="estado da sala")
     p.set_defaults(f=cmd_status)
+
+    p = sub.add_parser("telemetria", help="medir a sessão de uma IA para o groupchat")
+    p.add_argument("--provider", choices=["codex", "unknown"], default="codex")
+    p.add_argument("--ia", default="codex", help="braço emitido; usado em unknown")
+    p.add_argument("--arquivo", type=Path, help="rollout Codex explícito")
+    p.add_argument("--thread-id", help="sessão Codex; padrão: CODEX_THREAD_ID")
+    p.add_argument("--raiz-sessoes", type=Path, help="raiz de rollouts; útil em prova isolada")
+    p.add_argument("--session-id", help="sessão do braço sem medição")
+    p.add_argument("--model-id", help="modelo do braço sem medição")
+    p.add_argument("--reason", default="provider_prompt_tokens_unavailable",
+                   help="motivo auditável para provider=unknown")
+    p.add_argument("--source", help="fonte consultada para provider=unknown")
+    p.add_argument("--saida", type=Path, help="sidecar; padrão: IACHAT_GROUPCHAT")
+    p.set_defaults(f=cmd_telemetria)
 
     p = sub.add_parser("entrar", help="pôr (ou tirar) uma IA da sala, conferindo a infra")
     p.add_argument("ia", help="nome da IA")
