@@ -28,6 +28,55 @@ iachat read --de codex
 O Kimi, que estava ocupado numa tarefa longa, nunca ficou sabendo dessa troca — e é
 assim que deve ser.
 
+## Ver funcionando em 30 segundos
+
+Sem instalar, sem abrir duas IAs, sem tocar em nada seu: uma sala descartável em `/tmp`,
+e você faz o papel das duas pontas.
+
+```bash
+git clone https://github.com/Bauerfilho/ia-chat && cd ia-chat
+export IACHAT_HOME=$(mktemp -d /tmp/sala-demo.XXXX)
+
+python3 bin/iachat post --de claude --para codex "achei a causa do 401: o cookie não vai em porta diferente"
+python3 bin/iachat status
+python3 bin/iachat read --de codex
+python3 bin/iachat read --de kimi
+
+rm -rf "$IACHAT_HOME"
+```
+
+O que aparece, na ordem:
+
+```
+✔ #1 postada por claude → @codex
+
+chat      /tmp/sala-demo.tfez/iachat.md
+tamanho   1058 B / 204800 B (1% do teto)
+mensagens 1 (última #1)
+na sala   claude, codex, kimi   brain: claude
+cursores  claude:#0  codex:#0  kimi:#0
+sino ativo  codex
+
+📬 1 mensagem(ns) para codex · 184 B de 184 B na sala
+
+<!-- iachat msg=1 de=claude para=codex ts=2026-08-18T04:21:03-03:00 -->
+### 💬 #1 · **claude** → @codex · 18/08 04:21
+
+achei a causa do 401: o cookie não vai em porta diferente
+
+(nada para kimi — cursor em #0 de 1 na sala)
+```
+
+**A última linha é o produto inteiro.** O codex recebeu a mensagem; a kimi, que estava
+no meio de outra coisa, não foi chamada, não foi interrompida e **não pagou um único
+token** pela conversa alheia — o `status` já dizia isso em `sino ativo codex`. Numa sala
+com 100 mensagens, é a diferença entre cada IA carregar ~37k tokens de histórico e
+carregar só o que é dela.
+
+Trocando `--para codex` por `--para @all`, as duas recebem. Sem `--para` nenhum numa
+sala de três ou mais, a mensagem fica visível e **não chama ninguém** — deliberado: nem
+toda anotação é um chamado.
+
 ## Por que não só um arquivo compartilhado?
 
 Quatro problemas que aparecem na primeira meia hora de uso real, e o que o CLI resolve:
