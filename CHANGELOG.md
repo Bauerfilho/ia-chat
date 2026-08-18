@@ -1,5 +1,54 @@
 # CHANGELOG — ia-chat
 
+## 2026-08-18 (manhã) — publicado, e os comandos do dono atravessam o app
+
+> Os dois repositórios foram ao ar: `github.com/Bauerfilho/ia-chat` e `ia-chat-app`.
+
+### Os comandos de barra funcionam a partir da interface
+
+Trabalho do worker `L2` (qwen) na fase 9. **O crédito vem aqui porque o código entrou
+num commit meu que falava de outra coisa** (`git add -A` apressado, segunda vez no
+mesmo dia) — e a história já estava pública quando percebi. Reescrever push publicado é
+pior que o erro; o registro fica onde ainda vale.
+
+`/goal` `/plan` `/concluir` `/parar` `/refaz` `/decidi` atravessam o servidor por uma
+flag escondida, `--via-app`, com três travas:
+
+- **texto vira DADO, nunca argumento.** O payload chega como um objeto JSON pelo stdin
+  e é validado chave a chave contra um mapa. Chave fora do mapa = recusa. Provado:
+  `{"texto":"objetivo com ; whoami e $(id) e \`date\` dentro"}` foi gravado literal,
+  nada executou;
+- **o autor é do servidor** (`CFG["papel"]`), nunca do payload. Tentar mandar
+  `{"de":"bauer"}` é recusado — é a mensagem-fantasma de 17/08 fechada por construção,
+  não por vigilância;
+- **o mostrar-antes vive no servidor**, não no JS: `plan`, `parar` e `refaz` sem
+  `confirmado: true` devolvem 400. Um JS adulterado pularia a confirmação; o servidor
+  não. `quem` continua GET e sozinho, porque leitura atravessa e destruição não.
+
+`parar --seco` prevê com os MESMOS veredictos do disparo, sem matar nem gravar estado —
+provado com worker real, previsto e intacto depois do seco.
+
+### O sino do dono, com o padrão invertido
+
+Worker `L1` (codex). Ele pediu on/off; o achado foi maior: **o padrão do núcleo e os
+fallbacks caíam em `true`** — config ausente ou ilegível notificava sem consentimento.
+Agora silêncio é o padrão, e ao LIGAR o servidor prova o instalador do macOS antes de
+gravar `true` (falhou = 503, conserva `false`).
+
+### O IASWARM dentro do app, em dourado
+
+Worker `L3b` (grok). Botão da lateral também no topo · logo IASWARM sobre a luazinha ·
+janela do enxame em palha e ouro com a malha quadriculada preservada · métricas de
+frota · **o neon virou um botão** (`MODO NEON`) · e o controle remoto por IA: clicar no
+nome abre dados e a cauda do terminal. Ele recusou stdin no remoto, e recusou certo —
+a doutrina do app é leitura atravessa, destruição não.
+
+### A skill que salva quem foi compactada
+
+Worker `L4` (grok). A compactação já era capturada, e a captura tinha **45.683 B**.
+O `caminho.md` tem **2.079 B** e diz para ONDE ir em vez de contar o que houve.
+
+
 ## 2026-08-18 (madrugada) — o dono só assina o que ele digitou
 
 > ⚠️ **Muda comportamento para quem já usa.** Se você chama `iachat-comando` de dentro
