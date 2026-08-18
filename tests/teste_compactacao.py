@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 AQUI = Path(__file__).resolve().parent
@@ -102,6 +103,16 @@ def run_falso() -> Path:
         encoding="utf-8",
     )
     return d
+
+
+def mapa_minimo(*, rodando: str = "- (nenhum)", espera: str = "- (nenhuma)",
+                link: str = "- (nenhum)") -> str:
+    return (
+        "## Onde parou\n\n- (nenhuma prova)\n\n"
+        "## Rodando agora\n\n%s\n\n"
+        "## Espera decisão\n\n%s\n\n"
+        "## 3 links\n\n%s\n" % (rodando, espera, link)
+    )
 
 
 def roda(env: dict, args, stdin: str = "", cwd: Path = None) -> subprocess.CompletedProcess:
@@ -233,6 +244,124 @@ roda(env, ["--mapa"])
 r = roda(env, ["--validar", str(base / "caminho.md")])
 checa("PASS: o mapa gerado pelo binário passa no gate",
       r.returncode == 0 and "✔" in r.stdout, r.stdout + r.stderr)
+shutil.rmtree(base, ignore_errors=True)
+shutil.rmtree(run, ignore_errors=True)
+
+# ── 6b. Verdade do mapa: progresso sem processo não vira worker vivo.
+run = run_falso()
+base, env = sala_com_historico(False, run)
+roda(env, ["--mapa"])
+mapa_fantasma = (base / "caminho.md").read_text(encoding="utf-8")
+checa(
+    "REPROVA: progresso sem PID declara que não confirmou vida",
+    "L4-skill-compactacao" in mapa_fantasma
+    and "não consegui confirmar se está vivo" in mapa_fantasma,
+    mapa_fantasma,
+)
+ruim_vivo = base / "mapa-mente-vida.md"
+ruim_vivo.write_text(
+    mapa_minimo(rodando="- **fantasma** · etapa 4/5 · rodando"),
+    encoding="utf-8",
+)
+r = roda(env, ["--validar", str(ruim_vivo)])
+checa(
+    "REPROVA: gate recusa rodando sem prova nem incerteza",
+    r.returncode == 1 and "vida" in r.stdout.lower(),
+    r.stdout + r.stderr,
+)
+shutil.rmtree(base, ignore_errors=True)
+shutil.rmtree(run, ignore_errors=True)
+
+# ── 6c. O lado bom da vida: processo real, PID exato e comando ancorado no worker.
+run = run_falso()
+(run / "logs").mkdir()
+worker = "L4-skill-compactacao"
+processo = subprocess.Popen(
+    [sys.executable, "-c", "import time; time.sleep(30)", str(run), worker],
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+)
+try:
+    (run / "logs" / (worker + ".pid")).write_text(
+        str(processo.pid) + "\n", encoding="utf-8"
+    )
+    time.sleep(0.05)
+    base, env = sala_com_historico(False, run)
+    roda(env, ["--mapa"])
+    mapa_vivo = (base / "caminho.md").read_text(encoding="utf-8")
+    r = roda(env, ["--validar", str(base / "caminho.md")])
+    checa(
+        "PASS: processo ancorado aparece vivo com PID",
+        ("processo vivo PID %d" % processo.pid) in mapa_vivo,
+        mapa_vivo,
+    )
+    checa("PASS: mapa com processo provado passa", r.returncode == 0, r.stdout + r.stderr)
+finally:
+    processo.terminate()
+    try:
+        processo.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        processo.kill()
+        processo.wait(timeout=5)
+    shutil.rmtree(base, ignore_errors=True)
+    shutil.rmtree(run, ignore_errors=True)
+
+# ── 6d. Caminho citado precisa existir; ausência vira declaração, não link falso.
+run = run_falso()
+shutil.rmtree(run / "resultados")
+base, env = sala_com_historico(False, run)
+roda(env, ["--mapa"])
+mapa_sem_resultados = (base / "caminho.md").read_text(encoding="utf-8")
+checa(
+    "REPROVA: resultados ausente não é citado como caminho existente",
+    ("`%s`" % (run / "resultados")) not in mapa_sem_resultados
+    and "pasta de resultados ausente" in mapa_sem_resultados,
+    mapa_sem_resultados,
+)
+ruim_path = base / "mapa-mente-path.md"
+path_inexistente = run / "nao-existe"
+ruim_path.write_text(
+    mapa_minimo(link="- **relatórios** — `%s`" % path_inexistente),
+    encoding="utf-8",
+)
+r = roda(env, ["--validar", str(ruim_path)])
+checa(
+    "REPROVA: gate recusa caminho absoluto inexistente",
+    r.returncode == 1 and "caminho" in r.stdout.lower(),
+    r.stdout + r.stderr,
+)
+shutil.rmtree(base, ignore_errors=True)
+shutil.rmtree(run, ignore_errors=True)
+
+# ── 6e. Item concluído não volta do disco fantasiado de decisão pendente.
+run = run_falso()
+(run / "MAPA.md").write_text(
+    "# MAPA\n\n## O que espera a palavra dele\n\n"
+    "1. ✅ Publicar — FEITO às 07:18\n"
+    "2. PENDENTE — escolher a versão de publicação.\n",
+    encoding="utf-8",
+)
+base, env = sala_com_historico(False, run)
+roda(env, ["--mapa"])
+mapa_decisao = (base / "caminho.md").read_text(encoding="utf-8")
+checa(
+    "REPROVA: decisão concluída some e pendência real permanece",
+    "✅ Publicar" not in mapa_decisao
+    and "FEITO às 07:18" not in mapa_decisao
+    and "escolher a versão" in mapa_decisao,
+    mapa_decisao,
+)
+ruim_feito = base / "mapa-mente-pendencia.md"
+ruim_feito.write_text(
+    mapa_minimo(espera="- ✅ Publicar — FEITO às 07:18"),
+    encoding="utf-8",
+)
+r = roda(env, ["--validar", str(ruim_feito)])
+checa(
+    "REPROVA: gate recusa concluído em Espera decisão",
+    r.returncode == 1 and "concluído" in r.stdout.lower(),
+    r.stdout + r.stderr,
+)
 shutil.rmtree(base, ignore_errors=True)
 shutil.rmtree(run, ignore_errors=True)
 

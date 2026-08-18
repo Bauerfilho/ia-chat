@@ -15,6 +15,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import shlex
+import subprocess
 import sys
 import tempfile
 from datetime import datetime
@@ -231,14 +234,86 @@ def _rodando(run: Optional[Path]) -> List[str]:
             try:
                 last = p.read_text(encoding="utf-8").strip().splitlines()[-1]
                 rec = json.loads(last)
-                linhas.append(
-                    "- **%s** · etapa %s/%s · %s"
-                    % (p.stem, rec.get("etapa", "?"), rec.get("de", "?"),
-                       rec.get("estado", "?"))
+                estado = str(rec.get("estado", "?"))
+                linha = "- **%s** · etapa %s/%s · estado informado: %s" % (
+                    p.stem,
+                    rec.get("etapa", "?"),
+                    rec.get("de", "?"),
+                    estado,
                 )
+                if estado in ("rodando", "despachado"):
+                    vida, pid, motivo = _vida_worker(run, p.stem)
+                    if vida == "vivo":
+                        linha += " · processo vivo PID %s" % pid
+                    elif vida == "morto":
+                        linha += " · sem processo vivo (%s)" % motivo
+                    else:
+                        linha += " · não consegui confirmar se está vivo (%s)" % motivo
+                linhas.append(linha)
             except Exception:
                 linhas.append("- **%s** · (jsonl ilegível)" % p.stem)
     return linhas[:8] if len(linhas) > 1 else linhas + ["- (sem progress no run)"]
+
+
+def _vida_worker(run: Path, worker: str) -> Tuple[str, Optional[int], str]:
+    """Devolve vivo/morto/incerto usando o PID nominal e o comando ancorado."""
+    pidfile = run / "logs" / (worker + ".pid")
+    try:
+        bruto = pidfile.read_text(encoding="utf-8").splitlines()[0].strip()
+        pid = int(bruto)
+    except (OSError, ValueError, IndexError):
+        return "incerto", None, "PID nominal ausente ou ilegível"
+    if pid <= 0:
+        return "incerto", None, "PID nominal inválido"
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return "morto", pid, "PID %d não existe" % pid
+    except PermissionError:
+        return "incerto", pid, "sem permissão para consultar PID %d" % pid
+    except OSError:
+        return "incerto", pid, "falha ao consultar PID %d" % pid
+
+    try:
+        proc = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "state=", "-o", "command="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "incerto", pid, "não consegui inspecionar o comando do PID"
+    saida = proc.stdout.strip()
+    if proc.returncode != 0 or not saida:
+        return "incerto", pid, "PID existe, mas o comando não ficou observável"
+    partes = saida.split(None, 1)
+    if partes and partes[0].upper().startswith("Z"):
+        return "morto", pid, "PID %d é zumbi" % pid
+    comando = partes[1] if len(partes) > 1 else ""
+    if not _comando_ancora_worker(comando, run, worker):
+        return "incerto", pid, "PID vivo não prova vínculo com este run/worker"
+    return "vivo", pid, "comando ancorado no run/worker"
+
+
+def _comando_ancora_worker(comando: str, run: Path, worker: str) -> bool:
+    """Evita PID reciclado: o argv precisa nomear o run e o worker/dispatch."""
+    try:
+        argumentos = shlex.split(comando)
+    except ValueError:
+        return False
+    run_real = os.path.realpath(str(run))
+    tem_run = any(os.path.realpath(a) == run_real for a in argumentos)
+    if tem_run and worker in argumentos:
+        return True
+    for indice, argumento in enumerate(argumentos):
+        if os.path.basename(argumento) == "dispatch.sh" and indice + 1 < len(argumentos):
+            if os.path.realpath(argumentos[indice + 1]) == run_real:
+                return True
+        if os.path.basename(argumento) == "watchdog.sh":
+            cauda = argumentos[indice + 1:]
+            if run_real in [os.path.realpath(a) for a in cauda] and worker in cauda:
+                return True
+    return False
 
 
 def _espera(run: Optional[Path], sala: Path) -> List[str]:
@@ -277,6 +352,8 @@ def _espera(run: Optional[Path], sala: Path) -> List[str]:
             if not (forte or item):
                 continue
             t = ln.strip().lstrip("#-* ").strip()
+            if _linha_concluida(t):
+                continue
             if len(t) > 140:
                 t = t[:137] + "…"
             if t and t not in achados:
@@ -290,6 +367,19 @@ def _espera(run: Optional[Path], sala: Path) -> List[str]:
     return ["- " + a for a in achados]
 
 
+def _linha_concluida(texto: str) -> bool:
+    """Reconhece carimbo terminal explícito sem inferir conclusão por linguagem vaga."""
+    baixa = texto.casefold()
+    if "✅" in texto or re.search(r"\[[xX]\]", texto):
+        return True
+    if re.search(r"\b(?:não|nao)\s+(?:foi\s+)?(?:feito|conclu[ií]do|resolvido)", baixa):
+        return False
+    return bool(re.search(
+        r"(?:—|-|:)\s*(?:feito|conclu[ií]do|resolvido|entregue|publicado)\b",
+        baixa,
+    ))
+
+
 def _links(run: Optional[Path], sala: Path) -> List[str]:
     porta = None
     if run:
@@ -297,13 +387,25 @@ def _links(run: Optional[Path], sala: Path) -> List[str]:
         if pf.is_file():
             porta = pf.read_text(encoding="utf-8").strip().splitlines()[0].strip()
     painel = ("http://127.0.0.1:%s/" % porta) if porta else (
-        "`~/.claude/iaswarm-runs/<run>/` (painel-porta.txt ausente)"
+        "(não localizado: painel-porta.txt ausente)"
     )
-    rel = str(run / "resultados") if run else "`~/.claude/iaswarm-runs/`"
+    chat = sala / "iachat.md"
+    sala_link = ("`%s`" % chat) if chat.is_file() else (
+        "(arquivo iachat.md ausente no IACHAT_HOME)"
+    )
+    if run is not None and (run / "resultados").is_dir():
+        rel = "`%s`" % (run / "resultados")
+    elif run is not None:
+        rel = "(pasta de resultados ausente; nenhum caminho afirmado)"
+    else:
+        raiz = Path.home() / ".claude" / "iaswarm-runs"
+        rel = ("`%s`" % raiz) if raiz.is_dir() else (
+            "(raiz de runs ausente; nenhum caminho afirmado)"
+        )
     return [
-        "- **sala** — `open -a ia-chat` · `%s`" % (sala / "iachat.md"),
+        "- **sala** — `open -a ia-chat` · %s" % sala_link,
         "- **painel** — %s" % painel,
-        "- **relatórios** — `%s`" % rel,
+        "- **relatórios** — %s" % rel,
     ]
 
 
@@ -377,7 +479,40 @@ def valida_mapa(texto: str) -> Tuple[bool, str]:
     faltam = [s for s in SECOES if s not in texto]
     if faltam:
         return False, "faltam seções: %s" % ", ".join(faltam)
+    for citado in re.findall(r"`((?:/|~/)[^`\n]+)`", texto):
+        if not Path(citado).expanduser().exists():
+            return False, "caminho citado não existe: %s" % citado
+
+    rodando = _corpo_secao(texto, "## Rodando agora")
+    for linha in rodando.splitlines():
+        baixa_linha = linha.casefold()
+        informa_atividade = re.search(
+            r"·\s*(?:estado informado:\s*)?(?:rodando|despachado)(?:\s*·|\s*$)",
+            baixa_linha,
+        )
+        if not informa_atividade:
+            continue
+        prova_vivo = re.search(r"processo vivo pid [1-9][0-9]*", baixa_linha)
+        declara_incerto = "não consegui confirmar se está vivo" in baixa_linha
+        declara_morto = "sem processo vivo" in baixa_linha
+        if not (prova_vivo or declara_incerto or declara_morto):
+            return False, "vida de worker declarada sem prova nem incerteza"
+
+    espera = _corpo_secao(texto, "## Espera decisão")
+    for linha in espera.splitlines():
+        if _linha_concluida(linha):
+            return False, "item concluído apareceu em Espera decisão"
     return True, "ok"
+
+
+def _corpo_secao(texto: str, titulo: str) -> str:
+    """Recorta uma seção Markdown até o próximo H2, sem interpretar o restante."""
+    inicio = texto.find(titulo)
+    if inicio < 0:
+        return ""
+    inicio += len(titulo)
+    fim = texto.find("\n## ", inicio)
+    return texto[inicio:] if fim < 0 else texto[inicio:fim]
 
 
 def _escreve_atomico(destino: Path, texto: str) -> None:

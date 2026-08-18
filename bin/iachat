@@ -7,6 +7,8 @@ postando junto perdem mensagem (PIPE_BUF=512 no macOS, e `flock(1)` não existe)
 from __future__ import annotations
 
 import argparse
+import plistlib
+import subprocess
 import sys
 from pathlib import Path
 
@@ -186,15 +188,100 @@ def cmd_entrar(a) -> int:
 
 
 def cmd_sino(a) -> int:
-    """Liga/desliga a notificação do OPERADOR (a das IAs nunca desliga por aqui)."""
+    """Liga/desliga o sino do dono sem confundir consentimento com infraestrutura."""
     cfg = core.config()
-    if a.estado:
-        cfg = core.configurar_notificacao_operador(a.estado == "on")
+    if a.estado == "off":
+        cfg = core.configurar_notificacao_operador(False)
+    elif a.estado == "on":
+        provado, motivo = _daemon_operador_da_sala(core.home())
+        if not provado:
+            # Um true antigo também é uma mentira se o daemon sumiu ou mudou de sala.
+            # Falhar fechado aqui deixa o app e o CLI contando a mesma verdade.
+            if cfg.get("notificar_operador") is True:
+                cfg = core.configurar_notificacao_operador(False)
+            instalador = Path(__file__).resolve().with_name(
+                "ia-bell-install-daemon.sh"
+            )
+            print("sino do operador: 🔕 mudo", file=sys.stderr)
+            print("  ✗ não liguei: %s" % motivo, file=sys.stderr)
+            print(
+                "  instale explicitamente: %s --operador" % instalador,
+                file=sys.stderr,
+            )
+            print("  depois repita: iachat sino on", file=sys.stderr)
+            return 1
+        cfg = core.configurar_notificacao_operador(True)
     ligado = cfg.get("notificar_operador", False) is True
-    print(f"sino do operador: {'🔔 ligado' if ligado else '🔕 mudo'}")
+    if ligado:
+        provado, motivo = _daemon_operador_da_sala(core.home())
+        if not provado:
+            if a.estado == "on":
+                cfg = core.configurar_notificacao_operador(False)
+            print("sino do operador: ⚠️ configurado, mas INOPERANTE")
+            print("  %s" % motivo)
+            return 1
+    print("sino do operador: %s" % ("🔔 ligado" if ligado else "🔕 mudo"))
     if a.estado:
         print("  (vale no próximo ciclo do daemon, ~15s — não precisa reiniciar nada)")
     return 0
+
+
+def _daemon_operador_da_sala(sala: Path) -> tuple[bool, str]:
+    """Prova LaunchAgent vivo + plist de operador apontando para a sala exata."""
+    label = "com.bauer.ia-bell-operador"
+    plist = Path.home() / "Library" / "LaunchAgents" / (label + ".plist")
+    try:
+        with plist.open("rb") as arquivo:
+            dados = plistlib.load(arquivo)
+    except (OSError, ValueError, TypeError, plistlib.InvalidFileException):
+        return False, "plist do operador ausente ou ilegível em %s" % plist
+
+    if dados.get("Label") != label:
+        return False, "plist não declara o label %s" % label
+    argumentos = dados.get("ProgramArguments")
+    if (
+        not isinstance(argumentos, list)
+        or len(argumentos) < 3
+        or Path(str(argumentos[1])).name != "ia-bell-daemon.sh"
+        or argumentos[2] != "--operador"
+    ):
+        return False, "plist não executa ia-bell-daemon.sh --operador"
+    if dados.get("KeepAlive") is not True:
+        return False, "plist do operador não garante KeepAlive"
+
+    ambiente = dados.get("EnvironmentVariables")
+    alvo = ambiente.get("IACHAT_HOME") if isinstance(ambiente, dict) else None
+    if not isinstance(alvo, str) or not alvo.strip():
+        return False, "plist não declara qual IACHAT_HOME vigia"
+    try:
+        sala_real = sala.expanduser().resolve()
+        alvo_real = Path(alvo).expanduser().resolve()
+    except OSError:
+        return False, "não consegui resolver a sala declarada no plist"
+    if alvo_real != sala_real:
+        return False, "daemon aponta para outra sala (%s), não %s" % (
+            alvo_real,
+            sala_real,
+        )
+
+    try:
+        proc = subprocess.run(
+            ["launchctl", "list"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False, "não consegui consultar o launchctl"
+    if proc.returncode != 0:
+        return False, "launchctl não confirmou o daemon do operador"
+    for linha in proc.stdout.splitlines():
+        campos = linha.split("\t")
+        if len(campos) >= 3 and campos[2] == label:
+            if campos[0].isdigit() and int(campos[0]) > 0:
+                return True, "daemon PID %s vigia %s" % (campos[0], sala_real)
+            return False, "LaunchAgent carregado, mas sem processo vivo"
+    return False, "LaunchAgent %s não está carregado" % label
 
 
 def cmd_reparar(a) -> int:
