@@ -55,7 +55,7 @@ def _payload_stdin() -> Dict[str, Any]:
 
 def _sino_dono_ligado(sala: Path) -> bool:
     cfg = _ler_json(sala / "config.json")
-    return bool(cfg.get("notificar_operador", False))
+    return cfg.get("notificar_operador") is True
 
 
 def _ias_na_sala(sala: Path) -> List[str]:
@@ -81,14 +81,55 @@ def _tam(p: Path) -> str:
     return "%.1f KB" % (n / 1024.0)
 
 
-def _acha_run() -> Optional[Path]:
+def _run_no_caminho(caminho: Path, raiz: Path) -> Optional[Path]:
+    """Resolve o primeiro filho da raiz que contém o cwd, inclusive via PWD."""
+    tentativas = [caminho, caminho.resolve()]
+    raizes = [raiz, raiz.resolve()]
+    for atual in tentativas:
+        if not atual.is_absolute():
+            atual = Path.cwd() / atual
+        for base in raizes:
+            try:
+                relativo = atual.relative_to(base)
+            except ValueError:
+                continue
+            if not relativo.parts:
+                continue
+            candidato = raiz / relativo.parts[0]
+            if candidato.is_dir() and not candidato.name.startswith("."):
+                return candidato
+    return None
+
+
+def _acha_run() -> Tuple[Optional[Path], str]:
     env = os.environ.get("IASWARM_RUN", "").strip()
     if env:
         p = Path(env).expanduser()
-        return p if p.is_dir() else None
+        if p.is_dir():
+            return p, "IASWARM_RUN"
+        return None, "IASWARM_RUN inválido"
     raiz = Path.home() / ".claude" / "iaswarm-runs"
     if not raiz.is_dir():
-        return None
+        return None, "raiz de runs ausente"
+
+    # O trabalho que contém o cwd é evidência mais forte que atividade alheia.
+    # `PWD` preserva caminhos por symlink que `Path.cwd()` pode resolver; os dois
+    # são conferidos e só podem apontar para um filho direto da raiz de runs.
+    cwd_real = Path.cwd()
+    caminhos = [cwd_real]
+    pwd = os.environ.get("PWD", "").strip()
+    if pwd:
+        pwd_path = Path(pwd).expanduser()
+        try:
+            if pwd_path.resolve() == cwd_real.resolve():
+                caminhos.append(pwd_path)
+        except OSError:
+            pass
+    for caminho in caminhos:
+        candidato = _run_no_caminho(caminho, raiz)
+        if candidato is not None:
+            return candidato, "cwd dentro do run"
+
     cands: List[Tuple[float, Path]] = []
     try:
         for d in raiz.iterdir():
@@ -100,11 +141,11 @@ def _acha_run() -> Optional[Path]:
             if marca.exists():
                 cands.append((marca.stat().st_mtime, d))
     except OSError:
-        return None
+        return None, "não consegui ler a raiz de runs"
     if not cands:
-        return None
+        return None, "nenhum run candidato"
     cands.sort(reverse=True)
-    return cands[0][1]
+    return cands[0][1], "adivinhado pelo mtime mais recente de state.json/progress"
 
 
 def _landmarks_vizinhos(run: Optional[Path]) -> List[Path]:
@@ -267,7 +308,7 @@ def _links(run: Optional[Path], sala: Path) -> List[str]:
 
 
 def monta_mapa(sala: Path, payload: Dict[str, Any], modo: str) -> str:
-    run = _acha_run()
+    run, origem_run = _acha_run()
     trig = payload.get("trigger") or modo
     sid = str(payload.get("session_id") or payload.get("sessionId") or "")[:8]
     eu = os.environ.get("IACHAT_EU") or os.environ.get("COMPACT_EU") or "?"
@@ -286,11 +327,24 @@ def monta_mapa(sala: Path, payload: Dict[str, Any], modo: str) -> str:
         "O contexto sumiu. O chão está no disco. Isto **não é um resumo** —",
         "é o mapa de para onde ir. Skill `ia-compactacao`.",
         "",
+    ]
+    if origem_run.startswith("adivinhado"):
+        cab.extend([
+            "⚠️ **Run adivinhado pelo mtime mais recente** de `state.json`/`progress`.",
+            "O cwd e `IASWARM_RUN` não indicaram um trabalho; confira o caminho antes de retomar.",
+            "",
+        ])
+    elif origem_run == "IASWARM_RUN inválido":
+        cab.extend([
+            "⚠️ **IASWARM_RUN aponta para um caminho inválido.** Nenhum run foi adivinhado.",
+            "",
+        ])
+    cab.extend([
         "## Onde parou",
         "",
         "Último passo com prova no disco (mtime, não memória):",
         "",
-    ]
+    ])
     cab.extend(_provas_disco(run, sala))
     cab.extend(["", "## Rodando agora", ""])
     cab.extend(_rodando(run))

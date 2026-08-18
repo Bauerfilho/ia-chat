@@ -104,7 +104,7 @@ def run_falso() -> Path:
     return d
 
 
-def roda(env: dict, args, stdin: str = "") -> subprocess.CompletedProcess:
+def roda(env: dict, args, stdin: str = "", cwd: Path = None) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, str(BIN)] + list(args),
         env=env,
@@ -112,6 +112,7 @@ def roda(env: dict, args, stdin: str = "") -> subprocess.CompletedProcess:
         capture_output=True,
         text=True,
         timeout=20,
+        cwd=str(cwd) if cwd is not None else None,
     )
 
 
@@ -168,6 +169,21 @@ checa("sino off: ZERO flag em pendente/ (silêncio total)",
 shutil.rmtree(base, ignore_errors=True)
 shutil.rmtree(run, ignore_errors=True)
 
+# ── 3b. tipo estrito: strings parecidas com falso continuam DESLIGADAS
+for valor_ruim in ("false", "0"):
+    run = run_falso()
+    base, env = sala_com_historico(False, run)
+    cfg = json.loads((base / "config.json").read_text(encoding="utf-8"))
+    cfg["notificar_operador"] = valor_ruim
+    (base / "config.json").write_text(json.dumps(cfg) + "\n", encoding="utf-8")
+    roda(env, ["--pre"], '{"trigger":"auto","session_id":"tipo-ruim"}')
+    pendentes = list((base / "pendente").glob("*.md"))
+    checa('REPROVA: string %r não liga o sino' % valor_ruim,
+          pendentes == [],
+          "escreveu %s — somente o booleano true pode ligar" % [p.name for p in pendentes])
+    shutil.rmtree(base, ignore_errors=True)
+    shutil.rmtree(run, ignore_errors=True)
+
 # ── 4. --inicio injeta o caminho, não reescreve
 run = run_falso()
 base, env = sala_com_historico(True, run)
@@ -219,6 +235,51 @@ checa("PASS: o mapa gerado pelo binário passa no gate",
       r.returncode == 0 and "✔" in r.stdout, r.stdout + r.stderr)
 shutil.rmtree(base, ignore_errors=True)
 shutil.rmtree(run, ignore_errors=True)
+
+# ── 7. seleção do run: ambiente > cwd > fallback de mtime declarado
+laboratorio = Path(tempfile.mkdtemp(prefix="compact-run-cwd-"))
+home_teste = laboratorio / "home"
+raiz_runs = home_teste / ".claude" / "iaswarm-runs"
+run_cwd = raiz_runs / "run-do-cwd"
+run_novo = raiz_runs / "run-mais-novo"
+(run_cwd / "progress").mkdir(parents=True)
+(run_novo / "progress").mkdir(parents=True)
+(run_cwd / "resultados").mkdir()
+(run_novo / "resultados").mkdir()
+(run_cwd / "subpasta" / "profunda").mkdir(parents=True)
+(run_cwd / "state.json").write_text('{"workers": []}\n', encoding="utf-8")
+(run_novo / "state.json").write_text('{"workers": []}\n', encoding="utf-8")
+os.utime(run_cwd / "state.json", (1700000000, 1700000000))
+os.utime(run_novo / "state.json", (1800000000, 1800000000))
+
+base, env = sala_com_historico(False)
+env.pop("IASWARM_RUN", None)
+env["HOME"] = str(home_teste)
+env["PWD"] = str(run_novo)  # isca: variável stale não pode vencer o cwd real
+r = roda(env, ["--mapa"], cwd=run_cwd / "subpasta" / "profunda")
+mapa_cwd = (base / "caminho.md").read_text(encoding="utf-8")
+checa("cwd dentro de run vence o mtime global",
+      r.returncode == 0 and ("- run `%s`" % run_cwd) in mapa_cwd
+      and ("- run `%s`" % run_novo) not in mapa_cwd,
+      mapa_cwd[:700])
+shutil.rmtree(base, ignore_errors=True)
+
+fora = laboratorio / "fora-de-run"
+fora.mkdir()
+base, env = sala_com_historico(False)
+env.pop("IASWARM_RUN", None)
+env["HOME"] = str(home_teste)
+env["PWD"] = str(run_cwd)  # isca: PWD stale não transforma cwd externo em run
+r = roda(env, ["--mapa"], cwd=fora)
+mapa_chutado = (base / "caminho.md").read_text(encoding="utf-8")
+checa("fallback escolhe o run de mtime mais recente",
+      r.returncode == 0 and ("- run `%s`" % run_novo) in mapa_chutado,
+      mapa_chutado[:700])
+checa("fallback declara na cara que adivinhou por mtime",
+      "Run adivinhado pelo mtime mais recente" in mapa_chutado,
+      mapa_chutado[:700])
+shutil.rmtree(base, ignore_errors=True)
+shutil.rmtree(laboratorio, ignore_errors=True)
 
 print("\n%d ✔  %d ✗" % (_ok, _falhou))
 sys.exit(1 if _falhou else 0)
