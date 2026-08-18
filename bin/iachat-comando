@@ -65,6 +65,13 @@ import iachat_core as core  # noqa: E402
 
 DESPACHO_PADRAO = BIN / "iachat-despacho.sh"
 DECIDE = BIN / "iachat-decide"
+# A interface envia o NOME do run, nunca um caminho. A raiz é decidida pelo
+# processo do servidor/CLI; assim ``run`` continua dado e não ganha a capacidade
+# de apontar para qualquer lugar do disco. Mesma régua do visualizador do app.
+IASWARM_RAIZ = Path(os.environ.get(
+    "IASWARM_RAIZ", str(Path.home() / ".claude" / "iaswarm-runs")
+)).expanduser()
+RE_IASWARM_ID = re.compile(r"^[A-Za-z0-9._-]{1,80}$")
 # Papéis com que a frota planeja quando o dono não nomeia nada. Não é hierarquia: é
 # só evitar N planos idênticos, que custariam N vezes e diriam uma coisa só.
 PAPEL_PADRAO = {
@@ -1208,8 +1215,28 @@ def parar_run(a) -> int:
         return 2
     alvos = pedidos or list(ws)
 
-    sig = signal.SIGKILL if a.forte else signal.SIGTERM
     tabela = _tabela_ps()
+    if a.seco:
+        # A página do worker usa o mesmo contrato de dois tempos da paleta:
+        # primeiro esta leitura, depois um recibo server-side autoriza o disparo.
+        # A simulação percorre os MESMOS vereditos e a MESMA árvore que o ato,
+        # mas não sinaliza processo nem escreve no run (dado de outro programa).
+        print(f"🧪 seco — run {r['dir'].name}: o que o disparo faria")
+        for w in alvos:
+            i = ws[w]
+            if i["veredito"] == "vivo":
+                pid = i["pid"]
+                arvore = descendentes(pid, tabela) + [pid]
+                print(f"   {w:16} pid {pid:>7} — pararia {len(arvore)} processo(s) "
+                      f"da árvore")
+            elif i["veredito"] == "morto":
+                print(f"   {w:16} já não está rodando ({i['motivo']})")
+            else:
+                print(f"   {w:16} ⛔ NÃO seria parado — {i['motivo']}")
+        print(f"   (nada foi escrito em {r['dir']})")
+        return 0
+
+    sig = signal.SIGKILL if a.forte else signal.SIGTERM
     mortos, recusados, ja = [], [], []
     for w in alvos:
         i = ws[w]
@@ -1251,12 +1278,6 @@ def parar_run(a) -> int:
 
 def cmd_parar(a) -> int:
     if a.run:
-        if a.seco:
-            # Um run se prevê com o instrumento de presença, que é read-only: matar
-            # lá tem as mesmas travas daqui, e a previsão é a mesma leitura do ps.
-            print("✗ --seco é só para a missão corrente; um run se prevê com "
-                  "`iachat-comando quem --run <dir>`.", file=sys.stderr)
-            return 2
         return parar_run(a)
     e = le_estado()
     if not e:
@@ -1705,13 +1726,44 @@ def cmd_decidi(a) -> int:
 # RECUSADA, nunca vira argumento. Foi assim que a tentativa de contrabandear
 # `forcar`/`forte`/`--forte` pelo JSON morreu na borda, no gate, sem chegar perto
 # do despacho (teste_comandos_ui.py prova o caso que reprova).
+def _identificador_iaswarm(campo: str, valor: str) -> str:
+    """Valida ``run``/``ia`` como nomes opacos, nunca como fragmentos de path."""
+    if not RE_IASWARM_ID.fullmatch(valor) or ".." in valor:
+        raise ValueError(
+            f"--via-app: `{campo}` é identificador IASWARM inválido; use 1–80 "
+            "caracteres [A-Za-z0-9._-], sem `/`, espaço ou `..`"
+        )
+    return valor
+
+
+def _run_sob_raiz(nome: str) -> str:
+    """Resolve um ID validado sob a raiz cravada, recusando symlink de fuga."""
+    # Preserve a grafia literal da raiz (`/var` vs `/private/var`) no namespace:
+    # o processo do worker cita UMA delas no `ps`, e `le_run` compara as duas.
+    # A checagem de segurança usa as formas resolvidas; o valor entregue usa a
+    # forma absoluta não-resolvida para não apagar essa prova de identidade.
+    raiz_bruta = IASWARM_RAIZ.absolute()
+    raiz = raiz_bruta.resolve()
+    alvo_bruto = raiz_bruta / nome
+    alvo = alvo_bruto.resolve()
+    try:
+        alvo.relative_to(raiz)
+    except ValueError:
+        raise ValueError(
+            "--via-app: `run` é identificador IASWARM inválido fora da raiz"
+        )
+    return str(alvo_bruto)
+
+
 VIA_APP = {
     "goal": {"texto": (str, True)},
     "plan": {"seco": (bool, False), "colher": (bool, False),
              "ias": (list, False), "nivel": (int, False), "todas": (bool, False)},
     "concluir": {"texto": (str, False), "para": (list, False)},
-    "parar": {"seco": (bool, False)},
-    "refaz": {"ia": (str, True), "seco": (bool, False)},
+    "parar": {"run": (str, False), "ia": (str, False),
+              "seco": (bool, False)},
+    "refaz": {"ia": (str, True), "run": (str, False),
+              "seco": (bool, False)},
     "decidi": {"texto": (str, True), "porque": (str, True),
                "sobre": (str, False), "revoga": (list, False)},
 }
@@ -1757,6 +1809,10 @@ def le_via_app(a) -> None:
         elif tipo is str:
             if not isinstance(valor, str) or not valor.strip():
                 raise ValueError(f"--via-app: `{chave}` é texto não-vazio")
+            if chave in ("run", "ia"):
+                valor = _identificador_iaswarm(chave, valor)
+                if chave == "run":
+                    valor = _run_sob_raiz(valor)
         elif tipo is int:
             # `nivel` aceita 1|2|3 ou a string equivalente — o JSON do app manda
             # número; quem cola no stdin pode mandar texto. bool é int em Python,
@@ -1773,6 +1829,10 @@ def le_via_app(a) -> None:
             raise ValueError(f"--via-app: `{chave}` é true/false")
         if chave == "texto":
             a.texto = [valor]
+        elif chave == "ia" and a.cmd == "parar":
+            # O argparse do terminal aceita ``--ia`` repetível (lista); o JSON
+            # do app aceita UM worker exato. A forma interna continua a mesma.
+            a.ia = [valor]
         else:
             setattr(a, chave, valor)
 
