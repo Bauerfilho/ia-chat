@@ -169,7 +169,10 @@ def main() -> int:
         )
 
         # ---- T2: /plan --seco não gasta a frota -----------------------------
-        seco = roda(env, "plan", "--seco")
+        # `--todas` trava o ciclo multi-worker (parar/colher/refaz abaixo). A
+        # calibração por nível mora em teste_plan_calibrado.py — este arquivo
+        # prova o despacho, não a heurística.
+        seco = roda(env, "plan", "--seco", "--todas")
         checa(
             "T2 plan --seco mostra quem seria despachado sem despachar nada",
             seco.returncode == 0 and "codex" in seco.stdout and "kimi" in seco.stdout
@@ -179,7 +182,7 @@ def main() -> int:
         )
 
         # ---- T3: /plan dispara a frota, com PID e marca no `ps` -------------
-        pl = roda(env, "plan")
+        pl = roda(env, "plan", "--todas")
         e3 = estado(base)
         w_codex = e3["workers"]["codex"]
         cmdline = subprocess.run(

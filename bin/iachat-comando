@@ -14,8 +14,15 @@ Mais quatro que o desenho pedia:
 
 POR QUE PLANEJAR É COLETIVO E APLICAR É SÓ DELE: planejar é barato e reversível —
 N IAs planejando em paralelo custam N logs num diretório; se o plano for ruim, joga
-fora. Aplicar não volta. Por isso `plan` dispara a frota inteira sem pedir nada, e
-`concluir` recusa enquanto não houver plano no disco para autorizar.
+fora. Aplicar não volta. Por isso `plan` pede plano sem aplicar nada, e `concluir`
+recusa enquanto não houver plano no disco para autorizar.
+
+POR QUE O `/plan` CALIBRA QUANTAS E QUAIS: disparar a sala inteira num "renomear
+uma variável" queima quatro assinaturas e devolve quatro documentos para ele ler.
+Assinatura ociosa é dinheiro no lixo; assinatura queimada em bobagem também. O
+`cmd_plan` estima o nível pelo tamanho do enunciado, casa vocação com palavra, e
+declara a estimativa no `--seco` — ele decide olhando. `--ias` continua soberano;
+`--nivel` crava e a estimativa cala; `--todas` é o comportamento antigo.
 
 POR QUE O `parar` CONFERE O DONO DO PID ANTES DE MATAR: PID é reciclado. Um `kill`
 num número guardado há uma hora pode acertar o processo errado — o pior desfecho
@@ -69,6 +76,54 @@ PAPEL_PADRAO = {
     "qwclaude": "a alternativa mais simples que resolve",
     "dsclaude": "a segunda opinião: o que os outros vão errar",
 }
+# Vocabulário com que o enunciado casa a vocação. Heurística assumida: a palavra
+# que disparou o casamento aparece no `--seco`, para ele ver o critério e não
+# uma caixa-preta. Não é ranking de qualidade — é só "esta tarefa cheira a isto".
+AFINIDADE = {
+    "codex": (
+        "implementar", "implementacao", "codigo", "funcao", "refatorar",
+        "refator", "corrigir", "bug", "patch", "editar", "consertar",
+        "arrumar", "renomear", "modulo", "classe", "quebra",
+    ),
+    "kimi": (
+        "varrer", "listar", "todos os", "todas as", "volume",
+        "inventario", "enumerar", "medir", "em massa", "cada um",
+        "cada arquivo",
+    ),
+    "qwen": (
+        "custo", "risco", "preco", "cota", "credito", "barato",
+        "caro", "assinatura", "quanto custa",
+    ),
+    "grok": (
+        "provar", "garantir", "testar", "gate", "verificar",
+        "conferir", "ficou pronto", "aceitacao", "regressao",
+        "como provar",
+    ),
+    "agy": (
+        "onde esta", "achar", "encontrar", "arquivo:linha",
+        "localizar", "em que arquivo", "em que linha",
+    ),
+    "qwclaude": (
+        "mais simples", "alternativa", "simplificar", "menor caminho",
+    ),
+    "dsclaude": (
+        "segunda opiniao", "o que vai errar", "revisao cruzada",
+    ),
+}
+QUEM_PROVA = "grok"
+SINAIS_NIVEL_1 = (
+    "renomear", "uma linha", "um arquivo", "uma pergunta",
+    "so este", "neste arquivo", "nessa funcao", "nessa linha",
+)
+SINAIS_NIVEL_2 = (
+    "e verificar", "e provar", "e testar", "com teste",
+    "depois conferir", "uma frente",
+)
+SINAIS_NIVEL_3 = (
+    "varredura", "auditoria", "auditar", "migracao", "migrar",
+    "varias frentes", "todos os arquivos", "a frota",
+    "coordenar", "espalhar", "em paralelo",
+)
 ESTADOS_VIVOS = ("planejando", "aplicando")
 
 
@@ -764,6 +819,198 @@ def despacha(ia: str, braco: str, e: dict, papel: str, retomada: str = "") -> di
     }
 
 
+def _normaliza_enunciado(texto: str) -> str:
+    """Minúsculas sem acento — o casamento é de vocabulário, não de prosa."""
+    return "".join(
+        c for c in unicodedata.normalize("NFKD", texto.casefold())
+        if not unicodedata.combining(c)
+    )
+
+
+def _contem_sinal(texto_n: str, sinal: str) -> bool:
+    """Frase casa por substring; palavra curta, por fronteira — 'cada' não pega 'cadastrar'."""
+    sinal_n = _normaliza_enunciado(sinal)
+    if not sinal_n:
+        return False
+    if " " in sinal_n or ":" in sinal_n:
+        return sinal_n in texto_n
+    return re.search(rf"(?<![a-z0-9]){re.escape(sinal_n)}(?![a-z0-9])", texto_n) is not None
+
+
+def casa_afinidades(enunciado: str, candidatas: list[str]) -> list[dict]:
+    """Quem da sala casa com o enunciado, e por QUAL palavra.
+
+    Devolve na ordem de quem casou mais, empate na ordem da sala. Sem casamento
+    não inventa vocação: a lista vazia é o sinal de 'não reconheci'.
+    """
+    texto_n = _normaliza_enunciado(enunciado)
+    achados = []
+    for ia in candidatas:
+        palavras = AFINIDADE.get(ia, ())
+        casou = [p for p in palavras if _contem_sinal(texto_n, p)]
+        if casou:
+            achados.append({
+                "ia": ia, "palavra": casou[0], "n": len(casou),
+                "papel": PAPEL_PADRAO.get(ia, "plano geral"),
+            })
+    achados.sort(key=lambda x: (-x["n"], candidatas.index(x["ia"])))
+    return achados
+
+
+def estima_nivel(enunciado: str, casadas: list[dict]) -> tuple[int, str, bool]:
+    """(nível, critério, reconheceu).
+
+    A frase começa com 'estimei' de propósito: isto é chute declarado, não
+    veredito. Zero vocação casa → nível 3 e o critério diz que caiu por não
+    reconhecer. Uma estimativa que devolve 'ninguém' é pior que despachar demais.
+    """
+    texto_n = _normaliza_enunciado(enunciado)
+    n_palavras = len(texto_n.split())
+    if not casadas:
+        return 3, "não reconheci a tarefa; caí no nível 3", False
+    if any(_contem_sinal(texto_n, s) for s in SINAIS_NIVEL_3):
+        return 3, "estimei nível 3 porque o enunciado pede varredura, auditoria ou várias frentes", True
+    if any(_contem_sinal(texto_n, s) for s in SINAIS_NIVEL_2):
+        return 2, "estimei nível 2 porque há uma frente e um pedido de verificação", True
+    if any(_contem_sinal(texto_n, s) for s in SINAIS_NIVEL_1) or (
+            n_palavras <= 10 and len(casadas) <= 1):
+        return 1, "estimei nível 1 porque o escopo cabe num arquivo, numa linha ou numa pergunta", True
+    if len(casadas) >= 3:
+        return 3, "estimei nível 3 porque várias vocações casaram com o enunciado", True
+    if len(casadas) == 2:
+        return 2, "estimei nível 2 porque duas vocações casaram (frente + complemento)", True
+    return 1, "estimei nível 1 porque só uma vocação casou e o enunciado não pede frota", True
+
+
+def escolhe_pelo_nivel(nivel: int, casadas: list[dict],
+                       candidatas: list[str]) -> list[str]:
+    """Nível escolhe QUANTAS; a afinidade escolhe QUAIS, entre as da sala.
+
+    Nível 1: a de maior afinidade. Nível 2: ela + quem prova (grok se estiver
+    na sala; senão a próxima da sala). Nível 3: todas as que casaram; se
+    ninguém casou, a sala inteira (menos brain e dono, que já saíram da lista).
+    """
+    if not candidatas:
+        return []
+    if nivel == 1:
+        return [casadas[0]["ia"]] if casadas else [candidatas[0]]
+    if nivel == 2:
+        primeira = casadas[0]["ia"] if casadas else candidatas[0]
+        resto = [x for x in candidatas if x != primeira]
+        prova = QUEM_PROVA if QUEM_PROVA in resto else (resto[0] if resto else None)
+        return [primeira] + ([prova] if prova else [])
+    if casadas:
+        nomes = {c["ia"] for c in casadas}
+        return [x for x in candidatas if x in nomes]
+    return list(candidatas)
+
+
+def sala_operaria() -> tuple[list[str], str, str]:
+    """Quem pode ser operária do plano: a sala menos o brain e o dono.
+
+    A orquestradora não se despacha — ela está rodando este comando. O dono
+    também não: `na_sala` passou a tê-lo quando ele entrou pelo app, e um
+    worker com o nome dele cairia em 'braço sem adaptador'. Destinatário do
+    plano, nunca operário. Isto não se negocia nem com `--ias`.
+    """
+    brain = core.normaliza_ia(core.config().get("brain", ""))
+    operarias = [x for x in sala() if x not in (brain, DONO)]
+    return operarias, brain, DONO
+
+
+def calibra_plan(enunciado: str, candidatas: list[str], *,
+                 ias: list[str] | None = None, nivel: int | None = None,
+                 todas: bool = False, brain: str | None = None) -> dict:
+    """Decide quem planeja. `--ias` > `--todas` > `--nivel` > estimativa.
+
+    Nunca devolve lista vazia quando ainda há alguém na sala: zero alvos é
+    pior que despachar demais. Quem ficou de fora e por quê vai no `--seco`.
+    """
+    casadas = casa_afinidades(enunciado, candidatas)
+    if brain is None:
+        brain = core.normaliza_ia(core.config().get("brain", ""))
+
+    if ias:
+        alvos, recusadas = [], []
+        for ia in ias:
+            if ia in (DONO, brain):
+                recusadas.append(ia)
+                continue
+            if ia not in alvos:
+                alvos.append(ia)
+        return {
+            "alvos": alvos, "nivel": None, "origem": "ias",
+            "criterio": "--ias soberano (estimativa calada)",
+            "reconheceu": True, "casadas": casadas, "recusadas": recusadas,
+        }
+    if todas:
+        return {
+            "alvos": list(candidatas), "nivel": 3, "origem": "todas",
+            "criterio": "--todas: sala menos brain e dono (o comportamento antigo)",
+            "reconheceu": True, "casadas": casadas, "recusadas": [],
+        }
+    if nivel in (1, 2, 3):
+        # Cravar 3 é pedir a frota da sala, não "só quem a heurística casou":
+        # se a estimativa já tivesse acertado, ele não cravava.
+        alvos = (list(candidatas) if nivel == 3
+                 else escolhe_pelo_nivel(nivel, casadas, candidatas))
+        return {
+            "alvos": alvos, "nivel": nivel, "origem": "cravado",
+            "criterio": f"nível {nivel} cravado por --nivel (estimativa calada)",
+            "reconheceu": True, "casadas": casadas, "recusadas": [],
+        }
+
+    n, criterio, reconheceu = estima_nivel(enunciado, casadas)
+    alvos = escolhe_pelo_nivel(n, casadas, candidatas)
+    return {
+        "alvos": alvos, "nivel": n, "origem": "estimado",
+        "criterio": criterio, "reconheceu": reconheceu,
+        "casadas": casadas, "recusadas": [],
+    }
+
+
+def imprime_calibracao(cal: dict, candidatas: list[str], e: dict, a) -> None:
+    """O `--seco` é onde a estimativa se assume. Sem isto ele não decide."""
+    alvos = cal["alvos"]
+    print(f"🧪 seco — missão {e['id']}: {cal['criterio']}")
+    print(f"   {len(alvos)} IA(s) seriam despachadas")
+    for ia in alvos:
+        casou = next((c for c in cal["casadas"] if c["ia"] == ia), None)
+        if cal["origem"] == "ias":
+            motivo = "nomeada em --ias"
+        elif cal["origem"] == "todas":
+            motivo = "--todas"
+        elif casou:
+            motivo = f"palavra «{casou['palavra']}»"
+        elif not cal["reconheceu"]:
+            motivo = "caiu no nível 3 sem vocação casada"
+        else:
+            motivo = "completa a dupla (quem prova)" if cal["nivel"] == 2 else "nível cravado"
+        print(f"   {ia:10} braço={a.braco or ia:10} {PAPEL_PADRAO.get(ia, 'plano geral')}"
+              f"  ← {motivo}")
+    fora = [x for x in candidatas if x not in alvos]
+    if fora:
+        print("   de fora:")
+        for ia in fora:
+            papel = PAPEL_PADRAO.get(ia, "plano geral")
+            if cal["origem"] == "ias":
+                porque = "--ias não a nomeou"
+            elif cal["origem"] == "cravado" and cal["nivel"] == 1:
+                porque = "nível 1 pede uma só; não foi a de maior afinidade"
+            elif cal["origem"] == "cravado" and cal["nivel"] == 2:
+                porque = "nível 2 já tem a frente e quem prova"
+            elif ia not in AFINIDADE:
+                porque = "sem vocação cadastrada neste comando"
+            elif ia not in {c["ia"] for c in cal["casadas"]}:
+                porque = f"vocação ({papel}) não casou com o enunciado"
+            else:
+                porque = "o nível estimado não a pediu"
+            print(f"   - {ia}: {porque}")
+    if cal["recusadas"]:
+        print("   recusadas (dono e brain nunca operam o plano): "
+              + ", ".join(cal["recusadas"]))
+
+
 def cmd_plan(a) -> int:
     e = le_estado()
     if not e or not e.get("goal"):
@@ -781,28 +1028,31 @@ def cmd_plan(a) -> int:
               file=sys.stderr)
         return 3
 
-    alvos = [core.normaliza_ia(x) for p in (a.ias or []) for x in p.split(",") if x]
-    if not alvos:
-        brain = core.normaliza_ia(core.config().get("brain", ""))
-        # A orquestradora não se despacha: ela é quem está rodando este comando.
-        # O DONO também não: `na_sala` virou `[claude, codex, kimi, bauer]` quando ele
-        # entrou pelo app, e um worker `bauer` cairia em "braço sem adaptador" — o
-        # comando tentaria despachar o humano como se fosse uma IA. Ele é destinatário
-        # do plano, nunca operário dele.
-        alvos = [x for x in sala() if x not in (brain, DONO)]
+    candidatas, _brain, _dono = sala_operaria()
+    ias_cli = [core.normaliza_ia(x) for p in (getattr(a, "ias", None) or [])
+               for x in p.split(",") if x]
+    nivel = getattr(a, "nivel", None)
+    if isinstance(nivel, str) and nivel.strip().isdigit():
+        nivel = int(nivel)
+    cal = calibra_plan(
+        e["goal"], candidatas,
+        ias=ias_cli or None,
+        nivel=nivel if nivel in (1, 2, 3) else None,
+        todas=bool(getattr(a, "todas", False)),
+        brain=_brain,
+    )
+    alvos = cal["alvos"]
     if not alvos:
         print(f"✗ nenhuma IA para planejar (sala={sala()}, brain e dono fora). "
               f"Use `--ias codex,kimi`.", file=sys.stderr)
         return 2
 
     if a.seco:
-        print(f"🧪 seco — missão {e['id']}: {len(alvos)} IA(s) seriam despachadas")
-        for ia in alvos:
-            print(f"   {ia:10} braço={a.braco or ia:10} {PAPEL_PADRAO.get(ia, 'plano geral')}")
+        imprime_calibracao(cal, candidatas, e, a)
         return 0
 
     e["workers"] = e.get("workers", {})
-    print(f"📐 {e['id']} · pedindo plano a {len(alvos)} IA(s)")
+    print(f"📐 {e['id']} · {cal['criterio']} · pedindo plano a {len(alvos)} IA(s)")
     for ia in alvos:
         papel = PAPEL_PADRAO.get(ia, "o plano do seu ângulo")
         w = despacha(ia, a.braco or ia, e, papel)
@@ -1457,7 +1707,8 @@ def cmd_decidi(a) -> int:
 # do despacho (teste_comandos_ui.py prova o caso que reprova).
 VIA_APP = {
     "goal": {"texto": (str, True)},
-    "plan": {"seco": (bool, False), "colher": (bool, False)},
+    "plan": {"seco": (bool, False), "colher": (bool, False),
+             "ias": (list, False), "nivel": (int, False), "todas": (bool, False)},
     "concluir": {"texto": (str, False), "para": (list, False)},
     "parar": {"seco": (bool, False)},
     "refaz": {"ia": (str, True), "seco": (bool, False)},
@@ -1506,6 +1757,18 @@ def le_via_app(a) -> None:
         elif tipo is str:
             if not isinstance(valor, str) or not valor.strip():
                 raise ValueError(f"--via-app: `{chave}` é texto não-vazio")
+        elif tipo is int:
+            # `nivel` aceita 1|2|3 ou a string equivalente — o JSON do app manda
+            # número; quem cola no stdin pode mandar texto. bool é int em Python,
+            # então True/False não passam por aqui.
+            if isinstance(valor, bool):
+                raise ValueError(f"--via-app: `{chave}` é 1, 2 ou 3")
+            if isinstance(valor, str) and valor.strip() in {"1", "2", "3"}:
+                valor = int(valor)
+            elif not isinstance(valor, int):
+                raise ValueError(f"--via-app: `{chave}` é 1, 2 ou 3")
+            if valor not in (1, 2, 3):
+                raise ValueError(f"--via-app: `{chave}` é 1, 2 ou 3")
         elif not isinstance(valor, bool):       # bool por último: True é int também
             raise ValueError(f"--via-app: `{chave}` é true/false")
         if chave == "texto":
@@ -1540,8 +1803,13 @@ def main() -> int:
     p.add_argument("texto", nargs="*")
     p.set_defaults(f=cmd_goal)
 
-    p = app(dono(sub.add_parser("plan", help="a frota ativa planeja junta e devolve na sala")))
-    p.add_argument("--ias", action="append", help="quem planeja (padrão: a sala menos o brain)")
+    p = app(dono(sub.add_parser("plan", help="a frota planeja junta; o tamanho escolhe quantas")))
+    p.add_argument("--ias", action="append",
+                   help="quem planeja; soberano sobre a estimativa (já existia)")
+    p.add_argument("--nivel", type=int, choices=(1, 2, 3),
+                   help="crava o nível (1 sozinha, 2 dupla, 3 frota); a estimativa cala")
+    p.add_argument("--todas", action="store_true",
+                   help="sala menos brain e dono — o comportamento antigo")
     p.add_argument("--braco", help="forçar um braço para todas (codex, kimi, agy…)")
     p.add_argument("--colher", action="store_true", help="ler os planos e devolver na sala")
     p.add_argument("--esperar", type=int, metavar="SEG", help="bloquear até entregarem, e colher")
