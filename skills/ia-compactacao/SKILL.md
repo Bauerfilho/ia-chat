@@ -61,7 +61,7 @@ para você **saber o que fazer** quando o aviso chegar.
 >
 > Enquanto não for armado, a skill funciona **na mão**: `ia-compactacao --mapa`
 > escreve o mapa, `--inicio` imprime o ponteiro. O que não acontece sozinho é o
-> gatilho. Rode `iachat doctor` para ver se ele está armado nesta máquina.
+> gatilho. Rode `iachat-doctor` para ver se ele está armado nesta máquina.
 
 ## O sino
 

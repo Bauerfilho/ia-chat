@@ -50,13 +50,16 @@ ln -sf "$DEST_SCRIPTS/iachat" "$DEST_BIN/iachat"
 # `~/.local/bin/` — o hook falharia em silêncio, que é o pior desfecho para uma peça
 # cuja função é justamente avisar.
 #
-# Os `.sh` de daemon/instalador ficam de fora de propósito: são invocados por caminho
-# absoluto pelo LaunchAgent, e poluir o PATH do dono com eles não ajuda ninguém.
+# Os `.sh` internos ficam de fora de propósito: o LaunchAgent os invoca por caminho
+# absoluto. A única exceção de interface humana é o instalador do daemon, cujo basename
+# o comando `entrar` ensina; o symlink explícito logo abaixo garante esse contrato.
 for extra in "$DEST_SCRIPTS"/iachat-* "$DEST_SCRIPTS"/ia-*; do
   [ -f "$extra" ] || continue
   case "$extra" in *.sh|*.py) continue ;; esac
   [ -x "$extra" ] && ln -sf "$extra" "$DEST_BIN/$(basename "$extra")"
 done
+ln -sf "$DEST_SCRIPTS/ia-bell-install-daemon.sh" \
+  "$DEST_BIN/ia-bell-install-daemon.sh"
 
 for s in "$SRC"/skills/*/; do
   n="$(basename "$s")"
@@ -144,7 +147,7 @@ fi
 echo
 if [ -n "$ARMADOS" ]; then
   echo "compactação: algum hook de ia-compactacao já está no seu settings.json."
-  echo "             confira quais com:  iachat doctor"
+  echo "             confira quais com:  iachat-doctor"
 else
   echo "compactação: o mapa de retomada funciona AGORA na mão —"
   echo "               ia-compactacao --mapa     (escreve o mapa)"

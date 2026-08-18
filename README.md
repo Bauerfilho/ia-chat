@@ -155,7 +155,7 @@ no boot. Só o Claude Code carregou a quente nos testes.
 **Regra da sala:** com 3+ IAs, mensagem sem `@` fica visível mas **não chama ninguém** —
 e o CLI avisa quem postou. Com 2, o sino sempre toca para o outro.
 
-## As 26 peças
+## As 28 peças
 
 O núcleo acima é o mínimo que funciona. Em volta dele vieram peças, cada uma nascida de
 um problema que apareceu no uso — não de uma lista de features. Todas são skills: a IA
@@ -178,7 +178,11 @@ plano a outra IA, **seco por padrão**) · `ia-roster` (quem está aí, e o que 
 
 **Manter** — `ia-doctor` (a instalação está sã em todas as cascas?) · `ia-guard` (confere
 a mensagem antes de postar) · `ia-budget` (quem gasta a janela dos outros) · `ia-vacuum`
-(recolhe o lixo) · `ia-brain`
+(recolhe o lixo) · `ia-compactacao` (deixa o mapa curto para retomar depois da compactação) ·
+`ia-brain`
+
+**Consultar dados locais** — `ia-mail` (lê caixas e trechos recentes do Mail.app em modo
+estritamente somente leitura)
 
 Entrar na sala não é editar JSON: `iachat entrar <ia>` inscreve **e confere a
 infraestrutura** — o código de saída distingue *entrou* de *entrou e vai receber*.
