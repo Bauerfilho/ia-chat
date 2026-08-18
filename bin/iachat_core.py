@@ -21,6 +21,7 @@ import fcntl
 import json
 import os
 import re
+import threading
 import unicodedata
 from contextlib import contextmanager
 from datetime import datetime
@@ -128,18 +129,41 @@ def config() -> dict:
         return dict(CONFIG_PADRAO)
 
 
+# `flock` protege PROCESSOS entre si — e não protege THREADS do mesmo processo: duas
+# threads do mesmo PID pegam o mesmo lock de arquivo sem se bloquear. Isso não é
+# teórico aqui: os dois servidores do app são `ThreadingHTTPServer` e chamam `post()`
+# de dentro de threads.
+#
+# Achado por auditoria de carga em 18/08. A sonda de 16 threads × 12 posts NÃO
+# reproduziu corrupção (192/192 íntegros) — o GIL serializa a seção crítica, que é
+# curta. Mas o buraco de desenho existe, e há um fato que o torna urgente e não
+# especulativo: esta máquina roda **Python 3.14**, que tem build *free-threaded* sem
+# GIL. Nele, a proteção que hoje vem de graça desaparece — e o modo de falha é número
+# de mensagem repetido, silencioso, num arquivo append-only.
+#
+# `RLock` (não `Lock`): `post()` chama funções que também pegam o lock, e um `Lock`
+# simples travaria o processo contra si mesmo.
+_LOCK_THREAD = threading.RLock()
+
+
 @contextmanager
 def travado():
-    """Lock exclusivo para qualquer leitura-modificação-escrita do chat."""
+    """Lock exclusivo para qualquer leitura-modificação-escrita do chat.
+
+    Duas camadas, e cada uma cobre o que a outra não cobre:
+      · `RLock`  — entre THREADS do mesmo processo (o caso do servidor);
+      · `flock`  — entre PROCESSOS (o caso das IAs em janelas separadas).
+    """
     garantir_estrutura()
     lock = home() / ".lock" / "iachat.lock"
-    fd = os.open(str(lock), os.O_CREAT | os.O_RDWR, 0o644)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        yield
-    finally:
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        os.close(fd)
+    with _LOCK_THREAD:
+        fd = os.open(str(lock), os.O_CREAT | os.O_RDWR, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
 
 
 def _escrever_atomico(caminho: Path, texto: str) -> None:

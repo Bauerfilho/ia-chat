@@ -214,7 +214,7 @@ def gate_concorrencia() -> None:
         checa(
             "G-C1 contagem bate (histórico + novos)",
             au["n"] == esperado,
-            f"{au['n']} != {esperado}",
+            f"{au['n']} de {esperado}",
         )
         checa("G-C2 sem números duplicados", not au["dups"], str(au["dups"][:8]))
         checa("G-C2 sem buracos", not au["buracos"], str(au["buracos"][:8]))
@@ -273,7 +273,7 @@ def gate_rotacao_sob_escrita() -> None:
         checa(
             "G-C4 nenhuma mensagem caiu no vão (ativo+recorte == esperado)",
             au["n"] == esperado,
-            f"{au['n']} != {esperado} ativo={no_ativo} recorte={nos_recortes}",
+            f"{au['n']} de {esperado} ativo={no_ativo} recorte={nos_recortes}",
         )
         checa("G-C4 sem duplicata após rotate+post", not au["dups"], str(au["dups"][:8]))
         checa("G-C4 sem buraco após rotate+post", not au["buracos"], str(au["buracos"][:8]))

@@ -50,7 +50,7 @@ para reprovar**. Na sala real: mediana 12,6 (claude) · 16,8 (kimi) · 9,9
 (codex); a faixa das mensagens boas vai de **6,8** a **19,8**. Grande e
 densa é o melhor material da sala; grande e rala é que é o problema.
 
-`AVISO_GRANDE = 2048` (`bin/iachat_core.py:54`) disparou 3× na sala real —
+`AVISO_GRANDE = 2048` (a constante, no topo de `bin/iachat_core.py`) disparou 3× na sala real —
 #4, #9 e #15 — e as três são as mensagens mais úteis. **Tamanho não é
 veredito.** O porteiro reporta os bytes e a densidade; não reprova por eles.
 

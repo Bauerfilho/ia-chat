@@ -73,7 +73,7 @@ rotação.
 
 Sem configuração, a cota diária de cada IA é `teto_bytes ÷ nº de IAs na
 sala`. O relatório imprime a origem do número, sempre. No núcleo atual
-`TETO_PADRAO = 204800` (`bin/iachat_core.py:38`); a sala viva de 17/08
+`TETO_PADRAO = 204800` (a constante, no topo de `bin/iachat_core.py`); a sala viva de 17/08
 tinha 102400 no `config.json`.
 
 Para fixar outro valor, em `$IACHAT_HOME/config.json`:

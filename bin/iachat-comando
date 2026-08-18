@@ -38,7 +38,7 @@ import signal
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 BIN = Path(__file__).resolve().parent
@@ -173,6 +173,137 @@ def mata(pid: int, sig: int) -> str:
         return "processo"
     except (ProcessLookupError, PermissionError, OSError) as e:
         return f"erro: {e}"
+
+
+# ------------------------------------------- runs do iaswarm (dado de outro programa)
+# Um run do iaswarm (`~/.claude/iaswarm-runs/<nome>`) NÃO é uma missão deste comando:
+# ele nasce do `dispatch.sh`, que grava `logs/<worker>.pid` mas não grava o instante de
+# nascimento do processo. Sem `lstart` guardado, o gate do PID reciclado precisa de
+# outra prova — e há duas, ambas já no disco:
+#
+#   1. o caminho ABSOLUTO do run aparece na linha de comando do worker, porque o
+#      protocolo manda "cumpra o contrato em $RUN/…" (dispatch.sh:27-34);
+#   2. o processo nasceu ANTES de o `.pid` existir, porque o shell escreve o arquivo
+#      logo depois do fork. `lstart` posterior ao mtime do `.pid` = PID reciclado.
+#
+# Nada disto usa `pkill -f`. `pkill -f <nome>` casa a PRÓPRIA linha de comando de quem
+# procura e casa o PATH de qualquer processo que só mencione o nome — é como se mata o
+# processo errado. Aqui a busca é por PID gravado, conferido contra o `ps`.
+TOLERANCIA_NASCIMENTO_S = 60
+
+
+def _tabela_ps() -> list[tuple[int, int, str]]:
+    """(pid, ppid, command) de tudo que roda, numa chamada só."""
+    try:
+        r = subprocess.run(["ps", "-Ao", "pid=,ppid=,command="],
+                           capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    out = []
+    for ln in r.stdout.splitlines():
+        p = ln.split(None, 2)
+        if len(p) == 3 and p[0].isdigit() and p[1].isdigit():
+            out.append((int(p[0]), int(p[1]), p[2]))
+    return out
+
+
+def descendentes(pid: int, tabela: list[tuple[int, int, str]]) -> list[int]:
+    """A árvore abaixo de `pid`, das folhas para a raiz — a ordem em que se mata.
+
+    Worker do iaswarm NÃO é líder de grupo (o `dispatch.sh` não faz setsid), então
+    `killpg` ali derrubaria o grupo do dispatch inteiro, com os IRMÃOS dentro. Descer
+    por ppid mata só o que de fato desce deste pid.
+    """
+    filhos: dict[int, list[int]] = {}
+    for p, pp, _ in tabela:
+        filhos.setdefault(pp, []).append(p)
+    ordem, fila = [], [pid]
+    while fila:
+        atual = fila.pop(0)
+        for f in filhos.get(atual, []):
+            if f not in ordem and f != atual:
+                ordem.append(f)
+                fila.append(f)
+    return list(reversed(ordem))
+
+
+def _nascimento(pid: int) -> datetime | None:
+    bruto = " ".join(_ps(pid, "lstart").split())
+    if not bruto:
+        return None
+    try:
+        return datetime.strptime(bruto, "%a %b %d %H:%M:%S %Y").astimezone()
+    except ValueError:
+        return None
+
+
+def le_run(d: Path) -> dict:
+    """Lê um run do iaswarm. READ-ONLY: não cria, não escreve, não pega lock."""
+    d = d.expanduser().resolve()
+    if not (d / "workers.tsv").is_file():
+        raise ValueError(f"{d} não parece um run do iaswarm (sem workers.tsv)")
+    tabela = _tabela_ps()
+    alvo = str(d)
+    workers: dict[str, dict] = {}
+    for tsv in sorted(d.glob("workers*.tsv")):
+        for ln in tsv.read_text(encoding="utf-8", errors="replace").splitlines():
+            if not ln.strip() or ln.lstrip().startswith("#"):
+                continue
+            campos = ln.split("\t")
+            w = campos[0].strip()
+            if not w:
+                continue
+            workers[w] = {
+                "braco": campos[1].strip() if len(campos) > 1 else "?",
+                "etapas": campos[2].strip() if len(campos) > 2 else "?",
+                "contrato": campos[3].strip() if len(campos) > 3 else "",
+                "tsv": tsv.name,
+            }
+
+    for w, info in workers.items():
+        pidf = d / "logs" / f"{w}.pid"
+        res = d / "resultados" / f"{w}.md"
+        info["entregue"] = res.is_file() and res.stat().st_size > 0
+        info["resultado"] = str(res)
+        if not pidf.is_file():
+            info.update(veredito="nao-verificavel", pid=None,
+                        motivo=f"sem logs/{w}.pid: o disco não prova nem nega")
+            continue
+        try:
+            pid = int(pidf.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            info.update(veredito="nao-verificavel", pid=None,
+                        motivo=f"logs/{w}.pid ilegível")
+            continue
+        info["pid"] = pid
+        info["despachado_em"] = datetime.fromtimestamp(pidf.stat().st_mtime).astimezone()
+        linha = next((c for p, _, c in tabela if p == pid), None)
+        if linha is None:
+            info.update(veredito="morto", motivo="pid não está no ps")
+            continue
+        info["cmd"] = linha[:140]
+        if alvo not in linha:
+            info.update(veredito="nao-verificavel",
+                        motivo=f"pid {pid} existe mas NÃO cita este run: {linha[:70]!r}")
+            continue
+        nasc = _nascimento(pid)
+        if nasc and nasc > info["despachado_em"] + timedelta(seconds=TOLERANCIA_NASCIMENTO_S):
+            info.update(veredito="nao-verificavel",
+                        motivo=(f"pid {pid} nasceu {nasc:%H:%M:%S}, DEPOIS do despacho "
+                                f"{info['despachado_em']:%H:%M:%S} — reciclado"))
+            continue
+        info.update(veredito="vivo", nasceu=nasc, motivo="pid no ps, citando este run")
+
+    # Vivos que o run NÃO registrou: o `.pid` ausente não é prova de morte. Aconteceu
+    # de verdade em 18/08 — `d1-watchdog` rodando sem `.pid` e sem linha no workers.tsv.
+    conhecidos = {i.get("pid") for i in workers.values() if i.get("pid")}
+    meus = {os.getpid(), os.getppid()}
+    orfaos = [
+        (p, c[:140]) for p, _, c in tabela
+        if alvo in c and p not in conhecidos and p not in meus
+        and "iachat-comando" not in c   # a minha própria linha cita o run: não sou órfão
+    ]
+    return {"dir": d, "workers": workers, "orfaos": orfaos}
 
 
 # ---------------------------------------------------------------- tempo
@@ -433,7 +564,66 @@ def cmd_concluir(a) -> int:
 
 
 # ---------------------------------------------------------------- /parar
+def parar_run(a) -> int:
+    """Aborta worker(s) de um run do iaswarm, matando a descendência por ppid.
+
+    Só mata quem o disco PROVA ser daquele run. `nao-verificavel` é recusa, nunca
+    chute: o run não guarda o instante de nascimento, então quando a prova derivada
+    não fecha, o desfecho seguro é deixar vivo e dizer por quê.
+    """
+    try:
+        r = le_run(Path(a.run))
+    except ValueError as e:
+        print(f"✗ {e}", file=sys.stderr)
+        return 2
+    ws = r["workers"]
+
+    pedidos = [x for p in (a.ia or []) for x in p.split(",") if x]
+    desconhecidos = [x for x in pedidos if x not in ws]
+    if desconhecidos:
+        print(f"✗ não estão neste run: {', '.join(desconhecidos)} (há: {', '.join(ws)})",
+              file=sys.stderr)
+        return 2
+    alvos = pedidos or list(ws)
+
+    sig = signal.SIGKILL if a.forte else signal.SIGTERM
+    tabela = _tabela_ps()
+    mortos, recusados, ja = [], [], []
+    for w in alvos:
+        i = ws[w]
+        if i["veredito"] == "morto":
+            ja.append(w)
+            print(f"   {w:16} já não estava rodando ({i['motivo']})")
+            continue
+        if i["veredito"] != "vivo":
+            recusados.append((w, i["motivo"]))
+            print(f"   {w:16} ⛔ NÃO MATEI — {i['motivo']}", file=sys.stderr)
+            continue
+        pid = i["pid"]
+        arvore = descendentes(pid, tabela) + [pid]   # folhas primeiro, raiz por último
+        atingidos = []
+        for alvo_pid in arvore:
+            try:
+                os.kill(alvo_pid, sig)
+                atingidos.append(alvo_pid)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+        mortos.append(w)
+        print(f"   {w:16} {sig.name} em {len(atingidos)} processo(s): "
+              f"{', '.join(str(x) for x in atingidos)}")
+
+    print(f"\n🛑 {len(mortos)} parado(s) · {len(ja)} já morto(s) · {len(recusados)} recusado(s)")
+    print(f"   (nada foi escrito em {r['dir']} — o run é de outro programa)")
+    if recusados:
+        print("✗ recusa é o desfecho seguro: sem prova de que o PID é daquele worker, "
+              "matar é apostar.", file=sys.stderr)
+        return 3
+    return 0
+
+
 def cmd_parar(a) -> int:
+    if a.run:
+        return parar_run(a)
     e = le_estado()
     if not e:
         print("✗ não há missão para parar.", file=sys.stderr)
@@ -500,7 +690,75 @@ def cmd_parar(a) -> int:
 
 
 # ---------------------------------------------------------------- /quem
+MARCA_VEREDITO = {"vivo": "🟢 vivo", "morto": "🔴 morto",
+                  "nao-verificavel": "🟡 não-verificável"}
+
+
+def quem_run(a) -> int:
+    """Presença sobre um run do iaswarm. TRÊS desfechos, nunca dois.
+
+    Fundir "não consegui verificar" com "morto" ou com "vivo" é a mentira que este
+    comando existe para não contar: em 18/08 o `state.json` de um run dizia `rodando`
+    para seis workers cujos PIDs já não existiam no `ps`.
+    """
+    try:
+        r = le_run(Path(a.run))
+    except ValueError as e:
+        print(f"✗ {e}", file=sys.stderr)
+        return 2
+
+    ws = r["workers"]
+    if a.json:
+        print(json.dumps({
+            "run": str(r["dir"]),
+            "workers": [{"worker": w, **{k: (str(v) if isinstance(v, (datetime, Path)) else v)
+                                         for k, v in i.items()}} for w, i in ws.items()],
+            "orfaos": [{"pid": p, "cmd": c} for p, c in r["orfaos"]],
+        }, ensure_ascii=False, indent=2))
+        return 0
+
+    conta = {k: sum(1 for i in ws.values() if i["veredito"] == k)
+             for k in ("vivo", "morto", "nao-verificavel")}
+    print(f"🐝 {r['dir']}")
+    print(f"   {conta['vivo']} vivo(s) · {conta['morto']} morto(s) · "
+          f"{conta['nao-verificavel']} não-verificável(is) · {len(ws)} no workers.tsv")
+    print()
+    print(f"{'worker':16} {'braço':10} {'veredito':18} {'pid':>7}  {'entregue':8} porquê")
+    for w, i in ws.items():
+        print(f"{w:16} {i['braco']:10} {MARCA_VEREDITO[i['veredito']]:18} "
+              f"{str(i.get('pid') or '—'):>7}  {'✅' if i['entregue'] else '—':8} "
+              f"{i['motivo']}")
+
+    if r["orfaos"]:
+        print(f"\n⚠️  {len(r['orfaos'])} processo(s) VIVO(s) citando este run e SEM `.pid` "
+              f"registrado — ausência de `.pid` não prova morte:")
+        for p, c in r["orfaos"]:
+            print(f"   pid {p}: {c[:100]}")
+
+    # O painel é outro instrumento; quando ele diverge do `ps`, o réu é o painel.
+    sj = r["dir"] / "state.json"
+    if sj.is_file():
+        try:
+            dados = json.loads(sj.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            dados = {}
+        divergem = [
+            (x["worker"], x["estado"], ws[x["worker"]]["veredito"])
+            for x in dados.get("workers", [])
+            if x.get("worker") in ws
+            and x.get("estado") in ("rodando", "despachado")
+            and ws[x["worker"]]["veredito"] != "vivo"
+        ]
+        if divergem:
+            print(f"\n⚠️  state.json diz que {len(divergem)} ainda anda(m), e o `ps` não confirma:")
+            for w, painel, real in divergem:
+                print(f"   {w:16} painel={painel:12} ps={real}")
+    return 0
+
+
 def cmd_quem(a) -> int:
+    if a.run:
+        return quem_run(a)
     e = le_estado()
     cfg = core.config()
     brain = core.normaliza_ia(cfg.get("brain", ""))
@@ -557,7 +815,98 @@ def cmd_quem(a) -> int:
 
 
 # ---------------------------------------------------------------- /refaz
+def refaz_run(a) -> int:
+    """Redispara um worker morto de um run do iaswarm, retomando o parcial.
+
+    O prompt é o PROTOCOLO IASWARM literal (dispatch.sh:27-34), porque é o que a frota
+    já sabe cumprir; o que se acrescenta é a retomada. Escreve só `logs/<w>.{pid,log,
+    prompt}` — o `resultados/<w>.md` quem escreve é o worker.
+    """
+    try:
+        r = le_run(Path(a.run))
+    except ValueError as e:
+        print(f"✗ {e}", file=sys.stderr)
+        return 2
+    d, ws = r["dir"], r["workers"]
+    w = a.ia
+    if w not in ws:
+        print(f"✗ '{w}' não está neste run (há: {', '.join(ws)})", file=sys.stderr)
+        return 2
+    i = ws[w]
+
+    if i["veredito"] == "vivo" and not a.forcar:
+        print(f"✗ {w} ainda está VIVO (pid {i['pid']}). Redisparar agora daria dois "
+              f"workers escrevendo o mesmo resultado.\n"
+              f"  `iachat-comando parar --run {d} --ia {w}` antes, ou `--forcar`.",
+              file=sys.stderr)
+        return 3
+    if i["veredito"] == "nao-verificavel" and not a.forcar:
+        print(f"✗ não consigo provar que {w} morreu: {i['motivo']}.\n"
+              f"  Redisparar sobre um worker que talvez esteja vivo duplica trabalho e "
+              f"gasta assinatura. `--forcar` assume o risco.", file=sys.stderr)
+        return 3
+    if i["entregue"] and not a.forcar:
+        print(f"✗ {w} já entregou {i['resultado']}. Redisparar apagaria trabalho pronto "
+              f"— `--forcar` se for de propósito.", file=sys.stderr)
+        return 3
+
+    contrato = i["contrato"] or f"contratos/{w}.md"
+    n = i["etapas"]
+    protocolo = (
+        f"PROTOCOLO IASWARM. Leia e cumpra o contrato em {d}/{contrato} até o fim, sem "
+        f"perguntar. Após CADA etapa concluída, appenda 1 linha no arquivo "
+        f"{d}/progress/{w}.jsonl no formato "
+        f'{{"etapa":K,"de":{n},"estado":"rodando","nota":"3-8 palavras"}}. '
+        f"Escreva o resultado final em {d}/resultados/{w}.md no formato "
+        f"'missão:'/'resultado:'. Fronteira de escrita: SOMENTE os caminhos citados no "
+        f"contrato + progress/resultado acima."
+    )
+
+    parcial = ""
+    log = d / "logs" / f"{w}.log"
+    res = Path(i["resultado"])
+    if res.is_file() and res.stat().st_size > 0:
+        parcial = res.read_text(encoding="utf-8", errors="replace")[-2000:]
+    elif log.is_file():
+        parcial = log.read_text(encoding="utf-8", errors="replace")[-1500:]
+    if parcial:
+        protocolo += (f"\n\nRETOMADA: você já tinha produzido isto antes de cair. "
+                      f"Continue de onde parou, não recomece do zero:\n\n{parcial}")
+
+    tentativa = 2
+    while (d / "logs" / f"{w}.r{tentativa}.prompt.txt").exists():
+        tentativa += 1
+    pr = d / "logs" / f"{w}.r{tentativa}.prompt.txt"
+    novo_log = d / "logs" / f"{w}.r{tentativa}.log"
+    pr.write_text(protocolo, encoding="utf-8")
+
+    if a.seco:
+        print(f"🧪 seco — {w} seria redisparado no braço {a.braco or i['braco']}")
+        print(f"   prompt {len(protocolo)} B em {pr}")
+        print(f"   {'retomando ' + str(len(parcial)) + ' B de parcial' if parcial else 'do zero'}")
+        return 0
+
+    despachante = os.environ.get("IACHAT_DESPACHO", str(DESPACHO_PADRAO))
+    # A marca vai sem barras: o adaptador da kimi usa este campo como nome de sessão
+    # tmux, e tmux trata `:` e `/` como separador. O ÂNCORA de identidade não é ela —
+    # é o caminho do prompt, que fica dentro do run e aparece na linha de comando.
+    marca = f"{d.name}-{w}"
+    p = subprocess.Popen(
+        [despachante, a.braco or i["braco"], marca, str(pr), str(novo_log), str(res)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+        start_new_session=True, cwd=str(d),
+    )
+    (d / "logs" / f"{w}.pid").write_text(f"{p.pid}\n", encoding="utf-8")
+    print(f"♻️  {w} redisparado · pid {p.pid} · braço {a.braco or i['braco']} · "
+          f"tentativa r{tentativa}"
+          f"{' · retomando ' + str(len(parcial)) + ' B' if parcial else ' · do zero'}")
+    print(f"   log {novo_log}")
+    return 0
+
+
 def cmd_refaz(a) -> int:
+    if a.run:
+        return refaz_run(a)
     e = le_estado()
     if not e:
         print("✗ não há missão.", file=sys.stderr)
@@ -667,17 +1016,21 @@ def main() -> int:
 
     p = dono(sub.add_parser("parar", help="abortar a missão em andamento"))
     p.add_argument("--ia", action="append", help="só esta(s) (padrão: todas da missão)")
+    p.add_argument("--run", help="abortar worker(s) de um run do iaswarm")
     p.add_argument("--forte", action="store_true", help="SIGKILL em vez de SIGTERM")
     p.add_argument("--espera", type=float, default=2.0, help="segundos até conferir se saiu")
     p.set_defaults(f=cmd_parar)
 
     p = sub.add_parser("quem", help="quem está vivo, fazendo o quê, há quanto tempo")
     p.add_argument("--json", action="store_true")
+    p.add_argument("--run", help="presença sobre um run do iaswarm (read-only)")
     p.set_defaults(f=cmd_quem)
 
     p = sub.add_parser("refaz", help="redisparar worker morto, de onde parou")
     p.add_argument("--ia", required=True)
+    p.add_argument("--run", help="worker de um run do iaswarm")
     p.add_argument("--braco", help="trocar de braço na retomada")
+    p.add_argument("--seco", action="store_true", help="mostrar o que faria, sem gastar")
     p.add_argument("--forcar", action="store_true", help="mesmo vivo ou com plano entregue")
     p.set_defaults(f=cmd_refaz)
 
