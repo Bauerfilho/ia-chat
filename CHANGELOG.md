@@ -1,5 +1,31 @@
 # CHANGELOG — ia-chat
 
+## 2026-08-18 (fim de tarde) — o `/plan` calibra, e o sino mostra quem mais toca
+
+### O `/plan` escolhe quantas IAs e quais, pelo tamanho da tarefa
+
+Era a parte do pedido dele com mais ênfase: *"a depender do nível exigido pela tarefa
+demandada, o trabalho deve ser coordenado, o trabalho deve ser espalhado"*. O comando
+fazia metade — espalhava para a sala inteira, sempre.
+
+    "renomear a variável X neste arquivo"   → nível 1 · só codex · palavra «renomear»
+    "varrer tudo, auditar e provar"         → nível 3 · codex + kimi
+    "xyzzy plugh 42"                        → "não reconheci a tarefa; caí no nível 3"
+
+A estimativa se assume como estimativa, e nunca devolve ninguém. `--ias` > `--todas` >
+`--nivel` > estimativa; cravar qualquer uma imprime "estimativa calada". E `--ias
+bauer,claude,codex` devolve só o codex: o dono é destinatário do plano, nunca operário.
+
+### `iachat sino` mostra TODAS as fontes que podem tocar o Mac
+
+`sino off` não é silêncio do Mac inteiro — três vizinhos chamam a notificação do
+sistema sem consultar `notificar_operador`: o alarme de queda de energia (que ele
+mesmo pediu), o relay, e o sino próprio de cada IA. Quem lê "🔕 mudo" e vai dormir
+supõe silêncio; é a metade que engana.
+
+O comando não desliga nada: cada uma é instalação própria, com consentimento próprio.
+Ele ensina o `launchctl unload` e não o executa.
+
 ## 2026-08-18 (tarde) — a auditoria cruzada derrubou uma garantia que este arquivo dava
 
 > Cada frente da manhã foi auditada por quem **não a escreveu**. Três laudos, dois
