@@ -317,8 +317,17 @@ def post(de: str, texto: str, para: list[str] | None = None) -> dict:
     cfg = config()
     sala = [normaliza_ia(x) for x in cfg.get("na_sala", [])]
     if de not in sala:
+        # A mensagem ensina o COMANDO, não o arquivo. Ela mandava "adicione em
+        # <caminho>/config.json" — editar JSON à mão é pior que abrir o terminal, e
+        # existe `iachat entrar` justamente para isso. Quem tropeça aqui é sempre quem
+        # acabou de instalar: é a primeira coisa que o produto diz a um usuário novo, e
+        # dizia para ele ir mexer num arquivo de configuração. Achado da auditoria de
+        # pré-publicação, confirmado subindo o app com um papel fora da sala.
         raise ValueError(
-            f"'{de}' não está na sala {sala}. Adicione em {p_config()} antes de postar."
+            f"'{de}' não está na sala {sala}.\n"
+            f"  Entre com:  iachat entrar {de}\n"
+            f"  (ele diz, na hora, se você também vai RECEBER — entrar e não ouvir é "
+            f"a metade que engana.)"
         )
 
     texto = texto.strip()
