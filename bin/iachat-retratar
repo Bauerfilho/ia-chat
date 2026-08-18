@@ -1,0 +1,291 @@
+#!/usr/bin/env python3
+"""Retrata uma mensagem do ia-chat sem apagar nem reescrever o histórico.
+
+Comandos:
+  iachat-retratar post --de IA --msg N [--motivo MOTIVO] CORREÇÃO
+  iachat-retratar search TERMO [--de IA] [--data AAAA-MM-DD] [--abrir]
+
+A primeira linha ``retrata: #N`` é o vínculo canônico. A busca desta peça deriva
+o estado apenas do histórico append-only; nenhum índice lateral é fonte de verdade.
+"""
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+import unicodedata
+from pathlib import Path
+
+# O executável é instalado ao lado do núcleo. Resolver por ``__file__`` evita
+# depender do diretório atual de quem chamou a CLI.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import iachat_core as core  # noqa: E402
+
+
+RE_RETRATACAO = re.compile(r"^retrata:\s*#([1-9]\d*)\s*$", re.IGNORECASE)
+
+
+class ErroRetratacao(RuntimeError):
+    """Falha de integridade ou de política que impede publicar a retratação."""
+
+
+def _sem_acentos(texto: str) -> str:
+    """Normaliza somente para reconhecer marcadores de governança."""
+    base = unicodedata.normalize("NFKD", texto.casefold())
+    return "".join(c for c in base if not unicodedata.combining(c))
+
+
+def _corpo(mensagem: dict) -> str:
+    """Extrai o corpo depois de metadado e título gerados pelo núcleo."""
+    partes = mensagem["bruto"].split("\n\n", 1)
+    return partes[1].rstrip("\n") if len(partes) == 2 else ""
+
+
+def _primeira_linha(mensagem: dict) -> str:
+    """A relação só vale na primeira linha não vazia, nunca numa citação solta."""
+    return next((linha.strip() for linha in _corpo(mensagem).splitlines() if linha.strip()), "")
+
+
+def _alvo_retratado(mensagem: dict) -> int | None:
+    """Devolve o alvo de uma retratação canônica ou ``None``."""
+    achado = RE_RETRATACAO.fullmatch(_primeira_linha(mensagem))
+    return int(achado.group(1)) if achado else None
+
+
+def _decisao_do_dono(mensagem: dict) -> bool:
+    """Reconhece somente marca explícita; a CLI não inventa intenção do dono."""
+    linha = _sem_acentos(_primeira_linha(mensagem)).strip()
+    linha = linha.strip("[] ")
+    return bool(
+        re.match(r"^(?:decisao[ -]do[ -]dono|governanca[ -]do[ -]dono)(?::|$)", linha)
+    )
+
+
+def _carregar() -> list[dict]:
+    """Lê um snapshot coerente de recortes imutáveis e sala ativa."""
+    snapshots: list[tuple[Path, str]] = []
+    with core.travado():
+        for caminho in core._recortes() + [core.p_chat()]:
+            try:
+                snapshots.append((caminho, caminho.read_text(encoding="utf-8")))
+            except OSError as erro:
+                raise ErroRetratacao(f"não consegui ler {caminho}: {erro}") from erro
+
+    mensagens: list[dict] = []
+    for caminho, texto in snapshots:
+        for original in core.parse(texto):
+            mensagem = dict(original)
+            mensagem["fonte"] = caminho.stem
+            mensagens.append(mensagem)
+    mensagens.sort(key=lambda item: item["n"])
+
+    vistos: dict[int, str] = {}
+    for mensagem in mensagens:
+        numero = mensagem["n"]
+        if numero in vistos:
+            raise ErroRetratacao(
+                f"mensagem #{numero} duplicada em {vistos[numero]} e {mensagem['fonte']}"
+            )
+        vistos[numero] = mensagem["fonte"]
+    return mensagens
+
+
+def _mapa_retratacoes(mensagens: list[dict]) -> dict[int, dict]:
+    """Deriva a retratação vigente por alvo e ignora marcas forjadas/inválidas."""
+    por_numero = {mensagem["n"]: mensagem for mensagem in mensagens}
+    mapa: dict[int, dict] = {}
+    for mensagem in mensagens:
+        alvo = _alvo_retratado(mensagem)
+        if alvo is None or alvo >= mensagem["n"]:
+            continue
+        original = por_numero.get(alvo)
+        if original is None:
+            continue
+        # Só uma retratação publicada pelo próprio autor tem efeito semântico.
+        if original["de"] != mensagem["de"] or _alvo_retratado(original) is not None:
+            continue
+        mapa[alvo] = mensagem
+    return mapa
+
+
+def _audiencia(original: dict) -> list[str]:
+    """Alcança destinatários e possíveis leitores, sem eco no autor.
+
+    O cursor é um high-water mark, não um recibo por mensagem. Incluir toda IA
+    atual cujo cursor alcançou o alvo evita deixar sem correção quem o viu por
+    ``read --todas``; o custo é um aviso conservador a algum terceiro.
+    """
+    sala = [core.normaliza_ia(x) for x in core.config().get("na_sala", [])]
+    alcançados = set(original["para"])
+    alcançados.update(ia for ia in sala if core.cursor(ia) >= original["n"])
+    alcançados.discard(original["de"])
+    return [ia for ia in sala if ia in alcançados]
+
+
+def _montar_corpo(
+    alvo: int,
+    correcao: str,
+    motivo: str | None,
+    anterior: dict | None,
+) -> str:
+    """Serializa a relação antes da prosa para permitir leitura mecânica barata."""
+    linhas = [f"retrata: #{alvo}", "estado: RETRATADA"]
+    if anterior is not None:
+        linhas.append(f"substitui-retratação: #{anterior['n']}")
+    linhas.extend(["", "correção:", correcao.strip()])
+    if motivo and motivo.strip():
+        linhas.extend(["", "motivo:", motivo.strip()])
+    return "\n".join(linhas)
+
+
+def publicar(de: str, numero: int, correcao: str, motivo: str | None = None) -> dict:
+    """Valida política/autoria e acrescenta uma mensagem pelo núcleo provado."""
+    autor = core.normaliza_ia(de)
+    correcao = correcao.strip()
+    if not correcao:
+        raise ErroRetratacao("correção vazia")
+
+    mensagens = _carregar()
+    por_numero = {mensagem["n"]: mensagem for mensagem in mensagens}
+    original = por_numero.get(numero)
+    if original is None:
+        raise ErroRetratacao(f"não existe mensagem #{numero} em recortes nem no ativo")
+    if original["de"] != autor:
+        raise ErroRetratacao(
+            f"#{numero} é de {original['de']}; só o próprio autor pode retratá-la"
+        )
+    if _alvo_retratado(original) is not None:
+        raise ErroRetratacao(
+            "uma retratação não é retratável; publique nova correção para a mensagem original"
+        )
+    if _decisao_do_dono(original):
+        raise ErroRetratacao("decisão/governança do dono não pode ser retratada por uma IA")
+
+    anterior = _mapa_retratacoes(mensagens).get(numero)
+    audiencia = _audiencia(original)
+    corpo = _montar_corpo(numero, correcao, motivo, anterior)
+    try:
+        resultado = core.post(autor, corpo, audiencia)
+    except ValueError as erro:
+        raise ErroRetratacao(str(erro)) from erro
+    resultado["alvo"] = numero
+    resultado["anterior"] = anterior["n"] if anterior else None
+    return resultado
+
+
+def _sufixo_busca(mensagem: dict, mapa: dict[int, dict]) -> str:
+    """Expõe estado e ponteiro sem esconder nenhum resultado histórico."""
+    vigente = mapa.get(mensagem["n"])
+    if vigente is not None:
+        return f"  ⚠ RETRATADA → #{vigente['n']}"
+    alvo = _alvo_retratado(mensagem)
+    if alvo is not None:
+        return f"  ↪ RETRATA #{alvo}"
+    return ""
+
+
+def cmd_post(args: argparse.Namespace) -> int:
+    correcao = " ".join(args.correcao).strip() if args.correcao else sys.stdin.read().strip()
+    try:
+        resultado = publicar(args.de, args.msg, correcao, args.motivo)
+    except ErroRetratacao as erro:
+        print(f"✗ {erro}", file=sys.stderr)
+        return 1
+
+    destinos = ", ".join(f"@{ia}" for ia in resultado["para"]) or "ninguém"
+    substitui = f"; substitui #{resultado['anterior']}" if resultado["anterior"] else ""
+    print(
+        f"✔ #{resultado['n']} retrata #{resultado['alvo']}{substitui} "
+        f"→ aviso: {destinos}"
+    )
+    for aviso in resultado["avisos"]:
+        print(f"⚠️  {aviso}", file=sys.stderr)
+    return 0
+
+
+def cmd_search(args: argparse.Namespace) -> int:
+    termo = " ".join(args.termo)
+    resultado = core.buscar(termo, de=args.de, data=args.data)
+    achados = resultado["achados"]
+    if not achados:
+        print("(nada encontrado)")
+        return 0
+
+    try:
+        mensagens = _carregar()
+    except ErroRetratacao as erro:
+        print(f"✗ {erro}", file=sys.stderr)
+        return 2
+    por_numero = {mensagem["n"]: mensagem for mensagem in mensagens}
+    mapa = _mapa_retratacoes(mensagens)
+    filtro = " ".join(
+        item
+        for item in (
+            f"de={resultado['de']}" if resultado["de"] else "",
+            f"data={resultado['data']}" if resultado["data"] else "",
+        )
+        if item
+    )
+    print(f"🔎 {len(achados)} mensagem(ns) casam com '{resultado['termo']}' {filtro}".rstrip())
+    for achado in achados[:12]:
+        mensagem = por_numero.get(achado["n"], {"n": achado["n"], "bruto": ""})
+        print(
+            f"   {achado['fonte']:34} #{achado['n']:<3} {achado['de']:7} "
+            f"{achado['ts']}  → página {achado['pagina']}"
+            f"{_sufixo_busca(mensagem, mapa)}"
+        )
+    if len(achados) > 12:
+        print(f"   … e mais {len(achados) - 12}")
+
+    primeiro = achados[0]
+    if not args.abrir:
+        print(
+            f"\n   abrir: iachat page {primeiro['fonte']} {primeiro['pagina']}"
+            "   (ou repita com iachat-retratar search --abrir)"
+        )
+        return 0
+
+    pagina = core.paginar(primeiro["fonte"], primeiro["pagina"])
+    print("\n─── primeira ocorrência ───\n")
+    print(pagina["texto"])
+    vigente = mapa.get(primeiro["n"])
+    if vigente is not None:
+        print(f"\n─── correção vigente #{vigente['n']} ───\n")
+        print(vigente["bruto"].rstrip())
+    return 0
+
+
+def _positivo(valor: str) -> int:
+    numero = int(valor)
+    if numero < 1:
+        raise argparse.ArgumentTypeError("o número deve ser positivo")
+    return numero
+
+
+def parser() -> argparse.ArgumentParser:
+    cli = argparse.ArgumentParser(prog="iachat-retratar", description=__doc__)
+    comandos = cli.add_subparsers(dest="comando", required=True)
+
+    postar = comandos.add_parser("post", help="publicar retratação append-only")
+    postar.add_argument("--de", required=True, help="autor da mensagem original")
+    postar.add_argument("--msg", required=True, type=_positivo, help="número a retratar")
+    postar.add_argument("--motivo", help="por que a afirmação anterior não vale")
+    postar.add_argument("correcao", nargs="*", help="texto vigente (vazio = stdin)")
+    postar.set_defaults(funcao=cmd_post)
+
+    buscar = comandos.add_parser("search", help="buscar com marca e ponteiro de retratação")
+    buscar.add_argument("termo", nargs="*", help="texto a procurar")
+    buscar.add_argument("--de", help="só mensagens desta IA")
+    buscar.add_argument("--data", help="prefixo ISO, ex.: 2026-08-17")
+    buscar.add_argument("--abrir", action="store_true", help="abrir original e correção vigente")
+    buscar.set_defaults(funcao=cmd_search)
+    return cli
+
+
+def main() -> int:
+    args = parser().parse_args()
+    return args.funcao(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

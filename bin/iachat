@@ -33,7 +33,34 @@ def cmd_read(a) -> int:
     escopo = "tudo" if a.tudo else ("todas" if a.todas else "meu")
     r = core.ler(a.de, escopo=escopo, avancar=not a.sem_avancar)
     if not r["msgs"]:
-        print(f"(nada para {a.de} — cursor em #{r['desde']} de {r['total']} na sala)")
+        # "nada" tem DUAS causas com a mesma cara, e a diferença importa: ou ninguém te
+        # chamou, ou OUTRA SESSÃO SUA já consumiu. O cursor é por IA, não por sessão —
+        # duas janelas do mesmo Claude dividem o mesmo estado de leitura, e a primeira
+        # que lê zera o flag da outra (reproduzido pelo enxame em 18/08).
+        #
+        # A correção NÃO é dar um cursor por sessão: para o dono, duas janelas do Claude
+        # são o mesmo Claude, e multiplicar o estado por sessão criaria um isolamento que
+        # não existe no modelo mental dele — além de mexer no núcleo, onde um erro já
+        # apagou a sala inteira uma vez. O dano real aqui é o consumo ser **silencioso**.
+        # Então: mostrar QUANDO a última leitura aconteceu. Se foi há segundos e você não
+        # a viu, foi a sua outra janela — e agora dá para saber, em vez de adivinhar.
+        quando = ""
+        try:
+            import datetime as _dt
+            import json as _json
+
+            marca = _json.loads(core.p_cursor(a.de).read_text()).get("em", "")
+            if marca:
+                delta = (_dt.datetime.now().astimezone()
+                         - _dt.datetime.fromisoformat(marca)).total_seconds()
+                if delta < 300:
+                    quando = (f" · lido há {int(delta)}s — se não foi você, "
+                              f"foi outra sessão sua: o cursor é por IA, não por janela")
+                else:
+                    quando = f" · última leitura em {marca[11:16]}"
+        except Exception:
+            pass          # sem cursor ainda, ou formato antigo: o aviso é opcional
+        print(f"(nada para {a.de} — cursor em #{r['desde']} de {r['total']} na sala{quando})")
         return 0
     print(f"📬 {len(r['msgs'])} mensagem(ns) para {a.de} · {r['bytes']} B "
           f"de {r['bytes_sala']} B na sala\n")
