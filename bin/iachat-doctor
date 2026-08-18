@@ -49,11 +49,16 @@ import time
 from pathlib import Path
 
 # ─── contrato do plugin ──────────────────────────────────────────────────────
-# As 9 skills vivas: as 7 originais + ia-claim + ia-recibo (já implementadas e
-# instaladas; install.sh copia skills/*/ sem exceção). Medido em 17/08: com a
-# lista de 7, o Codex saía ✓ tendo só 7/9 — faltam ia-claim e ia-recibo em
-# ~/.codex/skills. Lista curta demais APROVA instalação incompleta.
-SKILLS = (
+# LISTA CURTA DEMAIS APROVA INSTALAÇÃO INCOMPLETA — a lição custou duas medições:
+# em 17/08, com 7 nomes, o Codex saía ✓ tendo 7 de 9 (faltavam ia-claim e ia-recibo);
+# em 18/08, com 9, o doctor conferia 9 de 26 e dizia ✓ igual. A segunda vez mostrou
+# que o problema não era o número, e sim o inventário escrito à mão: ele envelhece a
+# cada skill nova, e envelhece calado, porque ninguém revisa a lista de um verificador
+# que está passando. Por isso `skills_esperadas()` pergunta ao repositório.
+#
+# O PISO abaixo é só o último recurso — quando o doctor roda instalado, longe do
+# repositório que o gerou.
+SKILLS_PISO = (
     "ia-chat-activate",
     "ia-bell",
     "ia-nomination",
@@ -64,6 +69,37 @@ SKILLS = (
     "ia-claim",
     "ia-recibo",
 )
+
+
+def skills_esperadas() -> tuple[str, ...]:
+    """O que o REPOSITÓRIO publica, não uma lista escrita à mão.
+
+    Era uma tupla fixa de 9 nomes, e o repositório já publicava 26 — as outras 17
+    podiam estar com frontmatter quebrado, com `name` divergente do diretório, ou
+    simplesmente não instaladas, e o doctor dizia ✓ do mesmo jeito. Um inventário
+    escrito à mão envelhece na primeira skill nova, e envelhece em silêncio: ninguém
+    lembra de atualizar a lista de um verificador que está passando.
+
+    Ler `skills/` do repo faz a checagem crescer sozinha com o produto. Rodando
+    instalado (sem o repo ao lado), cai no piso — cobre menos, e é honesto sobre isso.
+
+    Achado do worker `codex` na missão m2.
+    """
+    # Dois lugares, nesta ordem. O repositório é a fonte; mas o doctor quase sempre roda
+    # INSTALADO (`~/.claude/scripts/ia-chat/`), e daí `parent.parent/skills` não existe —
+    # a primeira versão desta função caía sempre no piso e o inventário vivo nunca valia.
+    # O segundo lugar é onde o `install.sh` deposita tudo: `~/.claude/skills`. Usá-lo
+    # como referencial é o que faz o doctor dizer que o Codex tem 9 de 26 em vez de 9/9.
+    for origem in (Path(__file__).resolve().parent.parent / "skills",
+                   Path(os.path.expanduser("~/.claude/skills"))):
+        if not origem.is_dir():
+            continue
+        achadas = tuple(sorted(d.name for d in origem.iterdir()
+                               if d.is_dir() and d.name.startswith("ia-")
+                               and (d / "SKILL.md").is_file()))
+        if achadas:
+            return achadas
+    return SKILLS_PISO
 # Os 6 arquivos que install.sh:15-16 copia para $DEST_SCRIPTS — o contrato de
 # sincronia instalado×repositório. Os CLIs novos que o install.sh AINDA não
 # copia (iachat-claim, iachat-recibo, este iachat-doctor) são cobertos pelo
@@ -544,7 +580,7 @@ def checa_casca(L: Laudo, ia: str, sala: Path, scripts: Path, na_sala: bool) -> 
     else:
         achadas, quebradas, ausentes, ts_max = [], [], [], 0.0
         usados: list[Path] = []   # onde as skills REALMENTE estão, não onde foram procuradas
-        for s in SKILLS:
+        for s in skills_esperadas():
             for d in dirs:
                 alvo = d / s / "SKILL.md"
                 if alvo.is_file():
@@ -583,7 +619,8 @@ def checa_casca(L: Laudo, ia: str, sala: Path, scripts: Path, na_sala: bool) -> 
                          f'symlink de cada ia-* de {exp("~/.claude/skills")} para lá')
             L.add(e, "skill-no-disco", FALHA, " · ".join(det), como_fm, passo)
         else:
-            L.add(e, "skill-no-disco", OK, f"{len(achadas)}/{len(SKILLS)} em {onde}", como_fm)
+            L.add(e, "skill-no-disco", OK,
+                  f"{len(achadas)}/{len(skills_esperadas())} em {onde}", como_fm)
 
         # ── skill no CATÁLOGO DA SESSÃO: o limite honesto deste programa ──
         # Nenhuma casca expõe de fora o catálogo que carregou no boot. O que dá para
