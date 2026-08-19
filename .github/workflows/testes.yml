@@ -98,6 +98,20 @@ jobs:
           echo "::error::$REPO_IRMAO existe (HTTP $codigo) mas não veio para o workspace — permissão, nome ou rede. Sem ele os dois gates cobririam menos e continuariam verdes, e falso verde é pior que vermelho."
           exit 1
 
+      # `teste_despacho_pendurado.py` prova a sessão tmux DE VERDADE: criar um
+      # mock aqui faria o gate verificar o próprio teatro. O Mac do operador já
+      # tem tmux; a imagem hospedada não. Preparar o runner é parte do teste.
+      - name: tmux real para a integração do despacho
+        run: |
+          if command -v tmux >/dev/null 2>&1; then
+            echo "· tmux já presente: $(command -v tmux)"
+            tmux -V
+            exit 0
+          fi
+          HOMEBREW_NO_AUTO_UPDATE=1 brew install tmux
+          command -v tmux
+          tmux -V
+
       - name: python moderno
         if: matrix.interpretador == 'moderno'
         uses: actions/setup-python@v5

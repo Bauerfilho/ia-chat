@@ -43,6 +43,12 @@ def sha_chat(base: Path) -> str:
 
 def sala_com_historico(notificar: bool, run: Path = None) -> tuple:
     base = Path(tempfile.mkdtemp(prefix="iachat-compact-"))
+    # O teste precisa trazer o próprio HOME. No Mac do operador esta raiz já
+    # existe e escondia a dependência; o runner nasce limpo e expôs o vazamento.
+    # Criar só a estrutura vazia mantém o caso hermético: nenhuma decisão real
+    # de outro run pode entrar no mapa que estamos verificando.
+    home_teste = base / "home"
+    (home_teste / ".claude" / "iaswarm-runs").mkdir(parents=True)
     if FIXTURE.is_dir():
         shutil.copytree(FIXTURE, base, dirs_exist_ok=True)
     else:
@@ -68,6 +74,7 @@ def sala_com_historico(notificar: bool, run: Path = None) -> tuple:
     env["IACHAT_TEST"] = "1"
     env["IACHAT_EU"] = "claude"
     env["PYTHON_DONTWRITEBYTECODE"] = "1"
+    env["HOME"] = str(home_teste)
     if run is not None:
         env["IASWARM_RUN"] = str(run)
     return base, env
