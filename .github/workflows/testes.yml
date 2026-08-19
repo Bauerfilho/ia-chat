@@ -42,7 +42,10 @@ env:
 jobs:
   bateria:
     name: bateria · python ${{ matrix.interpretador }}
-    runs-on: macos-latest
+    # `macos-latest` migrou para macOS 26 e o Python não-sistema passou a
+    # expirar em localhost no runner hospedado. macOS 15 continua suportado e
+    # mantém a prova real do produto Mac sem trocar TCP por mock.
+    runs-on: macos-15
     timeout-minutes: 15
     strategy:
       fail-fast: false
@@ -112,12 +115,6 @@ jobs:
           command -v tmux
           tmux -V
 
-      - name: python moderno
-        if: matrix.interpretador == 'moderno'
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.13'
-
       # O valor entra por `env`, não por interpolação dentro do shell: aqui ele é
       # literal da minha própria matriz, mas a regra de nunca costurar expressão
       # em `run:` vale mesmo quando a entrada é confiável — é o hábito que impede
@@ -134,6 +131,11 @@ jobs:
             fi
           else
             PY="$(command -v python3)"
+            if [ "$PY" = "/usr/bin/python3" ]; then
+              echo "::error::a perna moderna resolveu para $PY e duplicaria a perna sistema."
+              exit 1
+            fi
+            "$PY" -c 'import sys; assert sys.version_info >= (3, 13), sys.version'
           fi
           echo "PY=$PY" >> "$GITHUB_ENV"
           echo "· interpretador: $PY"
