@@ -33,6 +33,36 @@ case "$PEND_SEG" in ''|*[!0-9]*) PEND_SEG=720 ;; esac
 case "$AVISO_SEG" in ''|*[!0-9]*) AVISO_SEG=480 ;; esac
 [ "$PEND_SEG" -ge 1 ] || PEND_SEG=720
 VIGIA_SESSAO=""
+KIMI_SESSAO_LIMPEZA=""
+TELEMETRIA_DESPACHO_ATIVA=0
+TELEMETRIA_BIN="$(dirname "$0")/iachat-telemetria.py"
+
+emite_telemetria_despacho() {
+  local estado=$1 motivo=${2:-}
+  local -a comando=(python3 "$TELEMETRIA_BIN")
+  if [ "$estado" = "exited" ]; then
+    comando+=(encerramento --ia "$BRACO")
+  else
+    comando+=(despacho --ia "$BRACO" --session-state "$estado" --reason "$motivo")
+  fi
+  if ! "${comando[@]}" >/dev/null; then
+    printf 'AVISO: telemetria do despacho não emitida (%s/%s)\n' \
+      "$BRACO" "$estado" >&2
+    return 1
+  fi
+}
+
+finaliza_despacho() {
+  local rc=$1
+  trap - EXIT
+  if [ -n "${KIMI_SESSAO_LIMPEZA:-}" ]; then
+    tmux kill-session -t "$KIMI_SESSAO_LIMPEZA" 2>/dev/null || true
+  fi
+  if [ "$TELEMETRIA_DESPACHO_ATIVA" -eq 1 ]; then
+    emite_telemetria_despacho "exited" || true
+  fi
+  return "$rc"
+}
 
 cpu_arvore() {
   python3 - "$1" <<'PY'
@@ -188,6 +218,12 @@ BRACO="${1:?braco}"; MISSAO="${2:?missao}"; PROMPT="${3:?prompt}"; LOG="${4:?log
 [ -f "$PROMPT" ] || { echo "prompt inexistente: $PROMPT" >&2; exit 2; }
 P="$(cat "$PROMPT")"
 
+# O braço passou pelo preflight e está prestes a ser lançado. A partir daqui,
+# qualquer saída — sucesso, erro do provider ou watchdog — fecha o ciclo no sidecar.
+TELEMETRIA_DESPACHO_ATIVA=1
+trap 'rc=$?; finaliza_despacho "$rc"; exit "$rc"' EXIT
+emite_telemetria_despacho "running" "despachada_sem_medicao" || true
+
 # Sobrepõe a doutrina de conversa da casa só para este worker (dispatch.sh:20).
 AUTONOMO='Você é um WORKER DE PLANEJAMENTO em modo não-interativo. NÃO existe humano nesta sessão: ninguém vai responder pergunta sua. NÃO peça esclarecimento, NÃO peça aprovação, NÃO proponha plano para aprovação — o plano PEDIDO é a entrega. Execute o pedido do começo ao fim e escreva o arquivo pedido. Se algo estiver ambíguo, escolha a interpretação mais conservadora, ANOTE a escolha no plano e siga. Sua sessão só termina depois de o arquivo de plano existir no disco.'
 
@@ -239,7 +275,7 @@ case "$BRACO" in
     tmux kill-session -t "$S" 2>/dev/null || true
     # Sem trap, o despacho pode sair e a sessão fica no prompt `>` a 0% CPU
     # (medido: iacmd-m2 viva 1h depois do plano, pids 21618/21767 a 0,0%).
-    trap 'tmux kill-session -t "$S" 2>/dev/null || true' EXIT
+    KIMI_SESSAO_LIMPEZA="$S"
     tmux new-session -d -s "$S" -x 200 -y 50 "cd '$(dirname "$PLANO")' && \"$KIMI_CMD\" --auto"
     BOOT_SEG="${IACHAT_KIMI_BOOT_SEG:-20}"
     POLL_SEG="${IACHAT_KIMI_POLL_SEG:-15}"
@@ -275,6 +311,7 @@ case "$BRACO" in
     wait "$BABA" 2>/dev/null || true
     tmux capture-pane -t "$S" -p -S -500 > "$LOG" 2>/dev/null || true
     tmux kill-session -t "$S" 2>/dev/null || true
+    KIMI_SESSAO_LIMPEZA=""
     ;;
   *)
     echo "braço sem adaptador: $BRACO (codex qwen kimi qwclaude dsclaude agy grok ollama)" >&2

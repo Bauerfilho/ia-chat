@@ -8,10 +8,12 @@ for exatamente reconhecido, emite ``unknown``; nunca improvisa um percentual.
 from __future__ import annotations
 
 import datetime as dt
+import argparse
 import fcntl
 import json
 import os
 import re
+import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
@@ -21,6 +23,9 @@ FONTE_CODEX = (
     "last_token_usage.input_tokens"
 )
 RE_THREAD_ID = re.compile(r"^[A-Za-z0-9-]{20,80}$")
+RAZAO_NUNCA_MEDIU = "nunca_mediu"
+RAZAO_MEDICAO_ENVELHECIDA = "medicao_envelhecida"
+RAZAO_HISTORICO_INDISPONIVEL = "historico_medicao_indisponivel"
 
 
 def agora_iso() -> str:
@@ -306,6 +311,105 @@ def grava_snapshot(caminho: Path, registro: Dict[str, Any]) -> None:
             fcntl.flock(arquivo.fileno(), fcntl.LOCK_UN)
 
 
+def registro_despacho(
+    ia_id: str,
+    session_state: str,
+    reason: str,
+) -> Dict[str, Any]:
+    """Cria um sinal de vida sem fingir que o despacho mediu contexto."""
+    registro = registro_unknown(ia_id.strip().lower(), reason)
+    registro["liveness"]["session_state"] = session_state
+    return registro
+
+
+def emite_despacho(
+    ia_id: str,
+    session_state: str,
+    reason: str,
+    caminho: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Persiste um evento de ciclo de vida usando o append travado canônico."""
+    registro = registro_despacho(ia_id, session_state, reason)
+    grava_snapshot(caminho or destino_padrao(), registro)
+    return registro
+
+
+def historico_tem_medicao_exata(caminho: Path, ia_id: str) -> Optional[bool]:
+    """Distingue ausência real de histórico ilegível, sob lock compartilhado."""
+    try:
+        with caminho.open("r", encoding="utf-8") as arquivo:
+            fcntl.flock(arquivo.fileno(), fcntl.LOCK_SH)
+            try:
+                linhas = arquivo.readlines()
+            finally:
+                fcntl.flock(arquivo.fileno(), fcntl.LOCK_UN)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return None
+
+    ia = ia_id.strip().lower()
+    encontrou = False
+    for linha in linhas:
+        if not linha.strip():
+            continue
+        try:
+            registro = json.loads(linha)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return None
+        if not isinstance(registro, dict):
+            return None
+        if str(registro.get("ia_id", "")).strip().lower() != ia:
+            continue
+        contexto = registro.get("context")
+        if isinstance(contexto, dict) and contexto.get("state") == "exact":
+            encontrou = True
+    return encontrou
+
+
+def razao_sem_medicao(caminho: Path, ia_id: str) -> str:
+    """Rotula dado nunca medido sem confundi-lo com medida anterior vencida."""
+    historico = historico_tem_medicao_exata(caminho, ia_id)
+    if historico is True:
+        return RAZAO_MEDICAO_ENVELHECIDA
+    if historico is False:
+        return RAZAO_NUNCA_MEDIU
+    return RAZAO_HISTORICO_INDISPONIVEL
+
+
+def finaliza_despacho(
+    ia_id: str,
+    caminho: Optional[Path] = None,
+    arquivo_codex: Optional[Path] = None,
+    thread_id: str = "",
+    raiz_sessoes: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Fecha o braço e mede Codex somente quando existe rollout auditável."""
+    ia = ia_id.strip().lower()
+    destino = caminho or destino_padrao()
+    if ia == "codex":
+        arquivo_env = os.environ.get("IACHAT_CODEX_ROLLOUT", "").strip()
+        arquivo = arquivo_codex or (Path(arquivo_env).expanduser() if arquivo_env else None)
+        registro = mede_codex(
+            arquivo=arquivo,
+            thread_id=thread_id,
+            raiz_sessoes=raiz_sessoes,
+        )
+    else:
+        registro = registro_unknown(
+            ia,
+            "provider_prompt_tokens_unavailable",
+            source="%s.provider_usage.layout_unverified" % ia,
+        )
+    contexto = registro.get("context")
+    if isinstance(contexto, dict) and contexto.get("state") != "exact":
+        contexto["measurement_reason"] = contexto.get("reason")
+        contexto["reason"] = razao_sem_medicao(destino, ia)
+    registro["liveness"]["session_state"] = "exited"
+    grava_snapshot(destino, registro)
+    return registro
+
+
 def emite_para_ia(ia_id: str, caminho: Optional[Path] = None) -> Dict[str, Any]:
     """Mede o braço conhecido; os demais entram como unknown justificado."""
     ia = ia_id.strip().lower()
@@ -342,3 +446,50 @@ def executar(argumentos: Any) -> int:
     grava_snapshot(destino, registro)
     print(json.dumps(registro, ensure_ascii=False, separators=(",", ":")))
     return 0
+
+
+def executar_direto(argv: Optional[Iterable[str]] = None) -> int:
+    """CLI estreita para o shell de despacho, sem duplicar escrita/lock em Bash."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="comando", required=True)
+    despacho = sub.add_parser("despacho", help="emitir ciclo de vida de um braço")
+    despacho.add_argument("--ia", required=True)
+    despacho.add_argument(
+        "--session-state", required=True, choices=("running", "exited")
+    )
+    despacho.add_argument("--reason", required=True)
+    despacho.add_argument("--saida", type=Path)
+    encerramento = sub.add_parser(
+        "encerramento", help="fechar o braço e medir Codex quando possível"
+    )
+    encerramento.add_argument("--ia", required=True)
+    encerramento.add_argument("--saida", type=Path)
+    encerramento.add_argument("--arquivo-codex", type=Path)
+    encerramento.add_argument("--thread-id", default="")
+    encerramento.add_argument("--raiz-sessoes", type=Path)
+    argumentos = parser.parse_args(list(argv) if argv is not None else None)
+
+    if argumentos.comando == "despacho":
+        registro = emite_despacho(
+            argumentos.ia,
+            argumentos.session_state,
+            argumentos.reason,
+            caminho=argumentos.saida,
+        )
+        print(json.dumps(registro, ensure_ascii=False, separators=(",", ":")))
+        return 0
+    if argumentos.comando == "encerramento":
+        registro = finaliza_despacho(
+            argumentos.ia,
+            caminho=argumentos.saida,
+            arquivo_codex=argumentos.arquivo_codex,
+            thread_id=argumentos.thread_id,
+            raiz_sessoes=argumentos.raiz_sessoes,
+        )
+        print(json.dumps(registro, ensure_ascii=False, separators=(",", ":")))
+        return 0
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(executar_direto(sys.argv[1:]))
